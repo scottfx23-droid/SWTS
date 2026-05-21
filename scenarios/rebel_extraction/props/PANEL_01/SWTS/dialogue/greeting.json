@@ -1,0 +1,19 @@
+{
+  "$schema": "swts-dialogue-v1",
+  "id": "dlg_panel01_greet",
+  "prop_id": "PANEL_01",
+  "speaker": {"name": "Outpost Data Terminal", "type": "terminal"},
+  "entry_point": "node_01",
+  "nodes": {
+    "node_01": {
+      "lines": [
+        {"text": "SYSTEM ONLINE // AWAITING INPUT", "style": "system"}
+      ],
+      "choices": [
+        {"label": "Slice into system", "next_action": "start_minigame"},
+        {"label": "Access data logs", "next_action": "read_logs"},
+        {"label": "[Disconnect]", "next_action": null}
+      ]
+    }
+  }
+}

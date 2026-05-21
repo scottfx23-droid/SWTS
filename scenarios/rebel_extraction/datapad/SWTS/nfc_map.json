@@ -1,0 +1,125 @@
+{
+  "$schema": "swts-nfc-map-v1",
+
+  "tags": {
+    "A7:3F:02:B1": {
+      "type": "datacard",
+      "id": "DC_CLEARANCE_EAST",
+      "name": "East Wing Clearance",
+      "category": "key",
+      "description": "Imperial security clearance for the eastern corridor",
+      "grants_access": "TERM_03",
+      "single_use": false,
+      "faction_required": null
+    },
+
+    "C2:8A:11:D4": {
+      "type": "datatape",
+      "id": "DT_07",
+      "name": "Intercepted Transmission",
+      "category": "intel",
+      "description": "Encrypted Imperial fleet communication",
+      "content_file": "lore/l002_fleet_coords.txt",
+      "requires_decrypt": true,
+      "decrypt_minigame": "slice",
+      "single_use": false,
+      "faction_required": null
+    },
+
+    "E5:12:9C:A0": {
+      "type": "datacard",
+      "id": "DC_MISSION_GHOST",
+      "name": "Rebel Mission Brief",
+      "category": "mission_trigger",
+      "description": "Encoded mission parameters from Alliance command",
+      "triggers_mission": "ghost_signal",
+      "single_use": true,
+      "faction_required": "rebel"
+    },
+
+    "B1:44:7E:F3": {
+      "type": "bounty_puck",
+      "id": "BP_TARGET_VOSS",
+      "name": "Bounty: Kell Voss",
+      "category": "bounty",
+      "description": "Wanted: smuggler operating near the cargo bay",
+      "bounty_reward": 300,
+      "target_display": {
+        "name": "Kell Voss",
+        "species": "Human",
+        "last_seen": "Cargo Bay",
+        "threat_level": "Moderate"
+      },
+      "single_use": true,
+      "faction_required": null
+    },
+
+    "D3:88:A1:02": {
+      "type": "datacard",
+      "id": "DC_LORE_JEDI_03",
+      "name": "Jedi Archive Fragment",
+      "category": "lore",
+      "description": "A damaged holocron data shard",
+      "content_file": "lore/l003_jedi_archive.txt",
+      "single_use": false,
+      "award_xp": 15,
+      "faction_required": null
+    },
+
+    "F0:22:B5:C7": {
+      "type": "datacard",
+      "id": "DC_CREDITS_50",
+      "name": "Credit Chip",
+      "category": "currency",
+      "description": "A chip loaded with 50 credits",
+      "award_credits": 50,
+      "single_use": true,
+      "faction_required": null
+    },
+
+    "A1:B2:C3:D4": {
+      "type": "datacard",
+      "id": "DC_MISSION_DROP",
+      "name": "Dead Drop Coordinates",
+      "category": "mission_trigger",
+      "description": "Location data for a concealed intel package",
+      "triggers_mission": "dead_drop",
+      "single_use": true,
+      "faction_required": null
+    },
+
+    "D5:E6:F7:A8": {
+      "type": "datacard",
+      "id": "DC_CLEARANCE_MASTER",
+      "name": "Master Clearance",
+      "category": "key",
+      "description": "All-access security authorization",
+      "grants_access": "ALL",
+      "single_use": false,
+      "faction_required": null
+    },
+
+    "B9:CA:DB:EC": {
+      "type": "datacard",
+      "id": "DC_REPAIR_PARTS",
+      "name": "Salvaged Components",
+      "category": "item",
+      "description": "Assorted droid repair parts",
+      "item_id": "REPAIR_PARTS",
+      "item_name": "Salvaged Components",
+      "single_use": false,
+      "faction_required": null
+    },
+
+    "FD:EE:DF:C0": {
+      "type": "datacard",
+      "id": "DC_CREDITS_100",
+      "name": "High-Value Credit Chip",
+      "category": "currency",
+      "description": "A chip loaded with 100 credits",
+      "award_credits": 100,
+      "single_use": true,
+      "faction_required": null
+    }
+  }
+}

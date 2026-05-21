@@ -1,0 +1,118 @@
+{
+  "$schema": "swts-mission-v1",
+
+  "id": "ghost_signal",
+  "title": "Ghost Signal",
+  "subtitle": "Intercept an Imperial transmission before it reaches the fleet",
+  "faction": "rebel",
+  "difficulty": 2,
+  "estimated_minutes": 20,
+  "repeatable": false,
+
+  "prerequisites": {
+    "min_level": 0,
+    "required_missions": [],
+    "required_items": [],
+    "required_faction_rep": 0
+  },
+
+  "triggers": {
+    "type": "nfc_scan",
+    "nfc_tag_id": "DC_MISSION_GHOST",
+    "alt_triggers": [
+      {
+        "type": "prop_interact",
+        "prop_id": "DROID_R5",
+        "condition": "first_visit"
+      }
+    ]
+  },
+
+  "briefing": {
+    "title": "Incoming Transmission",
+    "lines": [
+      "An Imperial comm relay is broadcasting on an open frequency.",
+      "The signal contains fleet coordinates — but it's encrypted.",
+      "Find datatape DT-07, then decrypt it at Terminal 03."
+    ]
+  },
+
+  "steps": [
+    {
+      "step_id": "s1",
+      "title": "Locate Datatape DT-07",
+      "description": "Search the outpost for the intercepted transmission tape",
+      "objective_type": "nfc_scan",
+      "target": {
+        "nfc_tag_id": "DT_07",
+        "media_type": "datatape",
+        "display_name": "Datatape DT-07"
+      },
+      "hint": {
+        "delay_seconds": 120,
+        "text": "Check near the large crate with Imperial markings"
+      },
+      "on_complete": {
+        "message": "Datatape acquired. Find an Imperial terminal to decrypt it.",
+        "add_inventory": ["DT_07"],
+        "award_xp": 25,
+        "next_step": "s2"
+      }
+    },
+    {
+      "step_id": "s2",
+      "title": "Decrypt the Signal",
+      "description": "Slice into Terminal 03 and decrypt the transmission",
+      "objective_type": "prop_interact",
+      "target": {
+        "prop_id": "TERM_03",
+        "ssid_pattern": "SWTS_TERM",
+        "display_name": "Imperial Comm Relay"
+      },
+      "minigame": {
+        "type": "slice",
+        "difficulty": 2,
+        "time_limit_seconds": 45,
+        "max_attempts": 3
+      },
+      "on_complete": {
+        "message": "Decryption complete. Coordinates extracted.",
+        "remove_inventory": ["DT_07"],
+        "add_inventory": ["INTEL_FLEET_COORDS"],
+        "award_xp": 50,
+        "next_step": "s3"
+      },
+      "on_fail": {
+        "message": "Encryption holding. Try again.",
+        "action": "retry"
+      }
+    },
+    {
+      "step_id": "s3",
+      "title": "Deliver Intel to R5-D4",
+      "description": "Return the decoded fleet coordinates to the rebel droid",
+      "objective_type": "prop_interact",
+      "target": {
+        "prop_id": "DROID_R5",
+        "ssid_pattern": "SWTS_DROID",
+        "display_name": "R5-D4"
+      },
+      "on_complete": {
+        "message": "R5 chirps excitedly. The fleet is warned!",
+        "remove_inventory": ["INTEL_FLEET_COORDS"],
+        "award_xp": 100,
+        "award_credits": 200,
+        "award_items": ["REBEL_COMMENDATION"],
+        "faction_rep": 15,
+        "unlock_missions": ["shadow_protocol"],
+        "next_step": null
+      }
+    }
+  ],
+
+  "completion": {
+    "summary": "You intercepted Imperial fleet coordinates and delivered them to the Rebellion.",
+    "title_awarded": null,
+    "lore_unlock": "l002_fleet_coords"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "$schema": "swts-dialogue-v1",
+  "id": "dlg_term01_greet",
+  "prop_id": "TERM_01",
+  "speaker": {"name": "Imperial Comm Relay", "type": "terminal"},
+  "entry_point": "node_01",
+  "nodes": {
+    "node_01": {
+      "lines": [
+        {"text": "IMPERIAL COMM RELAY // ACTIVE", "style": "system"},
+        {"text": "TRANSMISSION BUFFER DETECTED", "style": "system"}
+      ],
+      "choices": [
+        {"label": "Intercept transmission", "next_action": "start_minigame"},
+        {"label": "Scan frequency logs", "next_action": "read_logs"},
+        {"label": "[Disconnect]", "next_action": null}
+      ]
+    }
+  }
+}

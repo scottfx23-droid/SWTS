@@ -1,0 +1,12 @@
+{
+  "$schema": "swts-comms-v1",
+  "messages": [
+    {
+      "id": "welcome",
+      "from": "ALLIANCE COMMAND",
+      "subject": "WELCOME OPERATIVE",
+      "body": "Operative, you have been deployed to a contested sector. Imperial activity is heavy. Locate rebel contacts, scan datacards for intel, and slice into outpost terminals as opportunities arise. Mission control will transmit further orders as the situation develops. Stay alert.",
+      "trigger": "boot"
+    }
+  ]
+}

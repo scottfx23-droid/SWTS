@@ -1,0 +1,80 @@
+{
+  "$schema": "swts-mission-v1",
+
+  "id": "dead_drop",
+  "title": "Dead Drop",
+  "subtitle": "Recover a concealed intel package from the outpost",
+  "faction": "rebel",
+  "difficulty": 1,
+  "estimated_minutes": 10,
+  "repeatable": false,
+
+  "prerequisites": {
+    "min_level": 0,
+    "required_missions": [],
+    "required_items": [],
+    "required_faction_rep": 0
+  },
+
+  "triggers": {
+    "type": "nfc_scan",
+    "nfc_tag_id": "DC_MISSION_DROP"
+  },
+
+  "briefing": {
+    "title": "Priority Intercept",
+    "lines": [
+      "A rebel operative left a datacard hidden in the eastern corridor.",
+      "Retrieve it before Imperial patrols find it.",
+      "Bring it to R5-D4 for decoding."
+    ]
+  },
+
+  "steps": [
+    {
+      "step_id": "s1",
+      "title": "Retrieve Dead Drop",
+      "description": "Locate the concealed datacard near the eastern corridor",
+      "objective_type": "nfc_scan",
+      "target": {
+        "nfc_tag_id": "DC_CLEARANCE_EAST",
+        "media_type": "datacard",
+        "display_name": "Hidden Datacard"
+      },
+      "hint": {
+        "delay_seconds": 90,
+        "text": "Look near the wall panel with the flickering light"
+      },
+      "on_complete": {
+        "message": "Datacard recovered. Get it to R5-D4 for analysis.",
+        "add_inventory": ["DEAD_DROP_INTEL"],
+        "award_xp": 30,
+        "next_step": "s2"
+      }
+    },
+    {
+      "step_id": "s2",
+      "title": "Deliver to R5-D4",
+      "description": "Find the rebel droid and hand off the intel",
+      "objective_type": "prop_interact",
+      "target": {
+        "prop_id": "DROID_R5",
+        "ssid_pattern": "SWTS_DROID",
+        "display_name": "R5-D4"
+      },
+      "on_complete": {
+        "message": "Intel delivered. R5 begins decrypting.",
+        "remove_inventory": ["DEAD_DROP_INTEL"],
+        "award_xp": 50,
+        "award_credits": 150,
+        "next_step": null
+      }
+    }
+  ],
+
+  "completion": {
+    "summary": "You recovered concealed rebel intelligence and delivered it safely.",
+    "title_awarded": null,
+    "lore_unlock": null
+  }
+}

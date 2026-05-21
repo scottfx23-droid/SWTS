@@ -1,0 +1,28 @@
+{
+  "$schema": "swts-config-v1",
+  "scenario": {"name": "Rebel Extraction", "version": "1.0"},
+  "prop": {
+    "type": "terminal",
+    "id": "TERM_02",
+    "ssid": "SWTS_TERM_02",
+    "wifi_channel": 3,
+    "name": "Security Terminal",
+    "faction": "empire",
+    "location_hint": "Imperial zone, security office"
+  },
+  "hardware": {
+    "has_nfc_reader": true,
+    "nfc_slots": {"datacard": true, "datatape": false},
+    "has_leds": true, "led_count": 12, "led_pin": 21,
+    "has_buzzer": true, "buzzer_pin": 47
+  },
+  "behavior": {
+    "idle_animation": "imperial_pulse",
+    "idle_led_color": "red",
+    "requires_auth_card": true,
+    "auth_card_ids": ["DC_CLEARANCE_EAST", "DC_CLEARANCE_MASTER"],
+    "minigame_default": "slice",
+    "dialogue_greeting": "dialogue/greeting.json",
+    "dialogue_denied": "dialogue/denied.json"
+  }
+}

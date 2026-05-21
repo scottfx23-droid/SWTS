@@ -1,0 +1,64 @@
+{
+  "$schema": "swts-dialogue-v1",
+  "id": "dlg_gnk_greeting",
+  "prop_id": "DROID_GNK",
+  "speaker": {"name": "GNK Power Droid", "type": "droid", "portrait": "gnk"},
+  "entry_point": "node_01",
+
+  "nodes": {
+    "node_01": {
+      "lines": [
+        {"text": "GONK.", "style": "speech"}
+      ],
+      "choices": [
+        {"label": "Browse trade goods", "next": "node_trade"},
+        {"label": "Play Sabacc", "next": "node_sabacc"},
+        {"label": "Recharge datapad", "next": "node_recharge"},
+        {"label": "[Leave]", "next": null}
+      ]
+    },
+
+    "node_trade": {
+      "lines": [
+        {"text": "GONK GONK.", "style": "speech"}
+      ],
+      "actions": [
+        {
+          "type": "open_trade",
+          "inventory": [
+            {"item_id": "POWER_CELL", "name": "Power Cell", "price": 40, "stock": 5},
+            {"item_id": "RATION_PACK", "name": "Ration Pack", "price": 10, "stock": 20},
+            {"item_id": "SCANNER_MOD", "name": "Scanner Upgrade", "price": 100, "stock": 1},
+            {"item_id": "STEALTH_CHIP", "name": "Stealth Transponder", "price": 200, "stock": 1},
+            {"item_id": "BACTA_PATCH", "name": "Bacta Patch", "price": 25, "stock": 8}
+          ]
+        }
+      ],
+      "choices": [
+        {"label": "Back", "next": "node_01"}
+      ]
+    },
+
+    "node_sabacc": {
+      "lines": [
+        {"text": "GONK?", "style": "speech"}
+      ],
+      "actions": [{"type": "start_minigame", "minigame_type": "sabacc"}],
+      "choices": [],
+      "auto_close_seconds": 3
+    },
+
+    "node_recharge": {
+      "lines": [
+        {"text": "GOOONK.", "style": "speech"}
+      ],
+      "actions": [
+        {"type": "award_xp", "amount": 5},
+        {"type": "play_sound", "sound_id": "recharge"}
+      ],
+      "choices": [
+        {"label": "Thanks", "next": null}
+      ]
+    }
+  }
+}

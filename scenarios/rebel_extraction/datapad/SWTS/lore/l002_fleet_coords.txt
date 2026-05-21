@@ -1,0 +1,22 @@
+TITLE: Intercepted Imperial Transmission
+CLASS: SECRET // IMPERIAL NAVY
+DATE: Imperial Year 4.7.22
+---
+FROM: Admiral Konstantine, ISB Sector Command
+TO: All units, Outer Rim patrol fleet
+
+Fleet repositioning order effective immediately.
+All Arquitens-class cruisers are to converge on
+coordinates 7-7-Mark-3 in the Lothal sector.
+
+The Emperor's Hand arrives in 72 standard hours.
+Prepare docking bay 7 for a Lambda-class shuttle.
+
+All leave is cancelled. Increase patrol frequency
+along hyperspace routes Alpha-Seven through
+Alpha-Twelve. Report any rebel activity to
+ISB command immediately.
+
+Long live the Empire.
+---
+END TRANSMISSION

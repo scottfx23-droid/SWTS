@@ -1,0 +1,27 @@
+{
+  "$schema": "swts-config-v1",
+  "scenario": {"name": "Rebel Extraction", "version": "1.0"},
+  "prop": {
+    "type": "panel",
+    "id": "PANEL_02",
+    "ssid": "SWTS_PANEL_02",
+    "wifi_channel": 1,
+    "name": "Rebel Intel Drop",
+    "faction": "rebel",
+    "location_hint": "Outpost, hidden alcove"
+  },
+  "hardware": {
+    "has_nfc_reader": true,
+    "nfc_slots": {"datacard": true, "datatape": false},
+    "has_leds": true, "led_count": 8, "led_pin": 21,
+    "has_buzzer": false
+  },
+  "behavior": {
+    "idle_animation": "rebel_pulse",
+    "idle_led_color": "blue",
+    "requires_auth_card": true,
+    "auth_card_ids": ["DC_CLEARANCE_EAST", "DC_CLEARANCE_MASTER"],
+    "minigame_default": null,
+    "dialogue_greeting": "dialogue/greeting.json"
+  }
+}

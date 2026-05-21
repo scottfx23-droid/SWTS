@@ -1,0 +1,110 @@
+{
+  "$schema": "swts-mission-v1",
+
+  "id": "shadow_protocol",
+  "title": "Shadow Protocol",
+  "subtitle": "Execute a classified extraction operation",
+  "faction": "rebel",
+  "difficulty": 4,
+  "estimated_minutes": 30,
+  "repeatable": false,
+
+  "prerequisites": {
+    "min_level": 0,
+    "required_missions": ["ghost_signal"],
+    "required_items": [],
+    "required_faction_rep": 0
+  },
+
+  "triggers": {
+    "type": "mission_unlock",
+    "unlocked_by": "ghost_signal"
+  },
+
+  "briefing": {
+    "title": "Eyes Only",
+    "lines": [
+      "High command has authorized a shadow extraction.",
+      "Classified materials must be accessed from a secure terminal.",
+      "Upload extracted data and confirm with extraction chip.",
+      "This operation is dangerous. Proceed with caution."
+    ]
+  },
+
+  "steps": [
+    {
+      "step_id": "s1",
+      "title": "Access Classified Tape",
+      "description": "Acquire the shadow-encrypted datatape from the secure vault",
+      "objective_type": "nfc_scan",
+      "target": {
+        "nfc_tag_id": "DT_SHADOW",
+        "media_type": "datatape",
+        "display_name": "Classified Datatape"
+      },
+      "hint": {
+        "delay_seconds": 180,
+        "text": "The informant near the lore archive may know its location"
+      },
+      "on_complete": {
+        "message": "Classified tape secured. Find a terminal to upload.",
+        "add_inventory": ["DT_SHADOW"],
+        "award_xp": 40,
+        "next_step": "s2"
+      }
+    },
+    {
+      "step_id": "s2",
+      "title": "Upload via Terminal",
+      "description": "Use any Imperial terminal to upload the extracted data",
+      "objective_type": "prop_interact",
+      "target": {
+        "prop_id": "TERM_02",
+        "ssid_pattern": "SWTS_TERM",
+        "display_name": "Security Terminal"
+      },
+      "minigame": {
+        "type": "slice",
+        "difficulty": 4,
+        "time_limit_seconds": 35,
+        "max_attempts": 2
+      },
+      "on_complete": {
+        "message": "Data uploaded to rebel network. Confirm extraction.",
+        "remove_inventory": ["DT_SHADOW"],
+        "add_inventory": ["SHADOW_UPLOAD_CONF"],
+        "award_xp": 60,
+        "next_step": "s3"
+      },
+      "on_fail": {
+        "message": "Security countermeasures detected. Try again.",
+        "action": "retry"
+      }
+    },
+    {
+      "step_id": "s3",
+      "title": "Signal Extraction",
+      "description": "Scan the extraction chip to confirm mission complete",
+      "objective_type": "nfc_scan",
+      "target": {
+        "nfc_tag_id": "DC_EXTRACTION",
+        "media_type": "datacard",
+        "display_name": "Extraction Confirmation Chip"
+      },
+      "on_complete": {
+        "message": "Extraction confirmed. Shadow protocol complete.",
+        "remove_inventory": ["SHADOW_UPLOAD_CONF"],
+        "award_xp": 100,
+        "award_credits": 500,
+        "award_items": ["SHADOW_CLEARANCE"],
+        "next_step": null
+      }
+    }
+  ],
+
+  "completion": {
+    "summary": "You executed a classified shadow extraction, securing vital intelligence for the Rebellion.",
+    "title_awarded": "Shadow Operative",
+    "lore_unlock": "l004_shadow_intel"
+  }
+}

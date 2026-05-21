@@ -1,0 +1,31 @@
+{
+  "$schema": "swts-config-v1",
+  "scenario": {"name": "Rebel Extraction", "version": "1.0"},
+  "prop": {
+    "type": "terminal",
+    "id": "TERM_01",
+    "ssid": "SWTS_TERM_01",
+    "wifi_channel": 11,
+    "name": "Imperial Comm Relay",
+    "faction": "empire",
+    "location_hint": "Outpost, communications room"
+  },
+  "hardware": {
+    "has_nfc_reader": true,
+    "nfc_slots": {"datacard": false, "datatape": true},
+    "has_leds": true, "led_count": 12, "led_pin": 21,
+    "has_buzzer": true, "buzzer_pin": 47
+  },
+  "behavior": {
+    "idle_animation": "imperial_pulse",
+    "idle_led_color": "red",
+    "on_connect_sound": "terminal_boot",
+    "requires_auth_card": false,
+    "minigame_default": "decode",
+    "dialogue_greeting": "dialogue/greeting.json"
+  },
+  "features": {
+    "accepts_datatapes": true,
+    "datatape_action": "intercept"
+  }
+}

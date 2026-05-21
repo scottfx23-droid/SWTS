@@ -1,0 +1,20 @@
+{
+  "$schema": "swts-dialogue-v1",
+  "id": "dlg_term02_greet",
+  "prop_id": "TERM_02",
+  "speaker": {"name": "Security Terminal", "type": "terminal"},
+  "entry_point": "node_01",
+  "nodes": {
+    "node_01": {
+      "lines": [
+        {"text": "ISB SECURITY TERMINAL // RESTRICTED", "style": "system"},
+        {"text": "AUTHORIZATION REQUIRED FOR DATA ACCESS", "style": "system"}
+      ],
+      "choices": [
+        {"label": "Slice security protocols", "next_action": "start_minigame"},
+        {"label": "Review security logs", "next_action": "read_logs"},
+        {"label": "[Disconnect]", "next_action": null}
+      ]
+    }
+  }
+}

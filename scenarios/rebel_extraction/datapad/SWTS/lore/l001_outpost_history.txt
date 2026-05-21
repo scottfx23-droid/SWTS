@@ -1,0 +1,21 @@
+TITLE: Outpost Origin Report
+CLASS: DECLASSIFIED // ALLIANCE INTELLIGENCE
+DATE: 3 ABY
+---
+This outpost was originally constructed as a
+moisture farming relay station during the
+late Republic era. After the fall of the
+Jedi Order, the Empire converted it into a
+regional communications hub.
+
+Local resistance cells have operated in the
+area for approximately two standard years.
+The outpost's remote location and aging
+Imperial garrison make it an ideal staging
+point for intelligence operations.
+
+Note: Multiple hidden access points have been
+identified throughout the facility. Refer to
+sector maps for current entry coordinates.
+---
+END REPORT

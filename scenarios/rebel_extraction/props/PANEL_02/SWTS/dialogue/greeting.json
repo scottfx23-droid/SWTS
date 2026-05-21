@@ -1,0 +1,19 @@
+{
+  "$schema": "swts-dialogue-v1",
+  "id": "dlg_panel02_greet",
+  "prop_id": "PANEL_02",
+  "speaker": {"name": "Rebel Intel Drop", "type": "terminal"},
+  "entry_point": "node_01",
+  "nodes": {
+    "node_01": {
+      "lines": [
+        {"text": "SECURE CHANNEL // REBEL ALLIANCE", "style": "system"},
+        {"text": "INSERT CLEARANCE CARD TO ACCESS", "style": "system"}
+      ],
+      "choices": [
+        {"label": "Access intel cache", "next_action": "read_logs"},
+        {"label": "[Disconnect]", "next_action": null}
+      ]
+    }
+  }
+}

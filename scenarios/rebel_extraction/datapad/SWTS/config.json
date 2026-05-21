@@ -1,0 +1,44 @@
+{
+  "$schema": "swts-config-v1",
+
+  "scenario": {
+    "name": "Rebel Extraction",
+    "version": "1.0",
+    "author": "Scott",
+    "date": "2026-05-06",
+    "planet": "Tatooine",
+    "currency": "RP",
+    "currency_name": "Reputation"
+  },
+
+  "device": {
+    "type": "datapad",
+    "wifi_scan_interval_ms": 5000,
+    "wifi_scan_prefix": "SWTS_"
+  },
+
+  "ui": {
+    "home_buttons": [
+      {"id": "slice",     "label": "SLICE",      "sublabel_dynamic": "prop_count"},
+      {"id": "missions",  "label": "MISSIONS",   "sublabel_dynamic": "active_count"},
+      {"id": "datacard",  "label": "DATACARD",   "sublabel": "INSERT CARD"},
+      {"id": "bounty",    "label": "BOUNTY",     "sublabel_dynamic": "bounty_status"},
+      {"id": "cargo",     "label": "CARGO INTEL", "sublabel": "LOCATE CRATE"},
+      {"id": "comms",     "label": "COMMS",      "sublabel_dynamic": "unread_count"}
+    ]
+  },
+
+  "audio": {
+    "boot_melody": [440, 100, 554, 100, 659, 200],
+    "nfc_scan_tone": [880, 50, 1100, 50],
+    "success_tone": [523, 100, 659, 100, 784, 200],
+    "fail_tone": [400, 200, 300, 300],
+    "alert_tone": [800, 100, 0, 100, 800, 100]
+  },
+
+  "buttons": {
+    "red":   {"switch_pin": -1, "led_pin": -1, "role": "back"},
+    "white": {"switch_pin": -1, "led_pin": -1, "role": "confirm"},
+    "blue":  {"switch_pin": -1, "led_pin": -1, "role": "comms"}
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "$schema": "swts-dialogue-v1",
+  "id": "dlg_term02_denied",
+  "prop_id": "TERM_02",
+  "speaker": {"name": "Security Terminal", "type": "terminal"},
+  "entry_point": "node_01",
+  "nodes": {
+    "node_01": {
+      "lines": [
+        {"text": "ACCESS DENIED", "style": "system"},
+        {"text": "INSUFFICIENT CLEARANCE LEVEL", "style": "system"},
+        {"text": "INSERT VALID AUTHORIZATION CARD", "style": "system"}
+      ],
+      "choices": [
+        {"label": "[Disconnect]", "next_action": null}
+      ]
+    }
+  }
+}

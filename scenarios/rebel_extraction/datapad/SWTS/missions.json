@@ -1,0 +1,67 @@
+{
+  "$schema": "swts-missions-v1",
+  "missions": [
+    {
+      "id": "ghost_signal",
+      "title": "GHOST SIGNAL",
+      "subtitle": "Intercept an Imperial transmission before it reaches the fleet",
+      "faction": "REBEL",
+      "briefing": "An Imperial comm relay is broadcasting on an open frequency. The signal contains fleet coordinates but it is encrypted.\n\nFind datatape DT-07, decrypt it at a terminal, then deliver to R5-D4.",
+      "difficulty": 2,
+      "reward_credits": 200,
+      "reward_xp": 175,
+      "reward_item": "REBEL COMMENDATION",
+      "unlocks": "shadow_protocol",
+      "starts_unlocked": true,
+      "steps": [
+        { "title": "Locate Datatape DT-07", "description": "Search the outpost for the intercepted transmission tape", "type": "scan_nfc", "target": "DT07", "xp": 25 },
+        { "title": "Decrypt at Terminal", "description": "Insert datatape into the Imperial comm relay terminal", "type": "connect_prop", "target": "SWTS_TERM", "xp": 50 },
+        { "title": "Deliver Intel to R5-D4", "description": "Return decoded coordinates to the rebel droid", "type": "connect_prop", "target": "SWTS_DROID", "xp": 100 }
+      ]
+    },
+    {
+      "id": "dead_drop",
+      "title": "DEAD DROP",
+      "subtitle": "Recover a concealed intel package from the outpost",
+      "faction": "REBEL",
+      "briefing": "A rebel operative left a datacard hidden in the eastern corridor. Retrieve it before Imperial patrols find it.\n\nBring it to R5-D4 for decoding.",
+      "difficulty": 1,
+      "reward_credits": 150,
+      "reward_xp": 80,
+      "reward_item": "",
+      "unlocks": "",
+      "starts_unlocked": true,
+      "steps": [
+        { "title": "Retrieve Dead Drop", "description": "Locate the concealed datacard near the eastern corridor", "type": "scan_nfc", "target": "DEAD", "xp": 30 },
+        { "title": "Deliver to Contact", "description": "Find the rebel droid and hand off the intel", "type": "connect_prop", "target": "SWTS_DROID", "xp": 50 }
+      ]
+    },
+    {
+      "id": "shadow_protocol",
+      "title": "SHADOW PROTOCOL",
+      "subtitle": "Execute a classified extraction operation",
+      "faction": "REBEL",
+      "briefing": "High command has authorized a shadow extraction. This operation requires accessing classified materials and uploading them off-site.\n\nThis mission is dangerous. Proceed with caution.",
+      "difficulty": 4,
+      "reward_credits": 500,
+      "reward_xp": 200,
+      "reward_item": "SHADOW CLEARANCE",
+      "unlocks": "",
+      "starts_unlocked": false,
+      "steps": [
+        { "title": "Access Classified Tape", "description": "Acquire the shadow-encrypted datatape from the secure vault", "type": "scan_nfc", "target": "SHADOW", "xp": 40 },
+        { "title": "Extract via Terminal", "description": "Use any Imperial terminal to upload extracted data", "type": "connect_prop", "target": "SWTS_TERM", "xp": 60 },
+        { "title": "Signal Extraction", "description": "Scan the extraction chip to confirm mission complete", "type": "scan_nfc", "target": "EXTRACT", "xp": 100 }
+      ]
+    }
+  ],
+  "nfc_triggers": [
+    { "token": "GHOST",   "action": "start", "mission": "ghost_signal" },
+    { "token": "DROP",    "action": "start", "mission": "dead_drop" },
+    { "token": "DT07",    "action": "step",  "mission": "ghost_signal", "step": 0 },
+    { "token": "DEAD",    "action": "step",  "mission": "dead_drop",    "step": 0 },
+    { "token": "SHADOW",  "action": "step",  "mission": "shadow_protocol", "step": 0 },
+    { "token": "EXTRACT", "action": "step",  "mission": "shadow_protocol", "step": 2 },
+    { "token": "INTEL",   "action": "step",  "mission": "ghost_signal", "step": 2 }
+  ]
+}

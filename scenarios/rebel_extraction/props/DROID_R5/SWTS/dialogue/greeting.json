@@ -1,0 +1,136 @@
+{
+  "$schema": "swts-dialogue-v1",
+  "id": "dlg_r5_greeting",
+  "prop_id": "DROID_R5",
+  "speaker": {"name": "R5-D4", "type": "droid", "portrait": "r5d4"},
+  "entry_point": "node_01",
+
+  "conditions_global": {
+    "faction_overrides": {
+      "empire": "node_empire",
+      "bounty": "node_bounty"
+    },
+    "mission_overrides": {
+      "ghost_signal:active:s3": "node_ghost_turnin"
+    }
+  },
+
+  "nodes": {
+    "node_01": {
+      "lines": [
+        {"text": "[Translated from Binary] Welcome, operative. I have work that needs doing.", "style": "speech"}
+      ],
+      "conditions": [
+        {
+          "if": "player.has_item('REBEL_COMMENDATION')",
+          "insert_line": {"text": "[Translated] I see you carry a commendation. The Alliance remembers.", "style": "speech"}
+        }
+      ],
+      "choices": [
+        {"label": "What kind of work?", "next": "node_mission"},
+        {"label": "I have intel to deliver", "next": "node_ghost_turnin", "condition": "player.has_item('INTEL_FLEET_COORDS')"},
+        {"label": "Got anything to trade?", "next": "node_trade"},
+        {"label": "[Leave]", "next": null}
+      ]
+    },
+
+    "node_mission": {
+      "lines": [
+        {"text": "[Translated] An Imperial relay nearby is broadcasting fleet coordinates on an open channel. Sloppy. But the signal is encrypted.", "style": "speech"},
+        {"text": "[Translated] Find the datatape in the cargo bay. Decrypt it at a terminal. Bring me the coordinates.", "style": "speech"}
+      ],
+      "actions": [{"type": "start_mission", "mission_id": "ghost_signal"}],
+      "choices": [
+        {"label": "I'm on it.", "next": "node_accepted"},
+        {"label": "Not right now.", "next": "node_declined"}
+      ]
+    },
+
+    "node_accepted": {
+      "lines": [
+        {"text": "[Translated] Good luck, operative. Time is short.", "style": "speech"}
+      ],
+      "choices": [],
+      "auto_close_seconds": 3
+    },
+
+    "node_declined": {
+      "lines": [
+        {"text": "[Translated] I understand. But the offer stands.", "style": "speech"}
+      ],
+      "choices": [],
+      "auto_close_seconds": 3
+    },
+
+    "node_ghost_turnin": {
+      "lines": [
+        {"text": "[Translated] The fleet coordinates! You have done the Alliance a great service today.", "style": "speech"}
+      ],
+      "actions": [{"type": "complete_mission_step", "mission_id": "ghost_signal", "step_id": "s3"}],
+      "choices": [],
+      "auto_close_seconds": 5
+    },
+
+    "node_trade": {
+      "lines": [
+        {"text": "[Translated] I have some salvage parts available.", "style": "speech"}
+      ],
+      "actions": [
+        {
+          "type": "open_trade",
+          "inventory": [
+            {"item_id": "POWER_CELL", "name": "Power Cell", "price": 50, "stock": 3},
+            {"item_id": "CIRCUIT_BOARD", "name": "Salvaged Circuit Board", "price": 30, "stock": 5},
+            {"item_id": "DROID_OIL", "name": "Lubricant Canister", "price": 15, "stock": 10}
+          ]
+        }
+      ],
+      "choices": [
+        {"label": "Back", "next": "node_01"}
+      ]
+    },
+
+    "node_empire": {
+      "lines": [
+        {"text": "[Translated] I... I am just a maintenance unit. Nothing to see here.", "style": "speech"}
+      ],
+      "choices": [
+        {"label": "I need parts.", "next": "node_trade"},
+        {"label": "What are you hiding, droid?", "next": "node_intimidate"},
+        {"label": "[Leave]", "next": null}
+      ]
+    },
+
+    "node_intimidate": {
+      "lines": [
+        {"text": "[Translated] ...There may be a datatape. In the cargo bay. Take it. Just leave me functional.", "style": "speech"}
+      ],
+      "actions": [
+        {"type": "start_mission", "mission_id": "ghost_signal"},
+        {"type": "give_item", "item_id": "HINT_CARGO_BAY", "name": "Cargo Bay Location Data"}
+      ],
+      "choices": [],
+      "auto_close_seconds": 5
+    },
+
+    "node_bounty": {
+      "lines": [
+        {"text": "[Translated] Bounty hunter. I might have a job for you — if the price is right.", "style": "speech"}
+      ],
+      "choices": [
+        {"label": "I'm listening.", "next": "node_bounty_job"},
+        {"label": "Just here to trade.", "next": "node_trade"},
+        {"label": "[Leave]", "next": null}
+      ]
+    },
+
+    "node_bounty_job": {
+      "lines": [
+        {"text": "[Translated] There is a courier moving through the outpost. Scan their ID puck, bring me proof, and I will pay 300 credits.", "style": "speech"}
+      ],
+      "actions": [{"type": "start_mission", "mission_id": "bounty_courier"}],
+      "choices": [],
+      "auto_close_seconds": 5
+    }
+  }
+}

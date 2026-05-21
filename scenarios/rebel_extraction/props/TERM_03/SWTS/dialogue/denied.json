@@ -1,0 +1,18 @@
+{
+  "$schema": "swts-dialogue-v1",
+  "id": "dlg_term03_denied",
+  "prop_id": "TERM_03",
+  "speaker": {"name": "Decrypt Station", "type": "terminal"},
+  "entry_point": "node_01",
+  "nodes": {
+    "node_01": {
+      "lines": [
+        {"text": "AUTHORIZATION FAILURE", "style": "system"},
+        {"text": "CLEARANCE CARD REQUIRED", "style": "system"}
+      ],
+      "choices": [
+        {"label": "[Disconnect]", "next_action": null}
+      ]
+    }
+  }
+}

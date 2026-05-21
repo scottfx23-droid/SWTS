@@ -1,0 +1,25 @@
+{
+  "$schema": "swts-config-v1",
+  "scenario": {"name": "Rebel Extraction", "version": "1.0"},
+  "prop": {
+    "type": "droid",
+    "id": "DROID_GNK",
+    "ssid": "SWTS_DROID_GNK",
+    "wifi_channel": 4,
+    "name": "GNK Power Droid",
+    "faction": "neutral",
+    "location_hint": "Hub zone, trade post"
+  },
+  "hardware": {
+    "has_nfc_reader": false,
+    "has_leds": true, "led_count": 2, "led_pin": 21,
+    "has_buzzer": true, "buzzer_pin": 47
+  },
+  "behavior": {
+    "idle_animation": "gonk_waddle",
+    "idle_led_color": "amber",
+    "on_connect_sound": "gonk",
+    "minigame_default": "sabacc",
+    "dialogue_greeting": "dialogue/greeting.json"
+  }
+}

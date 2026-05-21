@@ -1,0 +1,168 @@
+{
+  "$schema": "swts-gm-config-v1",
+
+  "scenario": {
+    "name": "Rebel Extraction",
+    "version": "1.0",
+    "planet": "Helecine",
+    "currency": "RP"
+  },
+
+  "device": {
+    "id": "GM-1",
+    "role": "gamemaster"
+  },
+
+  "game": {
+    "max_score": 1000,
+    "event_duration_min": 120,
+    "auto_advance": false
+  },
+
+  "ui": {
+    "tabs": [
+      {"id": "events",    "label": "EVENTS",    "color": "amber"},
+      {"id": "comms",     "label": "COMMS",     "color": "cyan"},
+      {"id": "bounties",  "label": "BOUNTIES",  "color": "red"},
+      {"id": "players",   "label": "PLAYERS",   "color": "amber"},
+      {"id": "panels",    "label": "PANELS",    "color": "cyan"}
+    ]
+  },
+
+  "events": [
+    {
+      "id": "imperial_patrol",
+      "name": "IMPERIAL PATROL",
+      "severity": 2,
+      "description": "Patrol approaching outpost. All players should seek cover."
+    },
+    {
+      "id": "power_failure",
+      "name": "POWER FAILURE",
+      "severity": 1,
+      "description": "Outpost power grid unstable. Terminals may go offline."
+    },
+    {
+      "id": "fleet_arrival",
+      "name": "REBEL FLEET ARRIVAL",
+      "severity": 0,
+      "description": "Alliance reinforcements are inbound. All rebels report in."
+    },
+    {
+      "id": "bounty_announce",
+      "name": "BOUNTY POSTED",
+      "severity": 1,
+      "description": "New high-value target identified. Check the wanted board."
+    },
+    {
+      "id": "lockdown",
+      "name": "SECTOR LOCKDOWN",
+      "severity": 3,
+      "description": "Imperial security lockdown initiated. All terminals offline."
+    },
+    {
+      "id": "event_alpha",
+      "name": "EVENT ALPHA",
+      "severity": 2,
+      "description": "Mid-event story beat — actors should escalate intensity."
+    },
+    {
+      "id": "finale_start",
+      "name": "FINALE INITIATED",
+      "severity": 3,
+      "description": "Final phase begins. All players converge on the hub."
+    },
+    {
+      "id": "all_clear",
+      "name": "ALL CLEAR",
+      "severity": 0,
+      "description": "Patrol passed. Resume normal operations."
+    }
+  ],
+
+  "comms": [
+    {
+      "id": "gm_welcome",
+      "from": "ALLIANCE COMMAND",
+      "subject": "OPERATION BRIEF",
+      "body": "All operatives, welcome to the outpost. Mission parameters have been transmitted to your datapads. Proceed with caution."
+    },
+    {
+      "id": "gm_warning",
+      "from": "OUTPOST SECURITY",
+      "subject": "PATROL WARNING",
+      "body": "Imperial patrol detected. Avoid the eastern corridor for the next 10 minutes."
+    },
+    {
+      "id": "gm_recall",
+      "from": "ALLIANCE COMMAND",
+      "subject": "RECALL ORDER",
+      "body": "All operatives, return to the hub. New orders are being distributed."
+    },
+    {
+      "id": "gm_promote",
+      "from": "ALLIANCE COMMAND",
+      "subject": "FIELD COMMENDATION",
+      "body": "Outstanding work. Your service has been logged. Continue current operations."
+    },
+    {
+      "id": "gm_hint",
+      "from": "INFORMANT",
+      "subject": "INTEL DROP",
+      "body": "Check the eastern panels — there is something there that you have missed."
+    },
+    {
+      "id": "gm_final",
+      "from": "ALLIANCE COMMAND",
+      "subject": "EXTRACTION INBOUND",
+      "body": "Lambda shuttle approaching the hub. All operatives standby for evacuation."
+    }
+  ],
+
+  "bounties": [
+    {
+      "id": "bounty_voss",
+      "target_name": "Kell Voss",
+      "description": "Smuggler operating near cargo bay. Armed. Approach with caution.",
+      "reward": 300,
+      "clues": [
+        "Last seen near the cargo bay scanning crates.",
+        "Wears a faded brown jacket. Carries a comlink.",
+        "Limp in the left leg — old blaster wound."
+      ]
+    },
+    {
+      "id": "bounty_trex",
+      "target_name": "Captain T'rex",
+      "description": "Imperial defector wanted by ISB. High threat level.",
+      "reward": 500,
+      "clues": [
+        "Travels with a stormtrooper helmet under his arm.",
+        "Heard asking about freighter departures off-world.",
+        "ISB tracker says he is heading to the trade post."
+      ]
+    },
+    {
+      "id": "bounty_neela",
+      "target_name": "Neela Dann",
+      "description": "Rebel courier. Carries encrypted intel.",
+      "reward": 200,
+      "clues": [
+        "Twi'lek female, dark green lekku, civilian clothes.",
+        "Carrying a small datachit on a leather cord.",
+        "Last seen entering the eastern corridor."
+      ]
+    },
+    {
+      "id": "bounty_zix",
+      "target_name": "Zix the Hutt",
+      "description": "Black market dealer. Last seen at the trade post.",
+      "reward": 400,
+      "clues": [
+        "Always escorted by two Gamorrean guards.",
+        "Trades only in unmarked credit chips.",
+        "Hangs out behind the trade post after dark."
+      ]
+    }
+  ]
+}

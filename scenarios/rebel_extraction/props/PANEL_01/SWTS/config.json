@@ -1,0 +1,25 @@
+{
+  "$schema": "swts-config-v1",
+  "scenario": {"name": "Rebel Extraction", "version": "1.0"},
+  "prop": {
+    "type": "panel",
+    "id": "PANEL_01",
+    "ssid": "SWTS_PANEL_01",
+    "wifi_channel": 6,
+    "name": "Outpost Data Terminal",
+    "faction": "neutral",
+    "location_hint": "Main entrance, left wall"
+  },
+  "hardware": {
+    "has_nfc_reader": false,
+    "has_leds": true, "led_count": 8, "led_pin": 21,
+    "has_buzzer": false
+  },
+  "behavior": {
+    "idle_animation": "amber_breathe",
+    "idle_led_color": "amber",
+    "requires_auth_card": false,
+    "minigame_default": "slice",
+    "dialogue_greeting": "dialogue/greeting.json"
+  }
+}
