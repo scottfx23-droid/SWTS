@@ -1,0 +1,24 @@
+{
+  "$schema": "swts-config-v1",
+  "scenario": {"name": "Tatooine Run", "version": "0.1-demo"},
+  "prop": {
+    "type": "terminal",
+    "id": "TERM_01",
+    "ssid": "SWTS_TERM_01",
+    "wifi_channel": 1,
+    "name": "Repair Shop Decoder",
+    "faction": "rebel",
+    "location_hint": "Speeder repair shop, attached to cantina"
+  },
+  "hardware": {
+    "has_nfc_reader": true,
+    "has_buzzer": true,
+    "buzzer_pin": 4
+  },
+  "behavior": {
+    "scan_cooldown_ms": 1500,
+    "accepts_datatapes": true,
+    "datatape_action": "decrypt",
+    "dialogue_greeting": "dialogue/greeting.json"
+  }
+}

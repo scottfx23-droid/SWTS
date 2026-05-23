@@ -1,0 +1,44 @@
+{
+  "$schema": "swts-missions-v1",
+  "missions": [
+    {
+      "id": "intel_run",
+      "title": "INTEL RUN",
+      "subtitle": "Recover encrypted intel from the outpost and deliver it to R5-D8",
+      "faction": "REBEL",
+      "briefing": "Operative, a rebel sympathizer at the Twin Suns Cantina has dead-dropped an intel package for us.\n\nFind the datacard at the outpost, take it to the Repair Shop Decoder to decrypt, and hand the coordinates to R5-D8 who is hiding in the storage facility.\n\nImperial patrols are sweeping the area. Stay low.",
+      "difficulty": 1,
+      "reward_credits": 250,
+      "reward_xp": 100,
+      "reward_item": "ALLIANCE COMMENDATION",
+      "unlocks": "",
+      "starts_unlocked": true,
+      "steps": [
+        {
+          "title": "Pick up the Datacard",
+          "description": "Search the cantina and cafe for an INTEL_01 datacard. Scan it on your datapad.",
+          "type": "scan_nfc",
+          "target": "INTEL_01",
+          "xp": 30
+        },
+        {
+          "title": "Decrypt at the Repair Shop",
+          "description": "Carry the encrypted vault key DT_VAULT to the Repair Shop Terminal and scan it on the terminal reader.",
+          "type": "connect_prop",
+          "target": "SWTS_TERM",
+          "xp": 60
+        },
+        {
+          "title": "Deliver to R5-D8",
+          "description": "Find R5-D8 in the storage facility and hand off the decrypted intel.",
+          "type": "connect_prop",
+          "target": "SWTS_DROID",
+          "xp": 100
+        }
+      ]
+    }
+  ],
+  "nfc_triggers": [
+    { "token": "INTEL_01", "action": "step",  "mission": "intel_run", "step": 0 }
+  ]
+}

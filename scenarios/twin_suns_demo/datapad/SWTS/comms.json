@@ -1,0 +1,33 @@
+{
+  "$schema": "swts-comms-v1",
+  "messages": [
+    {
+      "id": "welcome",
+      "from": "ALLIANCE COMMAND",
+      "subject": "WELCOME TO TATOOINE",
+      "body": "Operative, you've been deployed to the Twin Suns Outpost. A rebel contact has left intel for us at the cantina. Find it, decrypt it at the Repair Shop Terminal, and get the coordinates to R5-D8 in the storage facility. Watch for Imperial patrols.",
+      "trigger": "boot"
+    },
+    {
+      "id": "intel_acquired",
+      "from": "R5-D8",
+      "subject": "SIGNAL ACQUIRED",
+      "body": "BEEP BOOP. Translation: Datacard located. The encryption is heavy — you'll need a friendly terminal to break it. The Repair Shop Decoder will do.",
+      "trigger": "mission_start:intel_run"
+    },
+    {
+      "id": "terminal_directions",
+      "from": "ALLIANCE COMMAND",
+      "subject": "DECRYPTION ROUTE",
+      "body": "Operative, the Repair Shop Terminal on the cantina is rebel-friendly. Carry the vault key DT_VAULT to it and present the card at its reader port. The terminal will broadcast confirmation when decryption is complete.",
+      "trigger": "event:nfc:TERM_01:INTEL_01"
+    },
+    {
+      "id": "decrypt_complete",
+      "from": "REPAIR SHOP TERMINAL",
+      "subject": "DECRYPTION COMPLETE",
+      "body": "Vault key DT_VAULT verified. Coordinates extracted. Transmitting to R5-D8. Recommend handoff at the storage facility immediately.",
+      "trigger": "event:nfc:TERM_01:DT_VAULT"
+    }
+  ]
+}

@@ -1,0 +1,104 @@
+{
+  "$schema": "swts-gm-config-v1",
+  "scenario": {
+    "name": "Tatooine Run",
+    "version": "0.1-demo",
+    "planet": "Tatooine",
+    "currency": "CR"
+  },
+  "device": {
+    "id": "GM-1",
+    "role": "gamemaster"
+  },
+  "game": {
+    "max_score": 1000,
+    "event_duration_min": 30,
+    "auto_advance": false
+  },
+  "ui": {
+    "tabs": [
+      {"id": "events",   "label": "EVENTS",   "color": "amber"},
+      {"id": "comms",    "label": "COMMS",    "color": "cyan"},
+      {"id": "bounties", "label": "BOUNTIES", "color": "red"},
+      {"id": "players",  "label": "PLAYERS",  "color": "amber"},
+      {"id": "panels",   "label": "PANELS",   "color": "cyan"}
+    ]
+  },
+  "events": [
+    {
+      "id": "imperial_patrol",
+      "name": "IMPERIAL PATROL",
+      "severity": 2,
+      "description": "Stormtrooper patrol sweeping the area. All operatives take cover and avoid open ground."
+    },
+    {
+      "id": "sandstorm",
+      "name": "INCOMING SANDSTORM",
+      "severity": 1,
+      "description": "Sand levels rising. Visibility dropping. Move quickly between buildings."
+    },
+    {
+      "id": "cantina_lockdown",
+      "name": "CANTINA LOCKDOWN",
+      "severity": 3,
+      "description": "Imperial security has locked down the cantina. Avoid the area until further notice."
+    },
+    {
+      "id": "bounty_posted",
+      "name": "BOUNTY POSTED",
+      "severity": 1,
+      "description": "High-value target identified. Check the wanted board."
+    },
+    {
+      "id": "all_clear",
+      "name": "ALL CLEAR",
+      "severity": 0,
+      "description": "Patrol has moved on. Resume normal operations."
+    },
+    {
+      "id": "extraction_inbound",
+      "name": "EXTRACTION INBOUND",
+      "severity": 0,
+      "description": "Lambda shuttle inbound for pickup. All operatives complete current objectives and report in."
+    }
+  ],
+  "comms": [
+    {
+      "id": "gm_patrol_warn",
+      "from": "OUTPOST SECURITY",
+      "subject": "PATROL WARNING",
+      "body": "Imperial patrol detected. Avoid the speeder repair area for the next 5 minutes."
+    },
+    {
+      "id": "gm_bounty_alert",
+      "from": "ALLIANCE INTEL",
+      "subject": "PRIORITY ALERT",
+      "body": "A bounty hunter has been spotted near the cantina. Check the wanted board for details."
+    },
+    {
+      "id": "gm_extraction_brief",
+      "from": "ALLIANCE COMMAND",
+      "subject": "EXTRACTION DETAILS",
+      "body": "Once R5 has the intel, regroup at the cafe for pickup. Lambda shuttle ETA 10 minutes."
+    },
+    {
+      "id": "gm_well_done",
+      "from": "ALLIANCE COMMAND",
+      "subject": "FIELD COMMENDATION",
+      "body": "Outstanding work, operative. Mission objectives complete. Your service is logged."
+    }
+  ],
+  "bounties": [
+    {
+      "id": "bounty_greedo",
+      "target_name": "Greedo",
+      "description": "Rodian bounty hunter casing the Twin Suns Cantina. Armed, opportunistic, working freelance for the Empire.",
+      "reward": 300,
+      "clues": [
+        "Last seen at the cantina bar. Green skin, big black eyes, holstered DT-12 blaster.",
+        "Asked the bartender about Rebel sympathizers. Suspects something.",
+        "Heading toward the speeder repair area — intercept before he reaches the terminal."
+      ]
+    }
+  ]
+}

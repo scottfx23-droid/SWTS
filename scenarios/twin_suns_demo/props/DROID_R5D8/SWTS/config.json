@@ -1,0 +1,25 @@
+{
+  "$schema": "swts-config-v1",
+  "scenario": {"name": "Tatooine Run", "version": "0.1-demo"},
+  "prop": {
+    "type": "droid",
+    "id": "DROID_R5D8",
+    "ssid": "SWTS_DROID_R5",
+    "wifi_channel": 1,
+    "name": "R5-D8",
+    "faction": "rebel",
+    "location_hint": "Storage facility (the generic building)"
+  },
+  "hardware": {
+    "has_nfc_reader": false,
+    "has_leds": true,
+    "has_buzzer": true,
+    "buzzer_pin": 4
+  },
+  "behavior": {
+    "idle_animation": "astromech_idle",
+    "accepts_intel": true,
+    "completes_mission": "intel_run",
+    "dialogue_greeting": "dialogue/greeting.json"
+  }
+}

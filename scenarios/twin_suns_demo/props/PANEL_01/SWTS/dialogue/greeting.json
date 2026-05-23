@@ -1,0 +1,13 @@
+{
+  "type": "dialogue",
+  "speaker": {"name": "Cantina Comm Board", "faction": "neutral"},
+  "lines": [
+    {"text": "BACKROOM TERMINAL // OPEN CHANNEL", "style": "system"},
+    {"text": "\"You looking for someone? Half the patrons in here are. Spice traders, smugglers, the occasional Jedi — nobody asks questions.\"", "style": "barkeep"},
+    {"text": "Local news ticker: Speeder thieves spotted near the repair shop. Imperial bounties posted on the wanted board. Sandstorm warning in effect.", "style": "info"}
+  ],
+  "choices": [
+    {"label": "Listen for rumors", "next_action": "rumor"},
+    {"label": "[Disconnect]", "next_action": null}
+  ]
+}

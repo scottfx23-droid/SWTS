@@ -1,0 +1,11 @@
+{
+  "type": "dialogue",
+  "speaker": {"name": "Repair Shop Decoder", "faction": "rebel"},
+  "lines": [
+    {"text": "DECODER ONLINE // REBEL-FRIENDLY", "style": "system"},
+    {"text": "Present an encrypted datacard at the reader port. I'll handle the rest.", "style": "info"}
+  ],
+  "choices": [
+    {"label": "[Disconnect]", "next_action": null}
+  ]
+}

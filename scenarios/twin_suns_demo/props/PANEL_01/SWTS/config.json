@@ -1,0 +1,25 @@
+{
+  "$schema": "swts-config-v1",
+  "scenario": {"name": "Tatooine Run", "version": "0.1-demo"},
+  "prop": {
+    "type": "panel",
+    "id": "PANEL_01",
+    "ssid": "SWTS_PANEL_01",
+    "wifi_channel": 1,
+    "name": "Cantina Comm Board",
+    "faction": "neutral",
+    "location_hint": "Twin Suns Cantina dome"
+  },
+  "hardware": {
+    "has_nfc_reader": false,
+    "has_leds": false,
+    "has_buzzer": true,
+    "buzzer_pin": 4
+  },
+  "behavior": {
+    "idle_animation": "cantina_pulse",
+    "requires_auth_card": false,
+    "slice_first": false,
+    "dialogue_greeting": "dialogue/greeting.json"
+  }
+}

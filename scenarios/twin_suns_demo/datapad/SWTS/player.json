@@ -1,0 +1,10 @@
+{
+  "$schema": "swts-player-v1",
+  "callsign": "OPERATIVE",
+  "score": 0,
+  "xp": 0,
+  "totalScans": 0,
+  "missions": [],
+  "comms_read": [],
+  "bounties_won": []
+}

@@ -1,0 +1,12 @@
+{
+  "type": "dialogue",
+  "speaker": {"name": "R5-D8", "faction": "rebel"},
+  "lines": [
+    {"text": "BEEP-BWEEP-WHIRR. (Translation: About time you showed up.)", "style": "droid"},
+    {"text": "Did you decrypt the package? If yes, I'll log the handoff and signal Command. If not, get to the Repair Shop Decoder first.", "style": "system"}
+  ],
+  "choices": [
+    {"label": "Hand off intel", "next_action": "deliver_intel"},
+    {"label": "[Disconnect]", "next_action": null}
+  ]
+}

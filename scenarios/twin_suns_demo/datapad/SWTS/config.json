@@ -1,0 +1,9 @@
+{
+  "$schema": "swts-config-v1",
+  "scenario": {
+    "name": "Tatooine Run",
+    "version": "0.1-demo",
+    "planet": "Tatooine",
+    "currency": "CR"
+  }
+}

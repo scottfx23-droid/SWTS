@@ -1,0 +1,30 @@
+{
+  "$schema": "swts-nfc-map-v1",
+  "_comment": "UID-to-content map. The 'uid' keys are placeholders — replace with the actual hex UIDs of YOUR physical NFC tags once you've scanned them in the datacard reader to learn the IDs.",
+  "tags": {
+    "01:23:45:67": {
+      "type": "datacard",
+      "id": "INTEL_01",
+      "name": "Rebel Intel Drop",
+      "category": "mission_trigger",
+      "description": "An encrypted intel package left by a rebel sympathizer at the cantina.",
+      "triggers_mission": "intel_run"
+    },
+    "01:23:45:68": {
+      "type": "datatape",
+      "id": "DT_VAULT",
+      "name": "Vault Key DT_VAULT",
+      "category": "key",
+      "description": "Imperial-grade vault key. Must be scanned at a Rebel-friendly terminal to decrypt.",
+      "grants_access": "decrypt"
+    },
+    "01:23:45:69": {
+      "type": "cargo",
+      "id": "CARGO_01",
+      "name": "Spice Shipment",
+      "category": "currency",
+      "description": "A small crate of refined spice. Sells for credits.",
+      "award_credits": 75
+    }
+  }
+}

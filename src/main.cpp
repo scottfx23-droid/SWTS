@@ -11,6 +11,7 @@
 #include <SPI.h>
 #include <SD.h>
 #include <Adafruit_PN532.h>
+#include <soc/rtc_cntl_reg.h>   // RTC_CNTL_BROWN_OUT_REG — disable brownout detector
 
 #include "icons.h"
 #include "missions.h"
@@ -527,6 +528,14 @@ lv_obj_t *scrMissions = NULL, *scrBounty = NULL, *scrCargo = NULL, *scrComms = N
 lv_obj_t *scrProp = NULL;
 lv_obj_t *scrSlice = NULL;  // Slice minigame screen
 lv_obj_t *dcSpinner = NULL, *dcPrompt = NULL, *dcResult = NULL;
+lv_obj_t *cgSpinner = NULL, *cgPrompt = NULL, *cgResult = NULL;
+bool cgScanning = true;
+
+// True when an NDEF text payload looks like a cargo crate id (e.g. CARGO_01).
+inline bool isCargoTag(const char *text) {
+    if (!text) return false;
+    return (strncasecmp(text, "CARGO_", 6) == 0) || (strncasecmp(text, "CARGO-", 6) == 0);
+}
 lv_obj_t *nbList = NULL, *nbStatus = NULL, *nbSpinner = NULL;
 bool dcScanning = true;
 
@@ -890,6 +899,39 @@ void readNdefText() {
 
 void showCardResult(uint8_t *uid, uint8_t len) {
     totalScans++;
+
+    // If a cargo crate was placed on this reader by mistake, redirect the player.
+    if (isCargoTag(ndefText)) {
+        lv_obj_add_flag(dcSpinner, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(dcPrompt, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(dcResult, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clean(dcResult);
+        lv_obj_set_style_border_color(dcResult, C_AMB_BRT, 0);
+
+        lv_obj_t *hd = lv_label_create(dcResult);
+        lv_label_set_text(hd, "WRONG READER");
+        lv_obj_set_style_text_font(hd, &lv_font_montserrat_18, 0);
+        lv_obj_set_style_text_color(hd, C_AMB_BRT, 0);
+        lv_obj_set_pos(hd, 10, 8);
+
+        lv_obj_t *nm = lv_label_create(dcResult);
+        char nb[64]; snprintf(nb, sizeof(nb), "Detected: %s", ndefText);
+        lv_label_set_text(nm, nb);
+        lv_obj_set_style_text_font(nm, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_color(nm, C_TXT, 0);
+        lv_obj_set_pos(nm, 10, 40);
+
+        lv_obj_t *body = lv_label_create(dcResult);
+        lv_label_set_text(body, "This is a supply crate.\n\nReturn to home and use\nCARGO INTEL to scan.");
+        lv_obj_set_style_text_font(body, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(body, C_AMB, 0);
+        lv_obj_set_width(body, W - 40);
+        lv_obj_set_pos(body, 10, 84);
+
+        buzzerScanFail();
+        dcScanning = false;
+        return;
+    }
 
     // TEMPORARY: show ONLY the NDEF text — nothing else
     lv_obj_add_flag(dcSpinner, LV_OBJ_FLAG_HIDDEN);
@@ -1883,7 +1925,8 @@ void showPropGreeting() {
 
     lv_obj_clean(propContent);
 
-    // Dialogue lines
+    // Dialogue lines — advance by each label's actual rendered height so
+    // wrapped multi-line texts don't get drawn over by the next line.
     JsonArray lines = doc["lines"].as<JsonArray>();
     int y = 4;
     for (JsonObject line : lines) {
@@ -1891,8 +1934,9 @@ void showPropGreeting() {
         const char* style = line["style"] | "speech";
 
         lv_obj_t *l = lv_label_create(propContent);
-        lv_label_set_text(l, text);
         lv_obj_set_width(l, W - 60);
+        lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+        lv_label_set_text(l, text);
         lv_obj_set_pos(l, 10, y);
 
         if (strcmp(style, "narration") == 0) {
@@ -1905,7 +1949,9 @@ void showPropGreeting() {
             lv_obj_set_style_text_font(l, &lv_font_montserrat_14, 0);
             lv_obj_set_style_text_color(l, C_AMB, 0);
         }
-        y += 28;
+        lv_obj_update_layout(l);
+        int h = lv_obj_get_height(l);
+        y += (h > 0 ? h : 20) + 6;   // measured height + small gap
     }
 
     // Separator before choices
@@ -2498,11 +2544,149 @@ void buildBountyDetailScreen() {
     lv_obj_center(bbl);
 }
 
+// ═══════════════════════════════════════
+//  CARGO INTEL SCREEN — NFC reader for CARGO_## crate tags
+// ═══════════════════════════════════════
+static void ev_cg_back(lv_event_t *e) { lv_scr_load_anim(scrHome, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 180, 0, false); }
+
 void buildCargoScreen() {
-    scrCargo = buildStubScreen("CARGO INTEL", &ico_cargo,
-        "CRATE ISB-7742",
-        "Imperial supply crate reported near\nthe eastern corridor loading dock",
-        "SCAN AREA TO TRIANGULATE POSITION");
+    scrCargo = lv_obj_create(NULL);
+    lv_obj_add_style(scrCargo, &s_scr, 0);
+    makeSubHeader(scrCargo, "CARGO INTEL", ev_cg_back);
+
+    cgSpinner = lv_spinner_create(scrCargo, 1000, 60);
+    lv_obj_set_size(cgSpinner, 140, 140);
+    lv_obj_align(cgSpinner, LV_ALIGN_CENTER, 0, -50);
+    lv_obj_set_style_arc_color(cgSpinner, C_AMB, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(cgSpinner, C_FRM, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(cgSpinner, 8, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_width(cgSpinner, 3, LV_PART_MAIN);
+
+    lv_obj_t *dot = lv_obj_create(scrCargo);
+    lv_obj_remove_style_all(dot);
+    lv_obj_set_size(dot, 16, 16);
+    lv_obj_align(dot, LV_ALIGN_CENTER, 0, -50);
+    lv_obj_set_style_bg_color(dot, C_AMB_BRT, 0);
+    lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+
+    cgPrompt = lv_label_create(scrCargo);
+    lv_label_set_text(cgPrompt, "PRESENT CRATE TAG\nTO READER PORT");
+    lv_obj_set_style_text_font(cgPrompt, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(cgPrompt, C_TXT, 0);
+    lv_obj_set_style_text_align(cgPrompt, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_letter_space(cgPrompt, 1, 0);
+    lv_obj_align(cgPrompt, LV_ALIGN_CENTER, 0, 60);
+
+    lv_obj_t *sub = lv_label_create(scrCargo);
+    lv_label_set_text(sub, "MANIFEST SCANNER STANDING BY");
+    lv_obj_set_style_text_font(sub, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(sub, C_DIM, 0);
+    lv_obj_set_style_text_letter_space(sub, 2, 0);
+    lv_obj_align(sub, LV_ALIGN_CENTER, 0, 100);
+
+    cgResult = lv_obj_create(scrCargo);
+    lv_obj_set_size(cgResult, W - 16, 240);
+    lv_obj_align(cgResult, LV_ALIGN_CENTER, 0, 30);
+    lv_obj_add_style(cgResult, &s_pnl, 0);
+    lv_obj_set_style_border_width(cgResult, 2, 0);
+    lv_obj_add_flag(cgResult, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(cgResult, LV_OBJ_FLAG_SCROLLABLE);
+
+    hline(scrCargo, H - 28, C_FRM, 1);
+    lv_obj_t *ftr = lv_obj_create(scrCargo);
+    lv_obj_set_size(ftr, W, 27); lv_obj_set_pos(ftr, 0, H - 27);
+    lv_obj_add_style(ftr, &s_ftr, 0);
+    lv_obj_clear_flag(ftr, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *fl = lv_label_create(ftr);
+    lv_label_set_text(fl, nfcOk ? "MANIFEST PORT ACTIVE" : "MANIFEST PORT OFFLINE");
+    lv_obj_set_style_text_font(fl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(fl, nfcOk ? C_AMB : C_AMB_DIM, 0);
+    lv_obj_align(fl, LV_ALIGN_LEFT_MID, 0, 0);
+}
+
+void showCargoResult(uint8_t *uid, uint8_t len) {
+    totalScans++;
+    lv_obj_add_flag(cgSpinner, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(cgPrompt, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(cgResult, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clean(cgResult);
+
+    // If this isn't a CARGO_* tag, redirect player to the Datacard reader.
+    if (!isCargoTag(ndefText)) {
+        lv_obj_set_style_border_color(cgResult, C_AMB_BRT, 0);
+
+        lv_obj_t *hd = lv_label_create(cgResult);
+        lv_label_set_text(hd, "WRONG READER");
+        lv_obj_set_style_text_font(hd, &lv_font_montserrat_18, 0);
+        lv_obj_set_style_text_color(hd, C_AMB_BRT, 0);
+        lv_obj_set_pos(hd, 10, 8);
+
+        lv_obj_t *nm = lv_label_create(cgResult);
+        char nb[64];
+        if (ndefText[0]) snprintf(nb, sizeof(nb), "Detected: %s", ndefText);
+        else             snprintf(nb, sizeof(nb), "Detected: (no payload)");
+        lv_label_set_text(nm, nb);
+        lv_obj_set_style_text_font(nm, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_color(nm, C_TXT, 0);
+        lv_obj_set_pos(nm, 10, 40);
+
+        lv_obj_t *body = lv_label_create(cgResult);
+        lv_label_set_text(body, "This is not a cargo crate.\n\nReturn to home and use\nDATACARD reader.");
+        lv_obj_set_style_text_font(body, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(body, C_AMB, 0);
+        lv_obj_set_width(body, W - 40);
+        lv_obj_set_pos(body, 10, 84);
+
+        buzzerScanFail();
+        cgScanning = false;
+        return;
+    }
+
+    // Real cargo identification
+    lv_obj_set_style_border_color(cgResult, C_AMB, 0);
+
+    lv_obj_t *hd = lv_label_create(cgResult);
+    lv_label_set_text(hd, "CRATE IDENTIFIED");
+    lv_obj_set_style_text_font(hd, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(hd, C_AMB_BRT, 0);
+    lv_obj_set_pos(hd, 10, 8);
+
+    lv_obj_t *nm = lv_label_create(cgResult);
+    lv_label_set_text(nm, ndefText);
+    lv_obj_set_style_text_font(nm, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(nm, C_AMB, 0);
+    lv_obj_set_pos(nm, 10, 40);
+
+    char uidStr[24];
+    if (len == 4) snprintf(uidStr, sizeof(uidStr), "UID: %02X:%02X:%02X:%02X", uid[0], uid[1], uid[2], uid[3]);
+    else snprintf(uidStr, sizeof(uidStr), "UID: %02X:%02X:%02X:%02X:%02X:%02X:%02X",
+                  uid[0], uid[1], uid[2], uid[3], uid[4], uid[5], uid[6]);
+    lv_obj_t *ub = lv_label_create(cgResult);
+    lv_label_set_text(ub, uidStr);
+    lv_obj_set_style_text_font(ub, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ub, C_DIM, 0);
+    lv_obj_set_pos(ub, 10, 80);
+
+    lv_obj_t *body = lv_label_create(cgResult);
+    lv_label_set_text(body, "Manifest logged.\n\nReport contents to a rebel\ncontact for a reward.");
+    lv_obj_set_style_text_font(body, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(body, C_TXT, 0);
+    lv_obj_set_width(body, W - 40);
+    lv_obj_set_pos(body, 10, 110);
+
+    inventoryItems++;
+    refreshHomeBadges();
+    buzzerScanOk();
+    cgScanning = false;
+}
+
+void resetCgScan() {
+    if (!cgResult) return;
+    lv_obj_add_flag(cgResult, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(cgSpinner, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(cgPrompt, LV_OBJ_FLAG_HIDDEN);
+    cgScanning = true;
 }
 
 // ═══════════════════════════════════════
@@ -3327,12 +3511,42 @@ void setup() {
     S.println("\n================================");
     S.println("  SWTS DATAPAD — Czerka DP-47");
     S.println("================================");
+    // Why did the previous boot end? Critical info for diagnosing "random reboots":
+    //   POWERON_RESET (1) = power cycle / USB suspend on host
+    //   SW_RESET (3)     = ESP.restart() called by firmware
+    //   WDT_RESET (4)    = task watchdog timed out (firmware hang)
+    //   INT_WDT (5)      = interrupt watchdog
+    //   BROWNOUT_RESET(15) = voltage sagged (power supply too weak)
+    //   USB_RESET, RTC_WDT, etc.
+    {
+        esp_reset_reason_t r = esp_reset_reason();
+        const char *names[] = {
+            "UNKNOWN", "POWERON", "EXT", "SW", "PANIC", "INT_WDT", "TASK_WDT",
+            "WDT", "DEEPSLEEP", "BROWNOUT", "SDIO", "USB", "JTAG", "EFUSE", "PWR_GLITCH", "CPU_LOCKUP"
+        };
+        const char *name = (r < (sizeof(names)/sizeof(names[0]))) ? names[r] : "?";
+        S.printf("[BOOT] reset_reason = %d (%s)\n", (int)r, name);
+    }
 
     // Buzzer
     pinMode(BUZZER_PIN, OUTPUT);
 
     // Physical buttons + their LEDs (cycle test on boot)
     initButtons();
+    // All three lit solid; each one beeps a distinct tone when pressed.
+    // Frequencies chosen to span a wide range — typical passive piezos have
+    // a narrow resonant peak so 523/698/880 Hz all sound the same. Spreading
+    // these across ~5x gives clearly audible difference.
+    btnHandler = [](BtnColor c) {
+        switch (c) {
+            case BTN_BLUE:  buzzerTone(600, 120);  break;   // low
+            case BTN_WHITE: buzzerTone(1500, 120); break;   // mid
+            case BTN_RED:   buzzerTone(3000, 120); break;   // high
+        }
+    };
+    ledOn(BTN_BLUE);
+    ledOn(BTN_WHITE);
+    ledOn(BTN_RED);
 
     // Display (must init before SD since they share SPI)
     tft.init(); tft.setRotation(2); tft.setBrightness(255);
@@ -3426,6 +3640,7 @@ void setup() {
 //  LOOP
 // ═══════════════════════════════════════
 static unsigned long dcTime = 0;
+static unsigned long cgTime = 0;
 
 void loop() {
     lv_timer_handler();
@@ -3439,9 +3654,14 @@ void loop() {
     if (uiDirtyBountyList)   { uiDirtyBountyList = false;   refreshBountyList(); }
     if (uiDirtyBountyDetail) {
         uiDirtyBountyDetail = false;
-        if (scrBountyDetail && currentBounty) {
+        if (currentBounty) {
+            // Explicit delete-then-rebuild so the old screen object is freed.
+            // buildBountyDetailScreen() reassigns scrBountyDetail to a fresh lv_obj.
+            lv_obj_t *oldScr = scrBountyDetail;
+            scrBountyDetail = nullptr;
             buildBountyDetailScreen();
-            lv_scr_load_anim(scrBountyDetail, LV_SCR_LOAD_ANIM_NONE, 0, 0, true);
+            if (scrBountyDetail) lv_scr_load_anim(scrBountyDetail, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
+            if (oldScr) lv_obj_del(oldScr);
         }
     }
 
@@ -3455,14 +3675,28 @@ void loop() {
     if (act == scrDatacard && dcScanning && nfcOk) {
         uint8_t uid[7]; uint8_t len;
         if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &len, 80)) {
-            readNdefText();  // read NDEF while tag is still on reader
-            buzzerScanOk(); // chirp on successful scan
+            readNdefText();
+            // showCardResult plays its own buzzer (ok for datacard, fail for cargo redirect)
+            if (!isCargoTag(ndefText)) buzzerScanOk();
             showCardResult(uid, len);
             dcTime = millis();
         }
     }
     if (act == scrDatacard && !dcScanning && dcTime && millis() - dcTime > 4000) {
         resetDcScan(); dcTime = 0;
+    }
+
+    // Cargo Intel — same flow but filtered for CARGO_* tags
+    if (act == scrCargo && cgScanning && nfcOk) {
+        uint8_t uid[7]; uint8_t len;
+        if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &len, 80)) {
+            readNdefText();
+            showCargoResult(uid, len);   // plays its own buzzer based on outcome
+            cgTime = millis();
+        }
+    }
+    if (act == scrCargo && !cgScanning && cgTime && millis() - cgTime > 4000) {
+        resetCgScan(); cgTime = 0;
     }
 
     // Scan on screen entry (once)
@@ -3536,10 +3770,17 @@ void loop() {
     if (millis() - lastStatus > 5000) {
         lastStatus = millis();
         unsigned long up = millis() / 1000;
-        S.printf("[STATUS] cs=%s up=%lus touch=%s nfc=%s sd=%s %s=%d scans=%d msns=%d read=%d won=%d dirty=%d\n",
+        // Heap diagnostics — track minimum-ever-seen so we can see slow leaks
+        static uint32_t heapMinEver = 0xFFFFFFFF;
+        uint32_t freeHeap = ESP.getFreeHeap();
+        uint32_t freePsram = ESP.getFreePsram();
+        if (freeHeap < heapMinEver) heapMinEver = freeHeap;
+        S.printf("[STATUS] cs=%s up=%lus touch=%s nfc=%s sd=%s %s=%d scans=%d msns=%d read=%d won=%d dirty=%d btn[B6=%d W8=%d R10=%d] heap=%u (min=%u) psram=%u\n",
                  callsign, up, touchOk ? "OK" : "--", nfcOk ? "OK" : "--", sdOk ? "OK" : "--",
                  scoreSuffix, score, totalScans, activeMissions,
-                 playerReadCommCount, playerWonBountyCount, (int)playerDirty);
+                 playerReadCommCount, playerWonBountyCount, (int)playerDirty,
+                 digitalRead(BTN_BLUE_PIN), digitalRead(BTN_WHITE_PIN), digitalRead(BTN_RED_PIN),
+                 (unsigned)freeHeap, (unsigned)heapMinEver, (unsigned)freePsram);
 
         // Tell GM we're alive + send full status
         swts::sendStatus(up, score, activeMissions, 0, totalScans, 0);
