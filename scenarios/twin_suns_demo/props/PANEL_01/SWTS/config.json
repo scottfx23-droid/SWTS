@@ -20,6 +20,8 @@
     "idle_animation": "cantina_pulse",
     "requires_auth_card": false,
     "slice_first": false,
+    "minigame_default": "simon",
+    "simon_rounds": 3,
     "dialogue_greeting": "dialogue/greeting.json"
   }
 }

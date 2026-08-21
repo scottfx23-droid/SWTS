@@ -12,6 +12,7 @@
 #include <SD.h>
 #include <Adafruit_PN532.h>
 #include <soc/rtc_cntl_reg.h>   // RTC_CNTL_BROWN_OUT_REG — disable brownout detector
+#include <esp_random.h>         // esp_random() — hardware RNG for the Simon sequence
 
 #include "icons.h"
 #include "missions.h"
@@ -527,6 +528,7 @@ lv_obj_t *scrHome = NULL, *scrDatacard = NULL, *scrNearby = NULL;
 lv_obj_t *scrMissions = NULL, *scrBounty = NULL, *scrCargo = NULL, *scrComms = NULL;
 lv_obj_t *scrProp = NULL;
 lv_obj_t *scrSlice = NULL;  // Slice minigame screen
+lv_obj_t *scrSimon = NULL;  // Simon Says (pattern lock) minigame screen
 lv_obj_t *dcSpinner = NULL, *dcPrompt = NULL, *dcResult = NULL;
 lv_obj_t *cgSpinner = NULL, *cgPrompt = NULL, *cgResult = NULL;
 bool cgScanning = true;
@@ -1848,6 +1850,315 @@ void updateSliceGame() {
     }
 }
 
+// ═══════════════════════════════════════
+//  SIMON SAYS MINIGAME — "PATTERN LOCK"
+//  Uses the three physical arcade buttons (Blue / White / Red) and their
+//  LEDs + buzzer. The panel plays back a growing color sequence on the
+//  LEDs; the player repeats it on the buttons. One extra step is revealed
+//  each round. Clear `simonRounds` rounds to breach the lock.
+//
+//  Number of rounds comes from the panel's start_simon JSON ("rounds"),
+//  defaulting to SIMON_DEFAULT_ROUNDS.
+// ═══════════════════════════════════════
+#define SIMON_MAX_ROUNDS     16
+#define SIMON_DEFAULT_ROUNDS 3
+
+// Playback timing (non-blocking, driven from loop())
+#define SIMON_ON_MS     460   // LED lit per step
+#define SIMON_OFF_MS    220   // gap between steps
+#define SIMON_START_MS  650   // pause before a round's playback begins
+#define SIMON_INPUT_MS  10000 // per-round input inactivity timeout
+
+// Per-color playback tones (match the boot-time button tones)
+static const int SIMON_TONE[3] = { 600, 1500, 3000 };  // BLUE, WHITE, RED
+
+enum SimonPhase : uint8_t {
+    SP_PRE,        // short pause, then playback
+    SP_PLAY,       // flashing the sequence back
+    SP_INPUT,      // waiting for the player to repeat it
+    SP_ROUND_OK,   // brief success flash before next round
+    SP_DONE        // won or lost — waiting to return to prop screen
+};
+
+uint8_t  simonSeq[SIMON_MAX_ROUNDS];
+int      simonRounds   = SIMON_DEFAULT_ROUNDS;  // total rounds (from JSON)
+int      simonLen      = 0;   // steps revealed this round (== round number)
+int      simonPlayIdx  = 0;   // playback cursor
+int      simonInputPos = 0;   // correct presses so far this round
+bool     simonLedOn    = false;
+SimonPhase simonPhase  = SP_PRE;
+unsigned long simonPhaseTime = 0;
+unsigned long simonInputTime = 0;
+bool     simonActive = false;
+bool     simonWon    = false;
+
+// LVGL objects
+lv_obj_t *simonTitle   = NULL;
+lv_obj_t *simonStatus  = NULL;
+lv_obj_t *simonRoundLbl= NULL;
+lv_obj_t *simonHintLbl = NULL;
+lv_obj_t *simonPad[3]  = { NULL, NULL, NULL };  // on-screen mirror of the LEDs
+
+static const char *SIMON_PAD_LBL[3] = { "BLU", "WHT", "RED" };
+
+void buildSimonScreen();
+
+// Light/darken the on-screen pad for a color (mirrors the physical LED)
+static void simonPadSet(int c, bool on) {
+    if (!simonPad[c]) return;
+    lv_obj_set_style_bg_color(simonPad[c], on ? C_AMB_BRT : C_PNL, 0);
+    lv_obj_set_style_border_color(simonPad[c], on ? C_AMB_BRT : C_AMB_DIM, 0);
+}
+static void simonAllPadsOff() { for (int i = 0; i < 3; i++) simonPadSet(i, false); }
+
+// Turn a color's button LED + on-screen pad on/off together
+static void simonShow(int c, bool on) {
+    if (on) { digitalWrite(BUTTONS[c].led, HIGH); btnState[c].ledHeld = true; btnState[c].ledUntil = 0; }
+    else    ledOff((BtnColor)c);
+    simonPadSet(c, on);
+}
+
+static void simonSetRoundLabel() {
+    char rbuf[20];
+    snprintf(rbuf, sizeof(rbuf), "ROUND %d/%d", simonLen, simonRounds);
+    lv_label_set_text(simonRoundLbl, rbuf);
+}
+
+void startSimonGame(int rounds) {
+    simonRounds = rounds;
+    if (simonRounds < 1) simonRounds = 1;
+    if (simonRounds > SIMON_MAX_ROUNDS) simonRounds = SIMON_MAX_ROUNDS;
+
+    // Pre-generate the full random sequence; reveal one more step each round.
+    for (int i = 0; i < simonRounds; i++) simonSeq[i] = (uint8_t)(esp_random() % 3);
+
+    simonLen      = 1;
+    simonPlayIdx  = 0;
+    simonInputPos = 0;
+    simonLedOn    = false;
+    simonActive   = true;
+    simonWon      = false;
+    simonPhase    = SP_PRE;
+    simonPhaseTime = millis();
+}
+
+void buildSimonScreen() {
+    scrSimon = lv_obj_create(NULL);
+    lv_obj_add_style(scrSimon, &s_scr, 0);
+    lv_obj_clear_flag(scrSimon, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Title
+    simonTitle = lv_label_create(scrSimon);
+    lv_label_set_text(simonTitle, "PATTERN LOCK");
+    lv_obj_set_style_text_font(simonTitle, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(simonTitle, C_AMB_BRT, 0);
+    lv_obj_set_style_text_letter_space(simonTitle, 2, 0);
+    lv_obj_align(simonTitle, LV_ALIGN_TOP_MID, 0, 16);
+
+    // Status line
+    simonStatus = lv_label_create(scrSimon);
+    lv_label_set_text(simonStatus, "SLICING SECURITY ICE");
+    lv_obj_set_style_text_font(simonStatus, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(simonStatus, C_AMB, 0);
+    lv_obj_align(simonStatus, LV_ALIGN_TOP_MID, 0, 48);
+
+    // Round counter
+    simonRoundLbl = lv_label_create(scrSimon);
+    lv_label_set_text(simonRoundLbl, "ROUND 1/3");
+    lv_obj_set_style_text_font(simonRoundLbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(simonRoundLbl, C_DIM, 0);
+    lv_obj_align(simonRoundLbl, LV_ALIGN_TOP_MID, 0, 74);
+
+    hline(scrSimon, 110, C_FRM, 1);
+
+    // Three pads mirroring the physical buttons (BLU / WHT / RED order)
+    const int padW = 84, padH = 120, gap = 14;
+    const int totalW = padW * 3 + gap * 2;
+    const int x0 = (W - totalW) / 2;
+    const int padY = 150;
+    for (int i = 0; i < 3; i++) {
+        lv_obj_t *pad = lv_obj_create(scrSimon);
+        lv_obj_remove_style_all(pad);
+        lv_obj_set_size(pad, padW, padH);
+        lv_obj_set_pos(pad, x0 + i * (padW + gap), padY);
+        lv_obj_set_style_bg_color(pad, C_PNL, 0);
+        lv_obj_set_style_bg_opa(pad, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_color(pad, C_AMB_DIM, 0);
+        lv_obj_set_style_border_width(pad, 2, 0);
+        lv_obj_set_style_radius(pad, 4, 0);
+        lv_obj_clear_flag(pad, LV_OBJ_FLAG_SCROLLABLE);
+        simonPad[i] = pad;
+
+        lv_obj_t *pl = lv_label_create(pad);
+        lv_label_set_text(pl, SIMON_PAD_LBL[i]);
+        lv_obj_set_style_text_font(pl, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(pl, C_DIM, 0);
+        lv_obj_align(pl, LV_ALIGN_BOTTOM_MID, 0, -6);
+    }
+
+    // Hint / prompt at the bottom
+    simonHintLbl = lv_label_create(scrSimon);
+    lv_label_set_text(simonHintLbl, "WATCH THE SEQUENCE");
+    lv_obj_set_style_text_font(simonHintLbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(simonHintLbl, C_AMB, 0);
+    lv_obj_set_style_text_align(simonHintLbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(simonHintLbl, W - 40);
+    lv_obj_align(simonHintLbl, LV_ALIGN_BOTTOM_MID, 0, -70);
+
+    hline(scrSimon, H - 40, C_AMB_DIM, 2);
+    lv_obj_t *ftr = lv_label_create(scrSimon);
+    lv_label_set_text(ftr, "USE THE COLORED BUTTONS");
+    lv_obj_set_style_text_font(ftr, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ftr, C_AMB_DIM, 0);
+    lv_obj_align(ftr, LV_ALIGN_BOTTOM_MID, 0, -14);
+}
+
+void launchSimonGame(int rounds) {
+    startSimonGame(rounds);
+
+    simonAllPadsOff();
+    ledAllOff();
+    simonSetRoundLabel();
+    lv_label_set_text(simonStatus, "SLICING SECURITY ICE");
+    lv_obj_set_style_text_color(simonStatus, C_AMB, 0);
+    lv_label_set_text(simonHintLbl, "WATCH THE SEQUENCE");
+    lv_obj_set_style_text_color(simonHintLbl, C_AMB, 0);
+
+    // Flush any stray button edges so old presses don't count as input
+    for (int i = 0; i < 3; i++) btnState[i].pressed = false;
+
+    lv_scr_load_anim(scrSimon, LV_SCR_LOAD_ANIM_MOVE_LEFT, 180, 0, false);
+}
+
+static void simonFail() {
+    simonActive = false;
+    simonWon = false;
+    simonPhase = SP_DONE;
+    simonAllPadsOff();
+    ledAllOff();
+    buzzerFail();
+    lv_label_set_text(simonStatus, "SEQUENCE REJECTED");
+    lv_obj_set_style_text_color(simonStatus, C_AMB_DIM, 0);
+    lv_label_set_text(simonHintLbl, "SYSTEM LOCKED OUT");
+    lv_obj_set_style_text_color(simonHintLbl, C_AMB_DIM, 0);
+}
+
+static void simonWin() {
+    simonActive = false;
+    simonWon = true;
+    simonPhase = SP_DONE;
+    ledAllOff();
+    // Victory flash: all pads bright
+    for (int i = 0; i < 3; i++) simonPadSet(i, true);
+    buzzerSuccess();
+    lv_label_set_text(simonStatus, "LOCK BREACHED");
+    lv_obj_set_style_text_color(simonStatus, C_AMB_BRT, 0);
+    lv_label_set_text(simonHintLbl, "ACCESS GRANTED");
+    lv_obj_set_style_text_color(simonHintLbl, C_AMB_BRT, 0);
+}
+
+// Advance the game one frame. Called from loop() while scrSimon is active.
+void updateSimonGame() {
+    if (!simonActive) return;
+    unsigned long now = millis();
+
+    switch (simonPhase) {
+
+    case SP_PRE:
+        // Short pause, then start replaying the sequence
+        if (now - simonPhaseTime >= SIMON_START_MS) {
+            simonPlayIdx = 0;
+            simonLedOn = false;
+            simonPhase = SP_PLAY;
+            simonPhaseTime = now;
+            lv_label_set_text(simonHintLbl, "WATCH THE SEQUENCE");
+            lv_obj_set_style_text_color(simonHintLbl, C_AMB, 0);
+        }
+        break;
+
+    case SP_PLAY:
+        // simonPhaseTime marks the last on/off transition. A lit step lasts
+        // SIMON_ON_MS; the dark gap between steps lasts SIMON_OFF_MS.
+        if (simonLedOn) {
+            if (now - simonPhaseTime >= SIMON_ON_MS) {
+                simonShow(simonSeq[simonPlayIdx], false);
+                simonPlayIdx++;
+                simonLedOn = false;
+                simonPhaseTime = now;
+            }
+        } else if (now - simonPhaseTime >= SIMON_OFF_MS) {
+            if (simonPlayIdx >= simonLen) {
+                // Sequence finished — hand off to the player
+                simonAllPadsOff();
+                simonInputPos = 0;
+                simonInputTime = now;
+                simonPhase = SP_INPUT;
+                for (int i = 0; i < 3; i++) btnState[i].pressed = false;  // flush
+                lv_label_set_text(simonHintLbl, "REPEAT THE SEQUENCE");
+                lv_obj_set_style_text_color(simonHintLbl, C_AMB_BRT, 0);
+                break;
+            }
+            int c = simonSeq[simonPlayIdx];
+            simonShow(c, true);
+            buzzerTone(SIMON_TONE[c], SIMON_ON_MS - 40);
+            simonLedOn = true;
+            simonPhaseTime = now;
+        }
+        break;
+
+    case SP_INPUT: {
+        BtnColor pressed;
+        if (buttonAnyConsume(&pressed)) {
+            simonInputTime = now;
+            int expected = simonSeq[simonInputPos];
+            // Visual + audible feedback for the press
+            simonPadSet(pressed, true);
+            ledPulse(pressed, 160);
+            if ((int)pressed == expected) {
+                buzzerTone(SIMON_TONE[pressed], 120);
+                simonInputPos++;
+                // brief pad flash off scheduled implicitly by ledPulse; clear pad next frame
+                if (simonInputPos >= simonLen) {
+                    // Round cleared
+                    if (simonLen >= simonRounds) {
+                        simonWin();
+                    } else {
+                        simonLen++;
+                        simonSetRoundLabel();
+                        simonPhase = SP_ROUND_OK;
+                        simonPhaseTime = now;
+                        buzzerTone(1046, 90);
+                        lv_label_set_text(simonHintLbl, "SEQUENCE ACCEPTED");
+                        lv_obj_set_style_text_color(simonHintLbl, C_AMB_BRT, 0);
+                    }
+                }
+            } else {
+                simonFail();
+            }
+        } else {
+            // Clear any pad lit by a press once its LED pulse has expired
+            for (int i = 0; i < 3; i++)
+                if (!btnState[i].ledHeld && btnState[i].ledUntil == 0)
+                    simonPadSet(i, false);
+            // Input timeout
+            if (now - simonInputTime >= SIMON_INPUT_MS) simonFail();
+        }
+        break;
+    }
+
+    case SP_ROUND_OK:
+        simonAllPadsOff();
+        if (now - simonPhaseTime >= 650) {
+            simonPhase = SP_PRE;
+            simonPhaseTime = now;
+        }
+        break;
+
+    case SP_DONE:
+        break;
+    }
+}
+
 static void ev_prop_slice(lv_event_t *e) {
     // Request minigame start from prop
     String resp = postInteract("start_minigame");
@@ -1859,6 +2170,19 @@ static void ev_prop_slice(lv_event_t *e) {
     int diff = doc["difficulty"] | 2;
 
     launchSliceGame(diff);
+}
+
+static void ev_prop_simon(lv_event_t *e) {
+    // Request Simon Says (pattern lock) start from the panel.
+    // The panel supplies the round count in its JSON; default to 3.
+    String resp = postInteract("start_simon");
+    if (resp.length() == 0) return;
+
+    JsonDocument doc;
+    deserializeJson(doc, resp);
+    int rounds = doc["rounds"] | SIMON_DEFAULT_ROUNDS;
+
+    launchSimonGame(rounds);
 }
 
 static void ev_prop_logs(lv_event_t *e) {
@@ -1990,6 +2314,8 @@ void showPropGreeting() {
         // Wire action based on response
         if (actStr == "start_minigame") {
             lv_obj_add_event_cb(btn, ev_prop_slice, LV_EVENT_CLICKED, NULL);
+        } else if (actStr == "start_simon") {
+            lv_obj_add_event_cb(btn, ev_prop_simon, LV_EVENT_CLICKED, NULL);
         } else if (actStr == "read_logs") {
             lv_obj_add_event_cb(btn, ev_prop_logs, LV_EVENT_CLICKED, NULL);
         } else {
@@ -3628,6 +3954,7 @@ void setup() {
     buildCommsScreen();
     buildPropScreen();
     buildSliceScreen();
+    buildSimonScreen();
     lv_scr_load(scrHome);
 
     // ── ESPNOW Mesh ──
@@ -3751,6 +4078,47 @@ void loop() {
             http.end();
 
             if (sliceWon) {
+                score += 50;
+                xp += 50;
+                refreshScoreLabel();
+                playerDirty = true;
+                playerLastSave = 0;
+            }
+
+            // Return to prop screen with fresh greeting
+            lv_obj_clean(propContent);
+            showPropGreeting();
+            lv_scr_load_anim(scrProp, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 180, 0, false);
+        }
+    }
+
+    // Simon Says minigame: advance state machine each frame
+    if (act == scrSimon) {
+        updateSimonGame();
+
+        // Return to prop screen 2.5s after the game ends
+        static unsigned long simonEndTime = 0;
+        if (!simonActive && simonEndTime == 0) simonEndTime = millis();
+        if (!simonActive && simonEndTime > 0 && millis() - simonEndTime > 2500) {
+            simonEndTime = 0;
+            ledAllOff();
+
+            // Report result to panel
+            HTTPClient http;
+            http.begin("http://192.168.4.1/api/interact");
+            http.addHeader("Content-Type", "application/json");
+            JsonDocument req;
+            req["action"] = "minigame_result";
+            req["game"] = "simon";
+            req["won"] = simonWon;
+            req["rounds"] = simonRounds;
+            JsonObject p = req["player"].to<JsonObject>();
+            p["callsign"] = callsign;
+            String body; serializeJson(req, body);
+            http.POST(body);
+            http.end();
+
+            if (simonWon) {
                 score += 50;
                 xp += 50;
                 refreshScoreLabel();

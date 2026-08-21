@@ -144,8 +144,9 @@ struct PanelConfig {
     bool has_nfc           = true;
     bool requires_auth     = false;
     bool has_minigame      = true;
-    char minigame_type[16] = "slice";
+    char minigame_type[16] = "slice";   // "slice" or "simon"
     int  minigame_diff     = 2;
+    int  simon_rounds      = 3;         // Simon Says rounds (when minigame_type == "simon")
     bool slice_first       = true;   // require slice before showing menu
     char auth_cards[4][32] = {};
     int  num_auth_cards    = 0;
@@ -181,6 +182,7 @@ bool loadConfig() {
     const char* mg = doc["behavior"]["minigame_default"] | nullptr;
     cfg.has_minigame = (mg != nullptr);
     if (cfg.has_minigame) strlcpy(cfg.minigame_type, mg, sizeof(cfg.minigame_type));
+    cfg.simon_rounds = doc["behavior"]["simon_rounds"] | cfg.simon_rounds;
 
     // If it has a minigame, slice first by default
     cfg.slice_first = cfg.has_minigame;
@@ -293,6 +295,10 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
 
     JsonDocument resp;
 
+    // Which slice action the menu offers depends on the configured minigame.
+    const char* mgAction = (strcmp(cfg.minigame_type, "simon") == 0)
+                               ? "start_simon" : "start_minigame";
+
     if (strcmp(action, "greet") == 0) {
         resp["type"] = "dialogue";
         JsonObject speaker = resp["speaker"].to<JsonObject>();
@@ -313,7 +319,7 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
 
             JsonObject c1 = choices.add<JsonObject>();
             c1["label"] = "Slice into system";
-            c1["next_action"] = "start_minigame";
+            c1["next_action"] = mgAction;
 
             JsonObject c2 = choices.add<JsonObject>();
             c2["label"] = "[Disconnect]";
@@ -337,7 +343,7 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
             if (cfg.has_minigame && !playerSliced) {
                 JsonObject c2 = choices.add<JsonObject>();
                 c2["label"] = "Slice into system";
-                c2["next_action"] = "start_minigame";
+                c2["next_action"] = mgAction;
             }
 
             JsonObject c3 = choices.add<JsonObject>();
@@ -361,6 +367,13 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
             JsonObject z3 = zones.add<JsonObject>();
             z3["start"] = 0.85; z3["end"] = 0.95; z3["points"] = 120;
         }
+    }
+    else if (strcmp(action, "start_simon") == 0) {
+        // Simon Says (pattern lock) — rounds come from config.
+        panelState = STATE_MINIGAME;
+        resp["type"] = "minigame_start";
+        resp["game"] = "simon";
+        resp["rounds"] = cfg.simon_rounds;
     }
     else if (strcmp(action, "minigame_result") == 0) {
         bool won = reqDoc["won"] | false;
