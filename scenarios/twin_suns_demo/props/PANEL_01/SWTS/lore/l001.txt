@@ -1,0 +1,23 @@
+TITLE: Cantina Backroom Ledger
+CLASS: ENCRYPTED // OUTPOST 77 PRIVATE CHANNEL
+DATE: 3 ABY
+---
+Sliced from the comm board's private
+booking ledger:
+
+ENTRY 47: Off-world courier paid cash for
+one night, no name given. Left before the
+suns rose. Bartender says the courier
+taped something under the corner booth --
+a datacard marked INTEL_01.
+
+ENTRY 51: Imperial patrol has doubled its
+sweeps of the market square. They are
+looking for a droid. Storage facility has
+NOT been searched yet.
+
+ENTRY 52: The repair shop decoder is
+running jobs off the books for the right
+people. Bring your own encryption key.
+---
+END OF LEDGER

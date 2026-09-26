@@ -17,6 +17,7 @@
 #include "icons.h"
 #include "missions.h"
 #include "swts_provision.h"
+#include "swts_test_configs.h"   // boot-time test provisioning (see header to disable)
 #include "swts_config.h"
 #include "swts_nfc_map.h"
 #include "swts_missions.h"
@@ -181,6 +182,18 @@ bool buttonAnyConsume(BtnColor *out) {
         if (btnState[i].pressed) { btnState[i].pressed = false; if (out) *out = (BtnColor)i; return true; }
     }
     return false;
+}
+
+// Default press feedback: each button beeps its own tone. Frequencies span
+// ~5x because passive piezos have a narrow resonant peak — closer notes
+// (523/698/880 Hz) all sound the same. Simon uses these same tones as its
+// pattern cues, so the game swaps in a no-op handler while it runs.
+static void defaultBtnTone(BtnColor c) {
+    switch (c) {
+        case BTN_BLUE:  buzzerTone(600, 120);  break;   // low
+        case BTN_WHITE: buzzerTone(1500, 120); break;   // mid
+        case BTN_RED:   buzzerTone(3000, 120); break;   // high
+    }
 }
 
 bool sdOk = false;
@@ -438,6 +451,10 @@ int findActive(uint8_t defIdx) {
     return -1;
 }
 
+void triggerCommsPrefix(const char *prefix, const char *value);  // forward decl
+void showObjectiveToast(const char *title, const char *body);    // forward decl
+bool debriefPending = false;   // set when the endgame mission completes; loop shows debrief
+
 bool startMission(uint8_t defIdx) {
     if (defIdx >= NUM_MISSIONS) return false;
     if (!msnUnlocked[defIdx]) return false;
@@ -452,10 +469,24 @@ bool startMission(uint8_t defIdx) {
             playerLastSave = 0;
             refreshHomeBadges();
             S.printf("Mission started: %s\n", ALL_MISSIONS[defIdx].title);
+            triggerCommsPrefix("mission_start", ALL_MISSIONS[defIdx].id);
             return true;
         }
     }
     return false; // No slots
+}
+
+// Start every unlocked, never-touched mission. Called once after boot (missions +
+// player state + comms pool all loaded), so day-one missions appear automatically
+// and their briefing comms fire. Completed/active slots block a restart.
+void autoStartMissions() {
+    for (int i = 0; i < NUM_MISSIONS; i++) {
+        if (!msnUnlocked[i] || !ALL_MISSIONS[i].starts_unlocked) continue;
+        bool seen = false;
+        for (int s2 = 0; s2 < MAX_ACTIVE; s2++)
+            if (msnSlots[s2].def_idx == i) { seen = true; break; }
+        if (!seen) startMission(i);
+    }
 }
 
 bool advanceStep(uint8_t defIdx, uint8_t stepIdx) {
@@ -477,19 +508,73 @@ bool advanceStep(uint8_t defIdx, uint8_t stepIdx) {
         refreshScoreLabel();
         refreshHomeBadges();
         playerDirty = true;
-        // Unlock next mission
+        // Unlock (and immediately start) the next mission in the chain
         if (m.unlocks_id[0]) {
             for (int i = 0; i < NUM_MISSIONS; i++) {
                 if (strcmp(ALL_MISSIONS[i].id, m.unlocks_id) == 0) {
                     msnUnlocked[i] = true;
+                    startMission(i);
+                    showObjectiveToast("NEW MISSION", ALL_MISSIONS[i].title);
                     break;
                 }
             }
         }
         S.printf("Mission COMPLETE: %s (+%d cr, +%d xp)\n", m.title, m.reward_credits, m.reward_xp);
+        if (m.is_endgame) debriefPending = true;   // loop() shows the debrief screen
         return true;
     }
     return true;
+}
+
+// ── Game events ──
+// Event ids arrive from the mesh (MSG_EVENT, possibly on the WiFi task) and from
+// prop HTTP responses ("game_event" field). They are queued here and drained in
+// loop() — the LVGL-safe context — where they fire comms and advance missions.
+#define MAX_PENDING_EVENTS 6
+char pendingEvents[MAX_PENDING_EVENTS][40];
+volatile int pendingEventCount = 0;
+portMUX_TYPE evMux = portMUX_INITIALIZER_UNLOCKED;
+
+void queueGameEvent(const char *id) {
+    portENTER_CRITICAL(&evMux);
+    if (pendingEventCount < MAX_PENDING_EVENTS)
+        strlcpy(pendingEvents[pendingEventCount++], id, sizeof(pendingEvents[0]));
+    portEXIT_CRITICAL(&evMux);
+}
+
+// Advance any active mission whose current step waits on this event id
+void advanceEventSteps(const char *eventId) {
+    for (int s2 = 0; s2 < MAX_ACTIVE; s2++) {
+        if (msnSlots[s2].def_idx < 0 || msnSlots[s2].complete) continue;
+        uint8_t di = msnSlots[s2].def_idx;
+        uint8_t st = msnSlots[s2].current_step;
+        const MissionDef &m = ALL_MISSIONS[di];
+        if (st >= m.num_steps) continue;
+        if (m.steps[st].obj_type != OBJ_EVENT) continue;
+        if (strcmp(m.steps[st].target, eventId) != 0) continue;
+
+        bool wasLast = (st == m.num_steps - 1);
+        if (advanceStep(di, st)) {
+            buzzerScanOk();
+            if (wasLast)
+                showObjectiveToast("MISSION COMPLETE", m.title);
+            else
+                showObjectiveToast("OBJECTIVE COMPLETE", m.steps[st].title);
+        }
+    }
+}
+
+void processGameEvents() {
+    while (true) {
+        char ev[40];
+        portENTER_CRITICAL(&evMux);
+        if (pendingEventCount == 0) { portEXIT_CRITICAL(&evMux); break; }
+        strlcpy(ev, pendingEvents[--pendingEventCount], sizeof(ev));
+        portEXIT_CRITICAL(&evMux);
+        S.printf("[GAME] Event: %s\n", ev);
+        triggerCommsPrefix("event", ev);
+        advanceEventSteps(ev);
+    }
 }
 
 // Check NFC scan against trigger table
@@ -500,8 +585,7 @@ struct ScanOutcome {
     uint8_t step_idx;
 };
 
-ScanOutcome checkMissionTrigger(uint8_t *uid, uint8_t len) {
-    const char *token = uidToToken(uid, len);
+ScanOutcome checkMissionTrigger(const char *token) {
     for (int i = 0; i < NUM_TRIGGERS; i++) {
         if (strcmp(token, NFC_TRIGGERS[i].match_token) == 0) {
             const NfcTrigger &t = NFC_TRIGGERS[i];
@@ -529,6 +613,7 @@ lv_obj_t *scrMissions = NULL, *scrBounty = NULL, *scrCargo = NULL, *scrComms = N
 lv_obj_t *scrProp = NULL;
 lv_obj_t *scrSlice = NULL;  // Slice minigame screen
 lv_obj_t *scrSimon = NULL;  // Simon Says (pattern lock) minigame screen
+lv_obj_t *scrPurge = NULL;  // Core Purge (memory defrag) minigame screen
 lv_obj_t *dcSpinner = NULL, *dcPrompt = NULL, *dcResult = NULL;
 lv_obj_t *cgSpinner = NULL, *cgPrompt = NULL, *cgResult = NULL;
 bool cgScanning = true;
@@ -634,7 +719,8 @@ void makeSubHeader(lv_obj_t *scr, const char *title, lv_event_cb_t backCb) {
 // ═══════════════════════════════════════
 static void ev_dc(lv_event_t *e)       { lv_scr_load_anim(scrDatacard, LV_SCR_LOAD_ANIM_MOVE_LEFT, 180, 0, false); }
 static void ev_nb(lv_event_t *e)       { lv_scr_load_anim(scrNearby, LV_SCR_LOAD_ANIM_MOVE_LEFT, 180, 0, false); }
-static void ev_missions(lv_event_t *e) { lv_scr_load_anim(scrMissions, LV_SCR_LOAD_ANIM_MOVE_LEFT, 180, 0, false); }
+void refreshMissionList();   // rebuilds the list from live state
+static void ev_missions(lv_event_t *e) { refreshMissionList(); lv_scr_load_anim(scrMissions, LV_SCR_LOAD_ANIM_MOVE_LEFT, 180, 0, false); }
 static void ev_bounty(lv_event_t *e)   { lv_scr_load_anim(scrBounty, LV_SCR_LOAD_ANIM_MOVE_LEFT, 180, 0, false); }
 static void ev_cargo(lv_event_t *e)    { lv_scr_load_anim(scrCargo, LV_SCR_LOAD_ANIM_MOVE_LEFT, 180, 0, false); }
 static void ev_comms(lv_event_t *e)    { lv_scr_load_anim(scrComms, LV_SCR_LOAD_ANIM_MOVE_LEFT, 180, 0, false); }
@@ -935,48 +1021,19 @@ void showCardResult(uint8_t *uid, uint8_t len) {
         return;
     }
 
-    // TEMPORARY: show ONLY the NDEF text — nothing else
+    // Token = the tag's NDEF text (INTEL_01, EXTRACT_01, ...). No UID-hash
+    // fallback: a failed read must never map onto a real mission token.
+    const char *token = ndefText;
+
+    // Deliver any comms keyed to this scan ("scan:<token>")
+    triggerCommsPrefix("scan", token);
+
     lv_obj_add_flag(dcSpinner, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(dcPrompt, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(dcResult, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clean(dcResult);
 
-    // UID
-    char uidStr[24];
-    if (len == 4) snprintf(uidStr, sizeof(uidStr), "%02X:%02X:%02X:%02X", uid[0], uid[1], uid[2], uid[3]);
-    else snprintf(uidStr, sizeof(uidStr), "%02X:%02X:%02X:%02X:%02X:%02X:%02X", uid[0], uid[1], uid[2], uid[3], uid[4], uid[5], uid[6]);
-
-    lv_obj_t *l1 = lv_label_create(dcResult);
-    char b1[48]; snprintf(b1, sizeof(b1), "UID: %s", uidStr);
-    lv_label_set_text(l1, b1);
-    lv_obj_set_style_text_font(l1, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(l1, C_AMB, 0);
-    lv_obj_set_pos(l1, 4, 0);
-
-    lv_obj_t *l2 = lv_label_create(dcResult);
-    char b2[48]; snprintf(b2, sizeof(b2), "UID LEN: %d", len);
-    lv_label_set_text(l2, b2);
-    lv_obj_set_style_text_font(l2, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(l2, C_AMB, 0);
-    lv_obj_set_pos(l2, 4, 24);
-
-    lv_obj_t *l3 = lv_label_create(dcResult);
-    if (ndefText[0]) {
-        char b3[140]; snprintf(b3, sizeof(b3), "NDEF: %s", ndefText);
-        lv_label_set_text(l3, b3);
-    } else {
-        lv_label_set_text(l3, "NDEF: (empty - read failed)");
-    }
-    lv_obj_set_style_text_font(l3, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(l3, C_AMB_BRT, 0);
-    lv_obj_set_width(l3, W - 40);
-    lv_obj_set_pos(l3, 4, 52);
-
-    dcScanning = false;
-    return;
-
-    // ── OLD CODE (temporarily disabled for NDEF debug) ──
-    ScanOutcome outcome = {SCAN_NONE, 0, 0};  // dummy
+    ScanOutcome outcome = checkMissionTrigger(token);
     if (outcome.result == SCAN_MISSION_START) {
         // ── MISSION STARTED ──
         const MissionDef &m = ALL_MISSIONS[outcome.mission_idx];
@@ -1533,6 +1590,7 @@ int sliceTimeLimit = 45;
 bool sliceActive = false;
 bool sliceWon = false;
 unsigned long sliceStartTime = 0;
+unsigned long sliceEndTime = 0;   // millis() when the game ended (0 = still running)
 
 // LVGL objects for the game
 lv_obj_t *sliceBarBg = NULL;
@@ -1579,17 +1637,14 @@ static void ev_slice_tap(lv_event_t *e) {
     if (allHit) {
         sliceRound++;
         if (sliceRound >= sliceMaxRounds) {
-            // WIN
+            // WIN — result is reported to the panel from loop() after the
+            // end-screen delay (a bare postInteract here would read as won=false)
             sliceActive = false;
             sliceWon = true;
+            sliceEndTime = millis();
             lv_label_set_text(sliceStatus, "SYSTEM BREACHED");
             lv_obj_set_style_text_color(sliceStatus, C_AMB_BRT, 0);
             lv_label_set_text(sliceHintLbl, "ACCESS GRANTED");
-
-            // Send result to panel
-            postInteract("minigame_result");  // TODO: send won=true
-
-            // Return to prop screen after delay (handled in loop)
         } else {
             // Next round — regenerate zones (harder)
             sliceCursorSpeed += 0.002f;
@@ -1631,6 +1686,7 @@ void startSliceGame(int difficulty) {
     sliceActive = true;
     sliceWon = false;
     sliceStartTime = millis();
+    sliceEndTime = 0;
     sliceTimeLimit = 60 - difficulty * 5;
 
     // Generate zones — wider and easier
@@ -1840,6 +1896,7 @@ void updateSliceGame() {
         // Time's up — fail
         sliceActive = false;
         sliceWon = false;
+        sliceEndTime = millis();
         lv_label_set_text(sliceStatus, "SLICE FAILED");
         lv_obj_set_style_text_color(sliceStatus, C_AMB_DIM, 0);
         lv_label_set_text(sliceHintLbl, "SYSTEM LOCKED OUT");
@@ -1889,6 +1946,7 @@ bool     simonLedOn    = false;
 SimonPhase simonPhase  = SP_PRE;
 unsigned long simonPhaseTime = 0;
 unsigned long simonInputTime = 0;
+unsigned long simonEndTime   = 0;   // millis() when the game ended (0 = still running)
 bool     simonActive = false;
 bool     simonWon    = false;
 
@@ -1900,6 +1958,10 @@ lv_obj_t *simonHintLbl = NULL;
 lv_obj_t *simonPad[3]  = { NULL, NULL, NULL };  // on-screen mirror of the LEDs
 
 static const char *SIMON_PAD_LBL[3] = { "BLU", "WHT", "RED" };
+
+// On-screen column for each color, mirroring the physical button layout
+// on the board (left to right: WHITE, BLUE, RED).
+static const int SIMON_PAD_COL[3] = { 1, 0, 2 };   // BLUE→mid, WHITE→left, RED→right
 
 void buildSimonScreen();
 
@@ -1938,6 +2000,7 @@ void startSimonGame(int rounds) {
     simonLedOn    = false;
     simonActive   = true;
     simonWon      = false;
+    simonEndTime  = 0;
     simonPhase    = SP_PRE;
     simonPhaseTime = millis();
 }
@@ -1980,7 +2043,7 @@ void buildSimonScreen() {
         lv_obj_t *pad = lv_obj_create(scrSimon);
         lv_obj_remove_style_all(pad);
         lv_obj_set_size(pad, padW, padH);
-        lv_obj_set_pos(pad, x0 + i * (padW + gap), padY);
+        lv_obj_set_pos(pad, x0 + SIMON_PAD_COL[i] * (padW + gap), padY);
         lv_obj_set_style_bg_color(pad, C_PNL, 0);
         lv_obj_set_style_bg_opa(pad, LV_OPA_COVER, 0);
         lv_obj_set_style_border_color(pad, C_AMB_DIM, 0);
@@ -2016,6 +2079,12 @@ void buildSimonScreen() {
 void launchSimonGame(int rounds) {
     startSimonGame(rounds);
 
+    // Suppress the default press-tone handler while the game runs — its
+    // per-button tones are the same ones used as pattern cues, so stray
+    // presses during playback would corrupt the audio pattern. Restored
+    // by loop() when the game returns to the prop screen.
+    btnHandler = [](BtnColor) {};
+
     simonAllPadsOff();
     ledAllOff();
     simonSetRoundLabel();
@@ -2034,6 +2103,7 @@ static void simonFail() {
     simonActive = false;
     simonWon = false;
     simonPhase = SP_DONE;
+    simonEndTime = millis();
     simonAllPadsOff();
     ledAllOff();
     buzzerFail();
@@ -2047,9 +2117,9 @@ static void simonWin() {
     simonActive = false;
     simonWon = true;
     simonPhase = SP_DONE;
-    ledAllOff();
-    // Victory flash: all pads bright
-    for (int i = 0; i < 3; i++) simonPadSet(i, true);
+    simonEndTime = millis();
+    // Victory flash: all pads + button LEDs bright (cleared on return to prop)
+    for (int i = 0; i < 3; i++) { simonPadSet(i, true); ledOn((BtnColor)i); }
     buzzerSuccess();
     lv_label_set_text(simonStatus, "LOCK BREACHED");
     lv_obj_set_style_text_color(simonStatus, C_AMB_BRT, 0);
@@ -2159,6 +2229,269 @@ void updateSimonGame() {
     }
 }
 
+// ═══════════════════════════════════════
+//  CORE PURGE MINIGAME — "MEMORY DEFRAG"
+//  Touchscreen whack-a-mole on a 4x4 grid of memory blocks. Corrupted
+//  blocks (bright amber ERR) flash up briefly — tap them before they
+//  vanish. Protected SYS blocks appear as decoys; tapping one is a fault,
+//  and PURGE_MAX_STRIKES faults locks you out. Purge the target count
+//  before the timer expires to win.
+//
+//  Targets / time limit come from the prop's start_purge JSON
+//  ("targets", "time_limit"), with defaults below.
+// ═══════════════════════════════════════
+#define PURGE_COLS    4
+#define PURGE_ROWS    4
+#define PURGE_CELLS   (PURGE_COLS * PURGE_ROWS)
+#define PURGE_DEFAULT_TARGETS 12
+#define PURGE_DEFAULT_TIME_S  35
+#define PURGE_MAX_STRIKES     3
+#define PURGE_SPAWN_MS  750    // interval between block spawns
+#define PURGE_LIFE_MS   1400   // how long a block stays tappable
+#define PURGE_DECOY_PCT 25     // % of spawns that are protected SYS blocks
+#define PURGE_MAX_ALIVE 3      // max blocks on screen at once
+
+enum PurgeCellState : uint8_t { PC_EMPTY, PC_CORRUPT, PC_DECOY };
+
+PurgeCellState purgeCell[PURGE_CELLS];
+unsigned long  purgeCellDie[PURGE_CELLS];   // millis when this block expires
+int  purgeTargets = PURGE_DEFAULT_TARGETS;
+int  purgeTimeS   = PURGE_DEFAULT_TIME_S;
+int  purgePurged  = 0;
+int  purgeStrikes = 0;
+bool purgeActive  = false;
+bool purgeWon     = false;
+unsigned long purgeStartTime = 0;
+unsigned long purgeSpawnTime = 0;
+unsigned long purgeEndTime   = 0;   // millis() when the game ended (0 = still running)
+
+// LVGL objects
+lv_obj_t *purgeStatus   = NULL;
+lv_obj_t *purgeProgLbl  = NULL;
+lv_obj_t *purgeFaultLbl = NULL;
+lv_obj_t *purgeTimerLbl = NULL;
+lv_obj_t *purgeHintLbl  = NULL;
+lv_obj_t *purgeCellObj[PURGE_CELLS];
+lv_obj_t *purgeCellLbl[PURGE_CELLS];
+
+static void purgeSetCell(int i, PurgeCellState st) {
+    purgeCell[i] = st;
+    switch (st) {
+    case PC_CORRUPT:
+        lv_obj_set_style_bg_color(purgeCellObj[i], C_AMB, 0);
+        lv_obj_set_style_border_color(purgeCellObj[i], C_AMB_BRT, 0);
+        lv_label_set_text(purgeCellLbl[i], "ERR");
+        lv_obj_set_style_text_color(purgeCellLbl[i], C_BG, 0);
+        break;
+    case PC_DECOY:
+        lv_obj_set_style_bg_color(purgeCellObj[i], C_PNL2, 0);
+        lv_obj_set_style_border_color(purgeCellObj[i], C_DIM, 0);
+        lv_label_set_text(purgeCellLbl[i], "SYS");
+        lv_obj_set_style_text_color(purgeCellLbl[i], C_DIM, 0);
+        break;
+    default:
+        lv_obj_set_style_bg_color(purgeCellObj[i], C_PNL, 0);
+        lv_obj_set_style_border_color(purgeCellObj[i], C_FRM, 0);
+        lv_label_set_text(purgeCellLbl[i], "");
+        break;
+    }
+}
+
+static void purgeClearGrid() {
+    for (int i = 0; i < PURGE_CELLS; i++) { purgeSetCell(i, PC_EMPTY); purgeCellDie[i] = 0; }
+}
+
+static void purgeRefreshLabels() {
+    char buf[24];
+    snprintf(buf, sizeof(buf), "PURGED %d/%d", purgePurged, purgeTargets);
+    lv_label_set_text(purgeProgLbl, buf);
+    snprintf(buf, sizeof(buf), "FAULTS %d/%d", purgeStrikes, PURGE_MAX_STRIKES);
+    lv_label_set_text(purgeFaultLbl, buf);
+}
+
+static void purgeWin() {
+    purgeActive = false;
+    purgeWon = true;
+    purgeEndTime = millis();
+    purgeClearGrid();
+    buzzerSuccess();
+    lv_label_set_text(purgeStatus, "CORE STABILIZED");
+    lv_obj_set_style_text_color(purgeStatus, C_AMB_BRT, 0);
+    lv_label_set_text(purgeHintLbl, "ACCESS GRANTED");
+    lv_obj_set_style_text_color(purgeHintLbl, C_AMB_BRT, 0);
+}
+
+static void purgeFail(const char *why) {
+    purgeActive = false;
+    purgeWon = false;
+    purgeEndTime = millis();
+    purgeClearGrid();
+    buzzerFail();
+    lv_label_set_text(purgeStatus, why);
+    lv_obj_set_style_text_color(purgeStatus, C_AMB_DIM, 0);
+    lv_label_set_text(purgeHintLbl, "SYSTEM LOCKED OUT");
+    lv_obj_set_style_text_color(purgeHintLbl, C_AMB_DIM, 0);
+}
+
+static void ev_purge_cell(lv_event_t *e) {
+    if (!purgeActive) return;
+    int i = (int)(intptr_t)lv_event_get_user_data(e);
+
+    if (purgeCell[i] == PC_CORRUPT) {
+        purgeSetCell(i, PC_EMPTY);
+        purgePurged++;
+        buzzerTone(1800, 30);
+        purgeRefreshLabels();
+        if (purgePurged >= purgeTargets) purgeWin();
+    } else if (purgeCell[i] == PC_DECOY) {
+        purgeSetCell(i, PC_EMPTY);
+        purgeStrikes++;
+        buzzerTone(300, 120);
+        purgeRefreshLabels();
+        if (purgeStrikes >= PURGE_MAX_STRIKES) purgeFail("SYS FILES DAMAGED");
+    }
+    // Tapping an empty cell does nothing — decoys are the mash deterrent
+}
+
+void buildPurgeScreen() {
+    scrPurge = lv_obj_create(NULL);
+    lv_obj_add_style(scrPurge, &s_scr, 0);
+    lv_obj_clear_flag(scrPurge, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(scrPurge);
+    lv_label_set_text(title, "CORE PURGE");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(title, C_AMB_BRT, 0);
+    lv_obj_set_style_text_letter_space(title, 2, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 16);
+
+    purgeStatus = lv_label_create(scrPurge);
+    lv_label_set_text(purgeStatus, "MEMORY DEFRAG IN PROGRESS");
+    lv_obj_set_style_text_font(purgeStatus, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(purgeStatus, C_AMB, 0);
+    lv_obj_align(purgeStatus, LV_ALIGN_TOP_MID, 0, 48);
+
+    // Progress / faults / timer row
+    purgeProgLbl = lv_label_create(scrPurge);
+    lv_obj_set_style_text_font(purgeProgLbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(purgeProgLbl, C_AMB, 0);
+    lv_obj_align(purgeProgLbl, LV_ALIGN_TOP_LEFT, 20, 76);
+
+    purgeFaultLbl = lv_label_create(scrPurge);
+    lv_obj_set_style_text_font(purgeFaultLbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(purgeFaultLbl, C_DIM, 0);
+    lv_obj_align(purgeFaultLbl, LV_ALIGN_TOP_MID, 0, 76);
+
+    purgeTimerLbl = lv_label_create(scrPurge);
+    lv_obj_set_style_text_font(purgeTimerLbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(purgeTimerLbl, C_AMB, 0);
+    lv_obj_align(purgeTimerLbl, LV_ALIGN_TOP_RIGHT, -20, 76);
+
+    hline(scrPurge, 104, C_FRM, 1);
+
+    // 4x4 grid of memory blocks
+    const int cellSz = 64, gap = 8;
+    const int gridW = PURGE_COLS * cellSz + (PURGE_COLS - 1) * gap;
+    const int x0 = (W - gridW) / 2;
+    const int y0 = 122;
+    for (int i = 0; i < PURGE_CELLS; i++) {
+        int cx = x0 + (i % PURGE_COLS) * (cellSz + gap);
+        int cy = y0 + (i / PURGE_COLS) * (cellSz + gap);
+        lv_obj_t *cell = lv_obj_create(scrPurge);
+        lv_obj_remove_style_all(cell);
+        lv_obj_set_size(cell, cellSz, cellSz);
+        lv_obj_set_pos(cell, cx, cy);
+        lv_obj_set_style_bg_opa(cell, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(cell, 2, 0);
+        lv_obj_set_style_radius(cell, 4, 0);
+        lv_obj_add_flag(cell, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_clear_flag(cell, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_event_cb(cell, ev_purge_cell, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+        purgeCellObj[i] = cell;
+
+        lv_obj_t *lbl = lv_label_create(cell);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+        lv_obj_center(lbl);
+        purgeCellLbl[i] = lbl;
+
+        purgeSetCell(i, PC_EMPTY);
+    }
+
+    purgeHintLbl = lv_label_create(scrPurge);
+    lv_label_set_text(purgeHintLbl, "TAP ERR BLOCKS -- AVOID SYS FILES");
+    lv_obj_set_style_text_font(purgeHintLbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(purgeHintLbl, C_AMB, 0);
+    lv_obj_set_style_text_align(purgeHintLbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(purgeHintLbl, W - 40);
+    lv_obj_align(purgeHintLbl, LV_ALIGN_BOTTOM_MID, 0, -56);
+
+    hline(scrPurge, H - 40, C_AMB_DIM, 2);
+    lv_obj_t *ftr = lv_label_create(scrPurge);
+    lv_label_set_text(ftr, "MEMORY CORE DIAGNOSTIC");
+    lv_obj_set_style_text_font(ftr, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ftr, C_AMB_DIM, 0);
+    lv_obj_align(ftr, LV_ALIGN_BOTTOM_MID, 0, -14);
+}
+
+void launchPurgeGame(int targets, int timeS) {
+    purgeTargets = constrain(targets, 1, 99);
+    purgeTimeS   = constrain(timeS, 5, 300);
+    purgePurged  = 0;
+    purgeStrikes = 0;
+    purgeActive  = true;
+    purgeWon     = false;
+    purgeEndTime = 0;
+    purgeStartTime = millis();
+    purgeSpawnTime = millis();
+
+    purgeClearGrid();
+    purgeRefreshLabels();
+    char tbuf[16];
+    snprintf(tbuf, sizeof(tbuf), "TIME %ds", purgeTimeS);
+    lv_label_set_text(purgeTimerLbl, tbuf);
+    lv_label_set_text(purgeStatus, "MEMORY DEFRAG IN PROGRESS");
+    lv_obj_set_style_text_color(purgeStatus, C_AMB, 0);
+    lv_label_set_text(purgeHintLbl, "TAP ERR BLOCKS -- AVOID SYS FILES");
+    lv_obj_set_style_text_color(purgeHintLbl, C_AMB, 0);
+
+    lv_scr_load_anim(scrPurge, LV_SCR_LOAD_ANIM_MOVE_LEFT, 180, 0, false);
+}
+
+// Advance the game one frame. Called from loop() while scrPurge is active.
+void updatePurgeGame() {
+    if (!purgeActive) return;
+    unsigned long now = millis();
+
+    // Countdown
+    int remaining = purgeTimeS - (int)((now - purgeStartTime) / 1000);
+    if (remaining < 0) remaining = 0;
+    char tbuf[16];
+    snprintf(tbuf, sizeof(tbuf), "TIME %ds", remaining);
+    lv_label_set_text(purgeTimerLbl, tbuf);
+    if (remaining == 0) { purgeFail("PURGE TIMED OUT"); return; }
+
+    // Expire blocks that outlived their window
+    int alive = 0;
+    for (int i = 0; i < PURGE_CELLS; i++) {
+        if (purgeCell[i] == PC_EMPTY) continue;
+        if (now >= purgeCellDie[i]) purgeSetCell(i, PC_EMPTY);
+        else alive++;
+    }
+
+    // Spawn a new block
+    if (alive < PURGE_MAX_ALIVE && now - purgeSpawnTime >= PURGE_SPAWN_MS) {
+        purgeSpawnTime = now;
+        for (int tries = 0; tries < 8; tries++) {
+            int i = esp_random() % PURGE_CELLS;
+            if (purgeCell[i] != PC_EMPTY) continue;
+            bool decoy = (esp_random() % 100) < PURGE_DECOY_PCT;
+            purgeSetCell(i, decoy ? PC_DECOY : PC_CORRUPT);
+            purgeCellDie[i] = now + PURGE_LIFE_MS;
+            break;
+        }
+    }
+}
+
 static void ev_prop_slice(lv_event_t *e) {
     // Request minigame start from prop
     String resp = postInteract("start_minigame");
@@ -2183,6 +2516,20 @@ static void ev_prop_simon(lv_event_t *e) {
     int rounds = doc["rounds"] | SIMON_DEFAULT_ROUNDS;
 
     launchSimonGame(rounds);
+}
+
+static void ev_prop_purge(lv_event_t *e) {
+    // Request Core Purge (memory defrag) start from the prop.
+    // The prop supplies targets + time limit in its JSON.
+    String resp = postInteract("start_purge");
+    if (resp.length() == 0) return;
+
+    JsonDocument doc;
+    deserializeJson(doc, resp);
+    int targets = doc["targets"]    | PURGE_DEFAULT_TARGETS;
+    int timeS   = doc["time_limit"] | PURGE_DEFAULT_TIME_S;
+
+    launchPurgeGame(targets, timeS);
 }
 
 static void ev_prop_logs(lv_event_t *e) {
@@ -2230,6 +2577,8 @@ static void ev_prop_logs(lv_event_t *e) {
     lv_obj_set_pos(ct, 10, 56);
 }
 
+void renderPropDialogue(JsonDocument &doc);   // forward decl
+
 void showPropGreeting() {
     S.println("[PROP] Fetching greeting...");
     String resp = postInteract("greet");
@@ -2246,8 +2595,37 @@ void showPropGreeting() {
 
     JsonDocument doc;
     deserializeJson(doc, resp);
+    renderPropDialogue(doc);
+}
 
+// Generic dialogue actions (anything that isn't a minigame/logs/disconnect)
+// keep their action string here; buttons carry an index into this table.
+static char propChoiceActions[8][24];
+static int  propChoiceCount = 0;
+
+static void ev_prop_action(lv_event_t *e) {
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= propChoiceCount) return;
+    char action[24];
+    strlcpy(action, propChoiceActions[idx], sizeof(action));
+
+    String resp = postInteract(action);
+    if (resp.length() == 0) return;
+
+    JsonDocument doc;
+    deserializeJson(doc, resp);
+
+    // Props may attach a game event to a dialogue response (mission hook)
+    const char *gev = doc["game_event"].as<const char*>();
+    if (gev && gev[0]) queueGameEvent(gev);
+
+    renderPropDialogue(doc);
+}
+
+// Render a dialogue response (lines + choice buttons) into propContent
+void renderPropDialogue(JsonDocument &doc) {
     lv_obj_clean(propContent);
+    propChoiceCount = 0;
 
     // Dialogue lines — advance by each label's actual rendered height so
     // wrapped multi-line texts don't get drawn over by the next line.
@@ -2316,15 +2694,55 @@ void showPropGreeting() {
             lv_obj_add_event_cb(btn, ev_prop_slice, LV_EVENT_CLICKED, NULL);
         } else if (actStr == "start_simon") {
             lv_obj_add_event_cb(btn, ev_prop_simon, LV_EVENT_CLICKED, NULL);
+        } else if (actStr == "start_purge") {
+            lv_obj_add_event_cb(btn, ev_prop_purge, LV_EVENT_CLICKED, NULL);
         } else if (actStr == "read_logs") {
             lv_obj_add_event_cb(btn, ev_prop_logs, LV_EVENT_CLICKED, NULL);
+        } else if (actStr.length() > 0 && actStr != "null" && propChoiceCount < 8) {
+            // Generic dialogue action (deliver_intel, send_signal, ...) —
+            // posts the action and renders whatever dialogue comes back
+            strlcpy(propChoiceActions[propChoiceCount], actStr.c_str(),
+                    sizeof(propChoiceActions[0]));
+            lv_obj_add_event_cb(btn, ev_prop_action, LV_EVENT_CLICKED,
+                                (void*)(intptr_t)propChoiceCount);
+            propChoiceCount++;
         } else {
-            // Disconnect / null / anything else
+            // Disconnect / null
             lv_obj_add_event_cb(btn, ev_prop_back, LV_EVENT_CLICKED, NULL);
         }
 
         y += 46;
     }
+}
+
+// Report a finished minigame to the panel, award points on a win, and return
+// to the prop screen with a fresh greeting. Game-specific result fields
+// (score, rounds, ...) go into `req` before calling.
+static void finishMinigameAndReturn(JsonDocument &req, bool won) {
+    req["action"] = "minigame_result";
+    req["won"] = won;
+    JsonObject p = req["player"].to<JsonObject>();
+    p["callsign"] = callsign;
+
+    HTTPClient http;
+    http.setTimeout(5000);
+    http.begin("http://192.168.4.1/api/interact");
+    http.addHeader("Content-Type", "application/json");
+    String body; serializeJson(req, body);
+    http.POST(body);
+    http.end();
+
+    if (won) {
+        score += 50;
+        xp += 50;
+        refreshScoreLabel();
+        playerDirty = true;
+        playerLastSave = 0;
+    }
+
+    lv_obj_clean(propContent);
+    showPropGreeting();
+    lv_scr_load_anim(scrProp, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 180, 0, false);
 }
 
 // Labels we update dynamically on connect
@@ -2546,11 +2964,242 @@ lv_obj_t* buildStubScreen(const char *title, const lv_img_dsc_t *icon,
     return scr;
 }
 
+lv_obj_t *msnListContainer = NULL;
+
+// Rebuild the mission list from current state. Locked missions stay hidden
+// so the endgame isn't spoiled before it unlocks.
+void refreshMissionList() {
+    if (!msnListContainer) return;
+    lv_obj_clean(msnListContainer);
+
+    int shown = 0;
+    for (int i = 0; i < NUM_MISSIONS; i++) {
+        // Status: active slot (running or complete), else unlocked-available, else hidden
+        int slot = -1;
+        for (int s2 = 0; s2 < MAX_ACTIVE; s2++)
+            if (msnSlots[s2].def_idx == i) { slot = s2; break; }
+        if (slot < 0 && !msnUnlocked[i]) continue;
+
+        const MissionDef &m = ALL_MISSIONS[i];
+        bool complete = (slot >= 0 && msnSlots[slot].complete);
+        bool running  = (slot >= 0 && !complete);
+        shown++;
+
+        lv_obj_t *card = lv_obj_create(msnListContainer);
+        lv_obj_remove_style_all(card);
+        lv_obj_set_width(card, lv_pct(100));
+        lv_obj_set_height(card, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(card, C_PNL, 0);
+        lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_color(card, complete ? C_FRM : C_AMB_DIM, 0);
+        lv_obj_set_style_border_width(card, 1, 0);
+        lv_obj_set_style_radius(card, 2, 0);
+        lv_obj_set_style_pad_all(card, 10, 0);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+        // Title + status badge
+        lv_obj_t *t = lv_label_create(card);
+        lv_label_set_text(t, m.title);
+        lv_obj_set_style_text_font(t, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_color(t, complete ? C_DIM : C_AMB_BRT, 0);
+        lv_obj_set_pos(t, 0, 0);
+
+        lv_obj_t *st = lv_label_create(card);
+        char sbuf[24];
+        if (complete)      snprintf(sbuf, sizeof(sbuf), "COMPLETE");
+        else if (running)  snprintf(sbuf, sizeof(sbuf), "STEP %d/%d",
+                                    msnSlots[slot].current_step + 1, m.num_steps);
+        else               snprintf(sbuf, sizeof(sbuf), "AVAILABLE");
+        lv_label_set_text(st, sbuf);
+        lv_obj_set_style_text_font(st, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(st, complete ? C_DIM : C_AMB, 0);
+        lv_obj_align(st, LV_ALIGN_TOP_RIGHT, 0, 4);
+
+        // Subtitle
+        lv_obj_t *sub = lv_label_create(card);
+        lv_label_set_text(sub, m.subtitle);
+        lv_label_set_long_mode(sub, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(sub, W - 50);
+        lv_obj_set_style_text_font(sub, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(sub, C_DIM, 0);
+        lv_obj_set_pos(sub, 0, 26);
+
+        // Current objective (running missions only)
+        if (running) {
+            const MissionStep &stp = m.steps[msnSlots[slot].current_step];
+            char obuf[176];
+            snprintf(obuf, sizeof(obuf), "> %s\n%s", stp.title, stp.description);
+            lv_obj_t *o = lv_label_create(card);
+            lv_label_set_text(o, obuf);
+            lv_label_set_long_mode(o, LV_LABEL_LONG_WRAP);
+            lv_obj_set_width(o, W - 50);
+            lv_obj_set_style_text_font(o, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(o, C_AMB, 0);
+            lv_obj_set_style_text_line_space(o, 3, 0);
+            lv_obj_set_pos(o, 0, 58);
+        }
+    }
+
+    if (shown == 0) {
+        lv_obj_t *empty = lv_label_create(msnListContainer);
+        lv_label_set_text(empty, "NO ACTIVE ASSIGNMENTS\n\nAwait orders from Command.");
+        lv_obj_set_style_text_font(empty, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(empty, C_DIM, 0);
+        lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
+    }
+}
+
 void buildMissionsScreen() {
-    scrMissions = buildStubScreen("MISSIONS", &ico_missions,
-        "Ghost Signal",
-        "Intercept an Imperial transmission\nbefore it reaches the fleet",
-        "STEP 1 OF 3 // LOCATE DATATAPE DT-07");
+    scrMissions = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scrMissions, C_BG, 0);
+    lv_obj_set_style_pad_all(scrMissions, 0, 0);
+    lv_obj_clear_flag(scrMissions, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(scrMissions);
+    lv_label_set_text(title, "MISSIONS");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, C_AMB_BRT, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 14);
+
+    lv_obj_t *sub = lv_label_create(scrMissions);
+    lv_label_set_text(sub, "ACTIVE OPERATIONS");
+    lv_obj_set_style_text_font(sub, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(sub, C_DIM, 0);
+    lv_obj_align(sub, LV_ALIGN_TOP_MID, 0, 40);
+
+    hline(scrMissions, 60, C_FRM, 1);
+
+    msnListContainer = lv_obj_create(scrMissions);
+    lv_obj_set_size(msnListContainer, W - 12, H - 100);
+    lv_obj_set_pos(msnListContainer, 6, 66);
+    lv_obj_set_style_bg_opa(msnListContainer, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(msnListContainer, 0, 0);
+    lv_obj_set_style_pad_all(msnListContainer, 0, 0);
+    lv_obj_set_flex_flow(msnListContainer, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(msnListContainer, 8, 0);
+
+    lv_obj_t *bb = lv_btn_create(scrMissions);
+    lv_obj_set_size(bb, 80, 36); lv_obj_set_pos(bb, 6, 5);
+    lv_obj_set_style_bg_color(bb, C_BG, 0);
+    lv_obj_set_style_bg_opa(bb, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(bb, C_PNL2, LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(bb, C_AMB_DIM, 0);
+    lv_obj_set_style_border_width(bb, 1, 0);
+    lv_obj_set_style_radius(bb, 2, 0);
+    lv_obj_set_style_shadow_width(bb, 0, 0);
+    lv_obj_set_style_pad_all(bb, 0, 0);
+    lv_obj_add_event_cb(bb, ev_back_home, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *bbl = lv_label_create(bb);
+    lv_label_set_text(bbl, "< BACK");
+    lv_obj_set_style_text_font(bbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bbl, C_AMB, 0);
+    lv_obj_center(bbl);
+
+    refreshMissionList();
+}
+
+// ═══════════════════════════════════════
+//  DEBRIEF — endgame victory screen
+//  Shown when a mission flagged "endgame": true completes.
+// ═══════════════════════════════════════
+lv_obj_t *scrDebrief = NULL;
+
+static const char* debriefRank() {
+    if (score >= 900) return "GHOST OF OUTPOST 77";
+    if (score >= 600) return "FIELD AGENT";
+    if (score >= 300) return "OPERATIVE";
+    return "RECRUIT";
+}
+
+void buzzerFanfare() {
+    // Extended victory chime — one-time blocking is fine here
+    buzzerTone(523, 90);  delay(100);
+    buzzerTone(659, 90);  delay(100);
+    buzzerTone(784, 90);  delay(100);
+    buzzerTone(1046, 220); delay(240);
+    buzzerTone(784, 80);  delay(90);
+    buzzerTone(1046, 320);
+}
+
+void showDebrief() {
+    // Built fresh each time so the stats are current
+    if (scrDebrief) { lv_obj_del(scrDebrief); scrDebrief = NULL; }
+    scrDebrief = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scrDebrief, C_BG, 0);
+    lv_obj_clear_flag(scrDebrief, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *hd = lv_label_create(scrDebrief);
+    lv_label_set_text(hd, "EXTRACTION COMPLETE");
+    lv_obj_set_style_text_font(hd, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(hd, C_AMB, 0);
+    lv_obj_set_style_text_letter_space(hd, 2, 0);
+    lv_obj_align(hd, LV_ALIGN_TOP_MID, 0, 42);
+
+    lv_obj_t *t = lv_label_create(scrDebrief);
+    lv_label_set_text(t, "MISSION\nACCOMPLISHED");
+    lv_obj_set_style_text_font(t, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(t, C_AMB_BRT, 0);
+    lv_obj_set_style_text_align(t, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_letter_space(t, 2, 0);
+    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 72);
+
+    hline(scrDebrief, 148, C_AMB_DIM, 2);
+
+    lv_obj_t *rl = lv_label_create(scrDebrief);
+    lv_label_set_text(rl, "SERVICE RANK AWARDED");
+    lv_obj_set_style_text_font(rl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(rl, C_DIM, 0);
+    lv_obj_align(rl, LV_ALIGN_TOP_MID, 0, 166);
+
+    lv_obj_t *rk = lv_label_create(scrDebrief);
+    lv_label_set_text(rk, debriefRank());
+    lv_obj_set_style_text_font(rk, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(rk, C_AMB_BRT, 0);
+    lv_obj_set_style_text_letter_space(rk, 1, 0);
+    lv_obj_align(rk, LV_ALIGN_TOP_MID, 0, 186);
+
+    // Final stats
+    char sbuf[120];
+    snprintf(sbuf, sizeof(sbuf),
+             "OPERATIVE  %s\n\nSCORE  %d %s\nXP  %d\nSCANS LOGGED  %d",
+             callsign, score, scoreSuffix, xp, totalScans);
+    lv_obj_t *st = lv_label_create(scrDebrief);
+    lv_label_set_text(st, sbuf);
+    lv_obj_set_style_text_font(st, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(st, C_AMB, 0);
+    lv_obj_set_style_text_align(st, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_line_space(st, 6, 0);
+    lv_obj_align(st, LV_ALIGN_TOP_MID, 0, 236);
+
+    lv_obj_t *ft = lv_label_create(scrDebrief);
+    lv_label_set_text(ft, "DEBRIEF TRANSMITTED TO\nALLIANCE COMMAND");
+    lv_obj_set_style_text_font(ft, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ft, C_DIM, 0);
+    lv_obj_set_style_text_align(ft, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(ft, LV_ALIGN_BOTTOM_MID, 0, -78);
+
+    lv_obj_t *btn = lv_btn_create(scrDebrief);
+    lv_obj_set_size(btn, W - 60, 42);
+    lv_obj_align(btn, LV_ALIGN_BOTTOM_MID, 0, -20);
+    lv_obj_set_style_bg_color(btn, C_PNL, 0);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(btn, C_PNL2, LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(btn, C_AMB_DIM, 0);
+    lv_obj_set_style_border_width(btn, 1, 0);
+    lv_obj_set_style_radius(btn, 2, 0);
+    lv_obj_set_style_shadow_width(btn, 0, 0);
+    lv_obj_add_event_cb(btn, ev_back_home, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *bl = lv_label_create(btn);
+    lv_label_set_text(bl, "RETURN TO DATAPAD");
+    lv_obj_set_style_text_font(bl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bl, C_AMB, 0);
+    lv_obj_center(bl);
+
+    lv_scr_load_anim(scrDebrief, LV_SCR_LOAD_ANIM_FADE_ON, 400, 0, false);
+
+    // Tell the GM (and any listening props) that this operative finished
+    swts::gmTriggerEvent("game_complete", "Operative extracted", 0, callsign);
+    buzzerFanfare();
 }
 
 // ═══════════════════════════════════════
@@ -3076,6 +3725,7 @@ bool loadMissionsFromSD() {
         strlcpy(d.reward_item, m["reward_item"] | "", sizeof(d.reward_item));
         strlcpy(d.unlocks_id,  m["unlocks"]     | "", sizeof(d.unlocks_id));
         d.starts_unlocked = m["starts_unlocked"] | false;
+        d.is_endgame      = m["endgame"]         | false;
 
         d.num_steps = 0;
         for (JsonObject s : m["steps"].as<JsonArray>()) {
@@ -3087,7 +3737,9 @@ bool loadMissionsFromSD() {
             strlcpy(st.target,      s["target"]      | "", sizeof(st.target));
             st.xp_reward = s["xp"] | 0;
             const char *type = s["type"] | "scan_nfc";
-            st.obj_type = (strcmp(type, "connect_prop") == 0) ? OBJ_CONNECT_PROP : OBJ_SCAN_NFC;
+            if      (strcmp(type, "connect_prop") == 0) st.obj_type = OBJ_CONNECT_PROP;
+            else if (strcmp(type, "event") == 0)        st.obj_type = OBJ_EVENT;
+            else                                        st.obj_type = OBJ_SCAN_NFC;
             d.num_steps++;
         }
 
@@ -3379,6 +4031,15 @@ char lastGmAlertBody[100] = "";
 uint8_t lastGmAlertSeverity = 0;
 uint16_t lastGmAlertDuration = 5000;
 
+// Local pop-up using the same overlay as GM alerts (objective/mission progress)
+void showObjectiveToast(const char *title, const char *body) {
+    strlcpy(lastGmAlertTitle, title, sizeof(lastGmAlertTitle));
+    strlcpy(lastGmAlertBody, body, sizeof(lastGmAlertBody));
+    lastGmAlertSeverity = 0;
+    lastGmAlertDuration = 4000;
+    lastGmAlertTime = millis();
+}
+
 void onMeshMsg(const swts::MeshHeader *hdr, const uint8_t *payload, int len) {
     switch (hdr->type) {
         case swts::MSG_COMM: {
@@ -3520,10 +4181,9 @@ void onMeshMsg(const swts::MeshHeader *hdr, const uint8_t *payload, int len) {
             if (len < (int)sizeof(swts::MeshEvent)) return;
             const swts::MeshEvent *e = (const swts::MeshEvent *)payload;
             S.printf("[MESH] Event: %s (sev %d)\n", e->event_name, e->severity);
-            extern void triggerComms(const char *trigger);
-            char trig[40];
-            snprintf(trig, sizeof(trig), "event:%s", e->event_id);
-            triggerComms(trig);
+            // Queued, not handled inline: this callback can run on the WiFi task.
+            // loop() drains the queue → fires comms + advances mission steps.
+            queueGameEvent(e->event_id);
             break;
         }
         case swts::MSG_RESET: {
@@ -3860,16 +4520,7 @@ void setup() {
     // Physical buttons + their LEDs (cycle test on boot)
     initButtons();
     // All three lit solid; each one beeps a distinct tone when pressed.
-    // Frequencies chosen to span a wide range — typical passive piezos have
-    // a narrow resonant peak so 523/698/880 Hz all sound the same. Spreading
-    // these across ~5x gives clearly audible difference.
-    btnHandler = [](BtnColor c) {
-        switch (c) {
-            case BTN_BLUE:  buzzerTone(600, 120);  break;   // low
-            case BTN_WHITE: buzzerTone(1500, 120); break;   // mid
-            case BTN_RED:   buzzerTone(3000, 120); break;   // high
-        }
-    };
+    btnHandler = defaultBtnTone;
     ledOn(BTN_BLUE);
     ledOn(BTN_WHITE);
     ledOn(BTN_RED);
@@ -3883,6 +4534,10 @@ void setup() {
     if (SD.begin(SD_CS, sdSPI, 4000000)) {
         sdOk = true;
         S.printf("[SD] Mounted %lluMB\n", SD.cardSize() / (1024*1024));
+
+        // TESTING: write embedded gameplay configs to the card (no-op when
+        // SWTS_WRITE_TEST_CONFIGS is commented out in swts_test_configs.h)
+        swts_test::writeTestConfigs(SD);
 
         // Load config from SD
         File cfg = SD.open("/SWTS/config.json", FILE_READ);
@@ -3903,6 +4558,7 @@ void setup() {
         loadMissionsFromSD();
         loadPlayerState();    // restores callsign, score, mission progress, comm-read flags
         loadCommsFromSD();    // loads pool + delivers boot-triggered comms (welcome etc.)
+        autoStartMissions();  // day-one missions go live (fires their briefing comms)
     } else {
         S.println("[SD] Mount failed");
     }
@@ -3955,6 +4611,7 @@ void setup() {
     buildPropScreen();
     buildSliceScreen();
     buildSimonScreen();
+    buildPurgeScreen();
     lv_scr_load(scrHome);
 
     // ── ESPNOW Mesh ──
@@ -4054,82 +4711,57 @@ void loop() {
         openPropScreen(idx);
     }
 
-    // Slice minigame: update cursor each frame
+    // Game events (mesh + prop responses): fire comms, advance mission steps
+    processGameEvents();
+
+    // Endgame debrief — small delay so the final objective feedback is seen first
+    static unsigned long debriefAt = 0;
+    if (debriefPending) { debriefPending = false; debriefAt = millis() + 2500; }
+    if (debriefAt && millis() > debriefAt) {
+        debriefAt = 0;
+        showDebrief();
+    }
+
+    // Slice minigame: update cursor each frame, report result 2s after it ends
     if (act == scrSlice) {
         updateSliceGame();
 
-        // Return to prop screen 2s after game ends
-        static unsigned long sliceEndTime = 0;
-        if (!sliceActive && sliceEndTime == 0) sliceEndTime = millis();
-        if (!sliceActive && sliceEndTime > 0 && millis() - sliceEndTime > 2000) {
+        if (!sliceActive && sliceEndTime && millis() - sliceEndTime > 2000) {
             sliceEndTime = 0;
-            // Send result to panel
-            HTTPClient http;
-            http.begin("http://192.168.4.1/api/interact");
-            http.addHeader("Content-Type", "application/json");
             JsonDocument req;
-            req["action"] = "minigame_result";
-            req["won"] = sliceWon;
             req["score"] = sliceScore;
-            JsonObject p = req["player"].to<JsonObject>();
-            p["callsign"] = callsign;
-            String body; serializeJson(req, body);
-            http.POST(body);
-            http.end();
-
-            if (sliceWon) {
-                score += 50;
-                xp += 50;
-                refreshScoreLabel();
-                playerDirty = true;
-                playerLastSave = 0;
-            }
-
-            // Return to prop screen with fresh greeting
-            lv_obj_clean(propContent);
-            showPropGreeting();
-            lv_scr_load_anim(scrProp, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 180, 0, false);
+            finishMinigameAndReturn(req, sliceWon);
         }
     }
 
-    // Simon Says minigame: advance state machine each frame
+    // Simon Says minigame: advance state machine each frame, report result
+    // 2.5s after it ends
     if (act == scrSimon) {
         updateSimonGame();
 
-        // Return to prop screen 2.5s after the game ends
-        static unsigned long simonEndTime = 0;
-        if (!simonActive && simonEndTime == 0) simonEndTime = millis();
-        if (!simonActive && simonEndTime > 0 && millis() - simonEndTime > 2500) {
+        if (!simonActive && simonEndTime && millis() - simonEndTime > 2500) {
             simonEndTime = 0;
             ledAllOff();
+            btnHandler = defaultBtnTone;   // restore press tones suppressed during the game
 
-            // Report result to panel
-            HTTPClient http;
-            http.begin("http://192.168.4.1/api/interact");
-            http.addHeader("Content-Type", "application/json");
             JsonDocument req;
-            req["action"] = "minigame_result";
             req["game"] = "simon";
-            req["won"] = simonWon;
             req["rounds"] = simonRounds;
-            JsonObject p = req["player"].to<JsonObject>();
-            p["callsign"] = callsign;
-            String body; serializeJson(req, body);
-            http.POST(body);
-            http.end();
+            finishMinigameAndReturn(req, simonWon);
+        }
+    }
 
-            if (simonWon) {
-                score += 50;
-                xp += 50;
-                refreshScoreLabel();
-                playerDirty = true;
-                playerLastSave = 0;
-            }
+    // Core Purge minigame: advance each frame, report result 2.5s after it ends
+    if (act == scrPurge) {
+        updatePurgeGame();
 
-            // Return to prop screen with fresh greeting
-            lv_obj_clean(propContent);
-            showPropGreeting();
-            lv_scr_load_anim(scrProp, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 180, 0, false);
+        if (!purgeActive && purgeEndTime && millis() - purgeEndTime > 2500) {
+            purgeEndTime = 0;
+            JsonDocument req;
+            req["game"] = "purge";
+            req["purged"] = purgePurged;
+            req["strikes"] = purgeStrikes;
+            finishMinigameAndReturn(req, purgeWon);
         }
     }
 

@@ -11,7 +11,7 @@
       "reward_credits": 250,
       "reward_xp": 100,
       "reward_item": "ALLIANCE COMMENDATION",
-      "unlocks": "",
+      "unlocks": "extraction",
       "starts_unlocked": true,
       "steps": [
         {
@@ -24,21 +24,52 @@
         {
           "title": "Decrypt at the Repair Shop",
           "description": "Carry the encrypted vault key DT_VAULT to the Repair Shop Terminal and scan it on the terminal reader.",
-          "type": "connect_prop",
-          "target": "SWTS_TERM",
+          "type": "event",
+          "target": "nfc:TERM_01:DT_VAULT",
           "xp": 60
         },
         {
           "title": "Deliver to R5-D8",
-          "description": "Find R5-D8 in the storage facility and hand off the decrypted intel.",
-          "type": "connect_prop",
-          "target": "SWTS_DROID",
+          "description": "Find R5-D8 in the storage facility, purge his scrambled memory core, and hand off the decrypted intel.",
+          "type": "event",
+          "target": "droid_handoff:DROID_R5D8",
           "xp": 100
+        }
+      ]
+    },
+    {
+      "id": "extraction",
+      "title": "EXTRACTION",
+      "subtitle": "Signal the shuttle and get off-world before the Empire locks down the outpost",
+      "faction": "REBEL",
+      "briefing": "The coordinates are with R5 -- now Command wants you out alive.\n\nThe cantina comm board can reach the shuttle on the outpost's open channel, but you'll have to slice through its security first. Broadcast the extraction signal, then get to the landing zone and scan the extraction beacon.\n\nMove fast. The Empire traces every wideband burst.",
+      "difficulty": 2,
+      "reward_credits": 300,
+      "reward_xp": 200,
+      "reward_item": "ALLIANCE SERVICE MEDAL",
+      "unlocks": "",
+      "starts_unlocked": false,
+      "endgame": true,
+      "steps": [
+        {
+          "title": "Signal the shuttle",
+          "description": "Slice the Cantina Comm Board and broadcast the extraction signal on the open channel.",
+          "type": "event",
+          "target": "extraction:PANEL_01",
+          "xp": 80
+        },
+        {
+          "title": "Reach the extraction point",
+          "description": "Get to the landing zone and scan the EXTRACT_01 beacon to confirm pickup.",
+          "type": "scan_nfc",
+          "target": "EXTRACT_01",
+          "xp": 120
         }
       ]
     }
   ],
   "nfc_triggers": [
-    { "token": "INTEL_01", "action": "step",  "mission": "intel_run", "step": 0 }
+    { "token": "INTEL_01",   "action": "step", "mission": "intel_run",  "step": 0 },
+    { "token": "EXTRACT_01", "action": "step", "mission": "extraction", "step": 1 }
   ]
 }

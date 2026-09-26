@@ -24,6 +24,7 @@
 #include <ArduinoJson.h>
 #include <ESPAsyncWebServer.h>
 #include "swts_mesh.h"
+#include "swts_test_configs.h"   // boot-time test provisioning (see header to disable)
 
 #define S Serial
 
@@ -74,6 +75,10 @@ struct DroidConfig {
     char name[40]       = "R5-D8";
     char ssid[24]       = "SWTS_DROID_R5";
     char faction[12]    = "rebel";
+    bool has_minigame   = true;    // card-less default: core must be purged
+    char minigame_type[16] = "purge";
+    int  purge_targets  = 12;   // corrupted blocks to clear
+    int  purge_time_s   = 35;   // time limit in seconds
 };
 DroidConfig cfg;
 
@@ -89,7 +94,17 @@ bool loadConfig() {
     strlcpy(cfg.name,    doc["prop"]["name"]    | cfg.name,    sizeof(cfg.name));
     strlcpy(cfg.ssid,    doc["prop"]["ssid"]    | cfg.ssid,    sizeof(cfg.ssid));
     strlcpy(cfg.faction, doc["prop"]["faction"] | cfg.faction, sizeof(cfg.faction));
-    S.printf("[CFG] %s id=%s ssid=%s faction=%s\n", cfg.name, cfg.id, cfg.ssid, cfg.faction);
+
+    // NOTE: as<const char*>(), not `| nullptr` — the latter always yields null
+    const char* mg = doc["behavior"]["minigame_default"].as<const char*>();
+    cfg.has_minigame = (mg != nullptr && mg[0] != '\0');
+    if (cfg.has_minigame) strlcpy(cfg.minigame_type, mg, sizeof(cfg.minigame_type));
+    cfg.purge_targets = doc["behavior"]["purge_targets"] | cfg.purge_targets;
+    cfg.purge_time_s  = doc["behavior"]["purge_time_s"]  | cfg.purge_time_s;
+
+    S.printf("[CFG] %s id=%s ssid=%s faction=%s minigame=%s\n",
+             cfg.name, cfg.id, cfg.ssid, cfg.faction,
+             cfg.has_minigame ? cfg.minigame_type : "none");
     return true;
 }
 
@@ -99,6 +114,7 @@ bool loadConfig() {
 AsyncWebServer server(80);
 char connectedCallsign[16] = "";
 bool intelDelivered = false;     // becomes true after a player picks the "deliver_intel" choice
+bool coreSliced = false;         // per-connection: has this player purged the memory core?
 
 void handleInfo(AsyncWebServerRequest *req) {
     JsonDocument doc;
@@ -108,8 +124,8 @@ void handleInfo(AsyncWebServerRequest *req) {
     doc["faction"]  = cfg.faction;
     JsonObject feat = doc["features"].to<JsonObject>();
     feat["has_nfc"]      = false;
-    feat["has_minigame"] = false;
-    feat["minigame_type"]= "";
+    feat["has_minigame"] = cfg.has_minigame;
+    feat["minigame_type"]= cfg.has_minigame ? cfg.minigame_type : "";
     String out;
     serializeJson(doc, out);
     req->send(200, "application/json", out);
@@ -126,6 +142,44 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
     strlcpy(connectedCallsign, callsign, sizeof(connectedCallsign));
     S.printf("[HTTP] %s by %s\n", action, callsign);
 
+    if (strcmp(action, "start_purge") == 0) {
+        // ── Core Purge minigame start — datapad runs the game on its screen ──
+        astromechChirp();
+        JsonDocument mg;
+        mg["type"]       = "minigame_start";
+        mg["game"]       = "purge";
+        mg["targets"]    = cfg.purge_targets;
+        mg["time_limit"] = cfg.purge_time_s;
+        String out;
+        serializeJson(mg, out);
+        req->send(200, "application/json", out);
+        return;
+    }
+
+    if (strcmp(action, "minigame_result") == 0) {
+        bool won = reqDoc["won"] | false;
+        JsonDocument mr;
+        mr["type"]     = "minigame_result";
+        mr["accepted"] = true;
+        if (won) {
+            coreSliced = true;
+            buzzHandoff();
+            mr["message"]  = "MEMORY CORE STABILIZED -- UPLOAD CHANNEL OPEN";
+            mr["unlocked"] = true;
+            char eventId[40];
+            snprintf(eventId, sizeof(eventId), "droid_slice:%s", cfg.id);
+            swts::gmTriggerEvent(eventId, "Memory core sliced on R5-D8", /*severity*/ 0, callsign);
+        } else {
+            buzzerTone(300, 250);
+            mr["message"] = "PURGE FAILED -- CORE STILL SCRAMBLED";
+            mr["retry"]   = true;
+        }
+        String out;
+        serializeJson(mr, out);
+        req->send(200, "application/json", out);
+        return;
+    }
+
     JsonDocument resp;
     resp["type"] = "dialogue";
     JsonObject speaker = resp["speaker"].to<JsonObject>();
@@ -134,6 +188,23 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
 
     JsonArray lines   = resp["lines"].to<JsonArray>();
     JsonArray choices = resp["choices"].to<JsonArray>();
+
+    if (strcmp(action, "deliver_intel") == 0 && cfg.has_minigame && !coreSliced) {
+        // ── Handoff attempted before the core was sliced — refuse ──
+        JsonObject l1 = lines.add<JsonObject>();
+        l1["text"] = "BZZT-BZZT-CLUNK. (Translation: Can't accept the upload — my memory core is still scrambled.)";
+        l1["style"] = "droid";
+        JsonObject c1 = choices.add<JsonObject>();
+        c1["label"]       = "Purge memory core";
+        c1["next_action"] = "start_purge";
+        JsonObject c2 = choices.add<JsonObject>();
+        c2["label"]       = "[Disconnect]";
+        c2["next_action"] = nullptr;
+        String out;
+        serializeJson(resp, out);
+        req->send(200, "application/json", out);
+        return;
+    }
 
     if (strcmp(action, "deliver_intel") == 0) {
         // ── Player is handing off the decrypted intel — completes the mission ──
@@ -146,6 +217,9 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
         char eventId[40];
         snprintf(eventId, sizeof(eventId), "droid_handoff:%s", cfg.id);
         swts::gmTriggerEvent(eventId, "Intel delivered to R5-D8", /*severity*/ 0, callsign);
+        // Mission hook — carried in the HTTP response so the delivering
+        // datapad advances even if it misses the mesh broadcast
+        resp["game_event"] = eventId;
 
         // Push a comm to the player so they get visual confirmation
         char commId[20];
@@ -181,15 +255,23 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
     JsonObject l2 = lines.add<JsonObject>();
     if (intelDelivered) {
         l2["text"] = "Coordinates already uploaded. Get to the extraction point.";
+    } else if (cfg.has_minigame && !coreSliced) {
+        l2["text"] = "Imperial ice scrambled my memory core -- I can't accept any upload like this. Purge the corrupted blocks and we're in business.";
     } else {
         l2["text"] = "Did you decrypt the package at the Repair Shop? If yes, hand it off. If not, get there first.";
     }
     l2["style"] = "system";
 
     if (!intelDelivered) {
-        JsonObject c1 = choices.add<JsonObject>();
-        c1["label"]       = "Hand off intel";
-        c1["next_action"] = "deliver_intel";
+        if (cfg.has_minigame && !coreSliced) {
+            JsonObject c1 = choices.add<JsonObject>();
+            c1["label"]       = "Purge memory core";
+            c1["next_action"] = "start_purge";
+        } else {
+            JsonObject c1 = choices.add<JsonObject>();
+            c1["label"]       = "Hand off intel";
+            c1["next_action"] = "deliver_intel";
+        }
     }
     JsonObject c2 = choices.add<JsonObject>();
     c2["label"]       = "[Disconnect]";
@@ -250,6 +332,12 @@ void setup() {
 
     // WiFi AP + STA so the player datapad can connect AND ESPNOW works
     S.println("[BOOT] WiFi mode -> AP_STA");
+    WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+        if (event == ARDUINO_EVENT_WIFI_AP_STACONNECTED ||
+            event == ARDUINO_EVENT_WIFI_AP_STADISCONNECTED) {
+            coreSliced = false;   // each new session must slice the core again
+        }
+    });
     WiFi.mode(WIFI_AP_STA);
     delay(100);
     S.println("[BOOT] softAP start...");
@@ -263,6 +351,9 @@ void setup() {
     bool sdOk = SD.begin(SD_CS, sdSPI, 4000000);
     if (sdOk) {
         S.printf("[SD] Mounted %lluMB\n", SD.cardSize() / (1024 * 1024));
+        // TESTING: write embedded gameplay configs to the card (no-op when
+        // SWTS_WRITE_TEST_CONFIGS is commented out in swts_test_configs.h)
+        swts_test::writeTestConfigs(SD);
         loadConfig();
     } else {
         S.println("[SD] No SD card / mount failed — using built-in defaults");

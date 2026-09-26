@@ -26,6 +26,7 @@
 #include <SD_MMC.h>
 #include <ArduinoJson.h>
 #include "swts_mesh.h"
+#include "swts_test_configs.h"   // boot-time test provisioning (see header to disable)
 
 #define S Serial
 #define W 800
@@ -2028,6 +2029,9 @@ void setup() {
     if (SD_MMC.begin("/sdcard", true, false, BOARD_MAX_SDMMC_FREQ, 5)) {
         sdOk = true;
         S.printf("[SD] Mounted %lluMB\n", SD_MMC.cardSize() / (1024*1024));
+        // TESTING: write embedded gameplay configs to the card (no-op when
+        // SWTS_WRITE_TEST_CONFIGS is commented out in swts_test_configs.h)
+        swts_test::writeTestConfigs(SD_MMC);
         loadGmConfig();
         loadGmState();   // restore bounty/device state from previous session
     } else {

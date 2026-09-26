@@ -4,16 +4,23 @@
     {
       "id": "welcome",
       "from": "ALLIANCE COMMAND",
-      "subject": "WELCOME TO TATOOINE",
+      "subject": "WELCOME TO OUTPOST 77",
       "body": "Operative, you've been deployed to the Twin Suns Outpost. A rebel contact has left intel for us at the cantina. Find it, decrypt it at the Repair Shop Terminal, and get the coordinates to R5-D8 in the storage facility. Watch for Imperial patrols.",
       "trigger": "boot"
     },
     {
-      "id": "intel_acquired",
+      "id": "assignment",
+      "from": "ALLIANCE COMMAND",
+      "subject": "ASSIGNMENT: INTEL RUN",
+      "body": "Your first objective is live. A sympathizer dead-dropped a datacard marked INTEL_01 somewhere around the cantina. Find it and scan it on your datapad. The cantina's backroom comm board keeps records of everything that moves through here -- slice it if you need a lead.",
+      "trigger": "mission_start:intel_run"
+    },
+    {
+      "id": "intel_scanned",
       "from": "R5-D8",
       "subject": "SIGNAL ACQUIRED",
-      "body": "BEEP BOOP. Translation: Datacard located. The encryption is heavy — you'll need a friendly terminal to break it. The Repair Shop Decoder will do.",
-      "trigger": "mission_start:intel_run"
+      "body": "BEEP BOOP. Translation: Datacard located. The encryption is heavy -- you'll need a friendly terminal to break it. The Repair Shop Decoder will do. Bring the vault key DT_VAULT with you.",
+      "trigger": "scan:INTEL_01"
     },
     {
       "id": "terminal_directions",
@@ -26,8 +33,29 @@
       "id": "decrypt_complete",
       "from": "REPAIR SHOP TERMINAL",
       "subject": "DECRYPTION COMPLETE",
-      "body": "Vault key DT_VAULT verified. Coordinates extracted. Transmitting to R5-D8. Recommend handoff at the storage facility immediately.",
+      "body": "Vault key DT_VAULT verified. Coordinates extracted. Transmitting to R5-D8. Recommend handoff at the storage facility immediately. Warning: his memory core took a hit from Imperial ice -- you may need to purge it before he can accept the upload.",
       "trigger": "event:nfc:TERM_01:DT_VAULT"
+    },
+    {
+      "id": "handoff_confirmed",
+      "from": "ALLIANCE COMMAND",
+      "subject": "COORDINATES RECEIVED",
+      "body": "R5-D8's transmission just reached the fleet. Outstanding work, operative. Stand by for extraction orders -- you're coming home.",
+      "trigger": "event:droid_handoff:DROID_R5D8"
+    },
+    {
+      "id": "extraction_orders",
+      "from": "ALLIANCE COMMAND",
+      "subject": "EXTRACTION ORDERS",
+      "body": "A Lambda shuttle is holding position off-world for you. The cantina comm board can reach it on the outpost's open channel -- slice through its security and broadcast the extraction signal. Then get to the landing zone. Don't keep the pilot waiting.",
+      "trigger": "mission_start:extraction"
+    },
+    {
+      "id": "shuttle_inbound",
+      "from": "TWIN SUNS FLIGHT",
+      "subject": "SHUTTLE INBOUND",
+      "body": "Signal received, operative. Lambda shuttle on approach -- ETA ten minutes. Proceed to the landing zone and scan the extraction beacon EXTRACT_01 to confirm pickup. Clear skies.",
+      "trigger": "event:extraction:PANEL_01"
     }
   ]
 }

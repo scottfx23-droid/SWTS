@@ -25,6 +25,14 @@
       "category": "currency",
       "description": "A small crate of refined spice. Sells for credits.",
       "award_credits": 75
+    },
+    "01:23:45:6A": {
+      "type": "beacon",
+      "id": "EXTRACT_01",
+      "name": "Extraction Beacon",
+      "category": "mission_trigger",
+      "description": "Alliance extraction beacon at the landing zone. Scanning it confirms pickup.",
+      "triggers_mission": "extraction"
     }
   }
 }

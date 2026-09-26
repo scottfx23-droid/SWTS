@@ -19,6 +19,7 @@
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
 #include "swts_mesh.h"
+#include "swts_test_configs.h"   // boot-time test provisioning (see header to disable)
 
 #define S Serial
 
@@ -179,13 +180,16 @@ bool loadConfig() {
     cfg.has_nfc = doc["hardware"]["has_nfc_reader"] | cfg.has_nfc;
     cfg.requires_auth = doc["behavior"]["requires_auth_card"] | cfg.requires_auth;
 
-    const char* mg = doc["behavior"]["minigame_default"] | nullptr;
-    cfg.has_minigame = (mg != nullptr);
+    // NOTE: `| nullptr` doesn't work as a default here (ArduinoJson deduces
+    // nullptr_t and always returns null) — use as<const char*>() instead,
+    // which returns nullptr for a missing/non-string value.
+    const char* mg = doc["behavior"]["minigame_default"].as<const char*>();
+    cfg.has_minigame = (mg != nullptr && mg[0] != '\0');
     if (cfg.has_minigame) strlcpy(cfg.minigame_type, mg, sizeof(cfg.minigame_type));
     cfg.simon_rounds = doc["behavior"]["simon_rounds"] | cfg.simon_rounds;
 
-    // If it has a minigame, slice first by default
-    cfg.slice_first = cfg.has_minigame;
+    // Slice-before-menu defaults to "has a minigame"; config may override
+    cfg.slice_first = doc["behavior"]["slice_first"] | cfg.has_minigame;
 
     JsonArray auth = doc["behavior"]["auth_card_ids"].as<JsonArray>();
     cfg.num_auth_cards = 0;
@@ -346,6 +350,14 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
                 c2["next_action"] = mgAction;
             }
 
+            if (playerSliced) {
+                // Breached boards can transmit on the outpost's open channel —
+                // the EXTRACTION mission uses this to signal the shuttle.
+                JsonObject cx = choices.add<JsonObject>();
+                cx["label"] = "Broadcast extraction signal";
+                cx["next_action"] = "send_signal";
+            }
+
             JsonObject c3 = choices.add<JsonObject>();
             c3["label"] = "[Disconnect]";
             c3["next_action"] = nullptr;
@@ -396,6 +408,46 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
             resp["message"] = "SLICE FAILED -- SECURITY HOLDING";
             resp["retry"] = true;
         }
+    }
+    else if (strcmp(action, "send_signal") == 0) {
+        resp["type"] = "dialogue";
+        JsonObject speaker = resp["speaker"].to<JsonObject>();
+        speaker["name"] = cfg.name;
+        JsonArray lines = resp["lines"].to<JsonArray>();
+        JsonArray choices = resp["choices"].to<JsonArray>();
+
+        if (!playerSliced) {
+            // Can't transmit through active security — slice first
+            JsonObject l1 = lines.add<JsonObject>();
+            l1["text"] = "TRANSMIT BLOCKED // SECURITY ACTIVE";
+            l1["style"] = "system";
+            JsonObject c1 = choices.add<JsonObject>();
+            c1["label"] = "Slice into system";
+            c1["next_action"] = mgAction;
+        } else {
+            // Broadcast the extraction signal — advances the EXTRACTION mission
+            char eventId[40];
+            snprintf(eventId, sizeof(eventId), "extraction:%s", cfg.id);
+            swts::gmTriggerEvent(eventId, "Extraction signal broadcast", 0, callsign);
+            resp["game_event"] = eventId;
+
+            JsonObject l1 = lines.add<JsonObject>();
+            l1["text"] = "WIDEBAND BURST TRANSMITTED // ALLIANCE CODE 7-7";
+            l1["style"] = "system";
+            JsonObject l2 = lines.add<JsonObject>();
+            l2["text"] = "Signal away. If anyone's listening out there, they know to come get you.";
+            l2["style"] = "speech";
+        }
+        JsonObject c2 = choices.add<JsonObject>();
+        c2["label"] = "[Disconnect]";
+        c2["next_action"] = nullptr;
+    }
+    else if (strcmp(action, "read_logs") == 0 && cfg.slice_first && !playerSliced) {
+        // Menu shouldn't offer logs before a slice, but enforce it here too
+        resp["type"] = "lore";
+        resp["title"] = "ACCESS DENIED";
+        resp["classification"] = "SECURITY LOCKOUT";
+        resp["content"] = "Encryption active.\nSlice into the system first.";
     }
     else if (strcmp(action, "read_logs") == 0) {
         // Load lore from flash
@@ -539,6 +591,10 @@ void setup() {
 
     // Check for SD card — provision to flash if found
     provisionFromSD();
+
+    // TESTING: overwrite flash with embedded gameplay configs (no-op when
+    // SWTS_WRITE_TEST_CONFIGS is commented out in swts_test_configs.h)
+    swts_test::writeTestConfigs(LittleFS);
 
     // Load config from flash
     loadConfig();

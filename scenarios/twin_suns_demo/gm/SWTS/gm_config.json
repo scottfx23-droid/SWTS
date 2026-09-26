@@ -3,7 +3,7 @@
   "scenario": {
     "name": "Tatooine Run",
     "version": "0.1-demo",
-    "planet": "Tatooine",
+    "planet": "Outpost 77",
     "currency": "CR"
   },
   "device": {

@@ -13,6 +13,7 @@
 enum ObjType : uint8_t {
     OBJ_SCAN_NFC,       // Scan a specific NFC tag (token match)
     OBJ_CONNECT_PROP,   // Connect to a specific prop via WiFi (SSID prefix)
+    OBJ_EVENT,          // Game event fired (mesh MSG_EVENT id or prop response game_event)
     OBJ_HAVE_ITEM       // Reserved
 };
 
@@ -20,7 +21,7 @@ struct MissionStep {
     char title[40];
     char description[120];
     ObjType obj_type;
-    char target[20];       // NFC token or SSID prefix
+    char target[36];       // NFC token, SSID prefix, or event id
     int xp_reward;
 };
 
@@ -41,6 +42,7 @@ struct MissionDef {
     char reward_item[32];      // "" if none
     char unlocks_id[24];       // "" if none
     bool starts_unlocked;
+    bool is_endgame;           // completing this mission ends the game (debrief screen)
 };
 
 extern MissionDef ALL_MISSIONS[MAX_MISSIONS];

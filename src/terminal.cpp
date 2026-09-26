@@ -34,6 +34,7 @@
 #include <ArduinoJson.h>
 #include <ESPAsyncWebServer.h>
 #include "swts_mesh.h"
+#include "swts_test_configs.h"   // boot-time test provisioning (see header to disable)
 
 #define S Serial
 
@@ -320,6 +321,9 @@ void setup() {
     bool sdOk = SD.begin(SD_CS, sdSPI, 4000000);
     if (sdOk) {
         S.printf("[SD] Mounted %lluMB\n", SD.cardSize() / (1024 * 1024));
+        // TESTING: write embedded gameplay configs to the card (no-op when
+        // SWTS_WRITE_TEST_CONFIGS is commented out in swts_test_configs.h)
+        swts_test::writeTestConfigs(SD);
         loadConfig();
     } else {
         S.println("[SD] Mount failed, using defaults");

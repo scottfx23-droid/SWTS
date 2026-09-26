@@ -20,6 +20,9 @@
     "idle_animation": "astromech_idle",
     "accepts_intel": true,
     "completes_mission": "intel_run",
+    "minigame_default": "purge",
+    "purge_targets": 12,
+    "purge_time_s": 35,
     "dialogue_greeting": "dialogue/greeting.json"
   }
 }
