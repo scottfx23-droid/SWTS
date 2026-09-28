@@ -52,6 +52,11 @@ enum MeshMsgType : uint8_t {
     MSG_ASSIGN      = 0x1B,  // GM assigns a new callsign to a target datapad
     MSG_FACTIONS    = 0x1C,  // GM broadcasts the scenario's faction roster
     MSG_PLAYER_MODE = 0x1D,  // GM sets a player's difficulty mode (ADULT/KID)
+    MSG_TIMER       = 0x1E,  // GM countdown broadcast (rebroadcast every 5s)
+    MSG_ALARM_CLEAR = 0x1F,  // GM clears a prop's alarm state
+    MSG_DUEL_REQUEST= 0x20,  // datapad challenges another datapad
+    MSG_DUEL_ACCEPT = 0x21,  // challenge accepted/declined
+    MSG_DUEL_RESULT = 0x22,  // each duelist's finish time (also read by GM)
 };
 
 // Device roles
@@ -89,6 +94,45 @@ struct __attribute__((packed)) MeshStatus {
     char     faction[14];   // player's chosen faction ("" = none yet)
     uint8_t  kid;           // 1 = kid difficulty mode
     uint16_t xp;            // experience points
+    // Prop extensions (zero for datapads)
+    int8_t   mood;          // droid mood -5..+5
+    uint8_t  alarm;         // 1 = prop is in ALARM state
+    char     session[16];   // terminal: callsign of the open session
+};
+
+struct __attribute__((packed)) MeshTimer {
+    char     id[16];
+    char     label[24];
+    uint32_t total_s;       // full duration
+    uint32_t remaining_s;   // at send time (receiver re-anchors to millis())
+    char     faction[14];   // "" = everyone sees it
+    uint8_t  active;        // 0 = timer cancelled/expired
+};
+
+struct __attribute__((packed)) MeshAlarmClear {
+    char     target_prop[16];
+};
+
+struct __attribute__((packed)) MeshDuelRequest {
+    char     duel_id[16];
+    char     challenger[16];
+    char     target[16];
+    int32_t  stake;
+    uint32_t seed;          // both sides generate the same button sequence
+    uint8_t  targets;       // presses to win
+};
+
+struct __attribute__((packed)) MeshDuelAccept {
+    char     duel_id[16];
+    char     callsign[16];
+    uint8_t  accept;        // 0 = declined
+};
+
+struct __attribute__((packed)) MeshDuelResult {
+    char     duel_id[16];
+    char     callsign[16];
+    uint32_t time_ms;       // total time incl. penalties (0xFFFFFFFF = aborted)
+    uint8_t  faults;
 };
 
 struct __attribute__((packed)) MeshPlayerMode {
@@ -202,28 +246,60 @@ inline MeshHandler userHandler = nullptr;
 //  INTERNAL RECEIVE CALLBACK
 // ═══════════════════════════════════════════════
 // Per-sender seq dedupe — catches MAC-layer frame duplicates.
-// We track up to 8 senders; for each we remember the highest seq seen.
-// A frame with seq <= last seen is a duplicate and is dropped.
-struct SenderSeq { char id[16]; uint32_t lastSeq; };
-inline SenderSeq seqTable[8] = {};
+// The table doubles as the peer table for the radar: it remembers each
+// sender's role, last-heard time and (when RSSI capture is enabled) a
+// rolling received-signal estimate.
+#define MESH_PEER_TABLE 16
+struct SenderSeq {
+    char     id[16];
+    uint32_t lastSeq;
+    uint8_t  role;
+    int8_t   rssi;          // smoothed; 0 = unknown
+    unsigned long lastHeard;
+};
+inline SenderSeq seqTable[MESH_PEER_TABLE] = {};
+
+// Radar support: a promiscuous callback captures the RSSI of the frame the
+// ESPNOW receive callback is about to deliver. The two fire back-to-back for
+// the same frame, so pairing "last promiscuous RSSI" with the next dispatch
+// is accurate enough for proximity buckets.
+inline volatile int8_t lastFrameRssi = 0;
+inline bool rssiCaptureOn = false;
+
+inline void promiscRssiCb(void *buf, wifi_promiscuous_pkt_type_t type) {
+    if (type != WIFI_PKT_MGMT) return;   // ESPNOW rides on action (mgmt) frames
+    const wifi_promiscuous_pkt_t *p = (const wifi_promiscuous_pkt_t *)buf;
+    lastFrameRssi = p->rx_ctrl.rssi;
+}
+
+// Call after meshInit() on devices that want per-peer RSSI (the datapad radar)
+inline void meshEnableRssi() {
+    esp_wifi_set_promiscuous_rx_cb(promiscRssiCb);
+    wifi_promiscuous_filter_t filt = {};
+    filt.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
+    esp_wifi_set_promiscuous_filter(&filt);
+    esp_wifi_set_promiscuous(true);
+    rssiCaptureOn = true;
+}
 
 inline bool seqIsDuplicate(const MeshHeader *hdr) {
-    for (int i = 0; i < 8; i++) {
-        if (seqTable[i].id[0] == 0) {
-            strlcpy(seqTable[i].id, hdr->from_id, sizeof(seqTable[i].id));
-            seqTable[i].lastSeq = hdr->seq;
-            return false;
-        }
-        if (strcmp(seqTable[i].id, hdr->from_id) == 0) {
-            // Drop only EXACT repeats (true radio duplicates).
-            // Allow any other seq (incl. lower = sender rebooted, seq reset to 1).
-            if (hdr->seq == seqTable[i].lastSeq) return true;
-            seqTable[i].lastSeq = hdr->seq;
+    for (int i = 0; i < MESH_PEER_TABLE; i++) {
+        SenderSeq &s = seqTable[i];
+        bool match = (s.id[0] != 0 && strcmp(s.id, hdr->from_id) == 0);
+        if (s.id[0] == 0 || match) {
+            if (match && hdr->seq == s.lastSeq) return true;   // exact radio dup
+            if (!match) strlcpy(s.id, hdr->from_id, sizeof(s.id));
+            s.lastSeq = hdr->seq;
+            s.role = hdr->role;
+            s.lastHeard = millis();
+            if (rssiCaptureOn && lastFrameRssi != 0) {
+                s.rssi = s.rssi ? (int8_t)((s.rssi * 3 + lastFrameRssi) / 4)
+                                : lastFrameRssi;
+            }
             return false;
         }
     }
-    // table full — accept (no dedupe possible)
-    return false;
+    return false;   // table full — accept (no dedupe possible)
 }
 
 // Internal dispatch — works with either callback signature
@@ -413,6 +489,65 @@ inline bool gmAssignCallsign(const char *target, const char *newCallsign) {
     strlcpy(a.target, target, sizeof(a.target));
     strlcpy(a.new_callsign, newCallsign, sizeof(a.new_callsign));
     return meshSend(MSG_ASSIGN, &a, sizeof(a));
+}
+
+// Prop status report (panel/terminal/droid): mood, alarm, open session.
+// Reuses MeshStatus with the player fields zeroed.
+inline bool sendPropStatus(uint32_t uptime, int mood, bool alarm, const char *session) {
+    MeshStatus s = {};
+    s.uptime_sec = uptime;
+    s.mood = (int8_t)mood;
+    s.alarm = alarm ? 1 : 0;
+    if (session) strlcpy(s.session, session, sizeof(s.session));
+    return meshSend(MSG_STATUS, &s, sizeof(s));
+}
+
+// GM countdown broadcast (send every ~5s while running; active=0 to cancel)
+inline bool gmSendTimer(const char *id, const char *label, uint32_t totalS,
+                        uint32_t remainingS, const char *faction, bool active) {
+    MeshTimer t = {};
+    strlcpy(t.id, id, sizeof(t.id));
+    strlcpy(t.label, label, sizeof(t.label));
+    t.total_s = totalS;
+    t.remaining_s = remainingS;
+    if (faction) strlcpy(t.faction, faction, sizeof(t.faction));
+    t.active = active ? 1 : 0;
+    return meshSend(MSG_TIMER, &t, sizeof(t));
+}
+
+inline bool gmAlarmClear(const char *propId) {
+    MeshAlarmClear a = {};
+    strlcpy(a.target_prop, propId, sizeof(a.target_prop));
+    return meshSend(MSG_ALARM_CLEAR, &a, sizeof(a));
+}
+
+inline bool sendDuelRequest(const char *duelId, const char *challenger, const char *target,
+                            int stake, uint32_t seed, uint8_t targets) {
+    MeshDuelRequest d = {};
+    strlcpy(d.duel_id, duelId, sizeof(d.duel_id));
+    strlcpy(d.challenger, challenger, sizeof(d.challenger));
+    strlcpy(d.target, target, sizeof(d.target));
+    d.stake = stake;
+    d.seed = seed;
+    d.targets = targets;
+    return meshSend(MSG_DUEL_REQUEST, &d, sizeof(d));
+}
+
+inline bool sendDuelAccept(const char *duelId, const char *callsign, bool accept) {
+    MeshDuelAccept d = {};
+    strlcpy(d.duel_id, duelId, sizeof(d.duel_id));
+    strlcpy(d.callsign, callsign, sizeof(d.callsign));
+    d.accept = accept ? 1 : 0;
+    return meshSend(MSG_DUEL_ACCEPT, &d, sizeof(d));
+}
+
+inline bool sendDuelResult(const char *duelId, const char *callsign, uint32_t timeMs, uint8_t faults) {
+    MeshDuelResult d = {};
+    strlcpy(d.duel_id, duelId, sizeof(d.duel_id));
+    strlcpy(d.callsign, callsign, sizeof(d.callsign));
+    d.time_ms = timeMs;
+    d.faults = faults;
+    return meshSend(MSG_DUEL_RESULT, &d, sizeof(d));
 }
 
 // Set one datapad's difficulty mode (targeted by its current callsign)

@@ -23,6 +23,13 @@
     "minigame_default": "purge",
     "purge_targets": 12,
     "purge_time_s": 35,
+    "proximity_enabled": true,
+    "proximity_rssi_start": -60,
+    "proximity_rssi_drop": -72,
+    "proximity_grace_ms": 2000,
+    "mood_enabled": true,
+    "mood_decay_s": 120,
+    "mood_colors": { "hostile": "FF2000", "neutral": "FFAA00", "friendly": "2060FF" },
     "dialogue_greeting": "dialogue/greeting.json"
   }
 }

@@ -50,7 +50,10 @@ static const char T_CONFIG[] = R"json({
     "version": "0.1-demo",
     "planet": "Outpost 77",
     "currency": "CR"
-  }
+  },
+  "radar_enabled": true,
+  "radar_kid_mode": false,
+  "duel": { "enabled": true, "targets": 5, "stake": 100, "cooldown_s": 120 }
 }
 )json";
 
@@ -260,6 +263,21 @@ static const char T_COMMS[] = R"json({
       "body": "Signal received, operative. Lambda shuttle on approach -- ETA ten minutes. Proceed to the landing zone and scan the extraction beacon EXTRACT_01 to confirm pickup. Clear skies.",
       "trigger": "event:extraction:PANEL_01",
       "faction": "REBEL"
+    },
+    {
+      "id": "reinforcements",
+      "from": "OUTPOST WATCH",
+      "subject": "REINFORCEMENTS ARRIVE",
+      "body": "Imperial troop shuttles are on the deck. The extraction window is closed -- whatever you were doing, it just got a lot harder.",
+      "trigger": "event:reinforcements_arrive"
+    },
+    {
+      "id": "shadow_freq",
+      "from": "UNKNOWN SENDER",
+      "subject": "INTERCEPTED BURST",
+      "body": "Backup extraction frequency is 121.9 -- memorize it and burn this message. If the comm board is compromised, broadcast from the repair shop decoder instead. Trust no one wearing white armor.",
+      "trigger": "boot",
+      "encrypted": true
     }
   ]
 }
@@ -343,6 +361,10 @@ static const char T_GM_CONFIG[] = R"json({
     "role": "gamemaster"
   },
   "factions": ["REBEL", "IMPERIAL"],
+  "timers": [
+    { "id": "extraction_window", "label": "EXTRACTION WINDOW",
+      "seconds": 600, "on_expire": "reinforcements_arrive", "faction": "" }
+  ],
   "game": {
     "max_score": 1000,
     "event_duration_min": 30,
@@ -401,6 +423,12 @@ static const char T_GM_CONFIG[] = R"json({
       "severity": 2,
       "description": "ISB authorizes force. All Imperial agents move on known rebel positions immediately.",
       "faction": "IMPERIAL"
+    },
+    {
+      "id": "reinforcements_arrive",
+      "name": "REINFORCEMENTS ARRIVE",
+      "severity": 3,
+      "description": "Imperial reinforcements have landed. The extraction window is closed."
     }
   ],
   "comms": [
@@ -487,6 +515,14 @@ static const char T_CONFIG[] = R"json({
     "slice_first": true,
     "minigame_default": "simon",
     "simon_rounds": 3,
+    "proximity_enabled": true,
+    "proximity_rssi_start": -60,
+    "proximity_rssi_drop": -72,
+    "proximity_grace_ms": 2000,
+    "alarm_after_fails": 2,
+    "alarm_timeout_s": 90,
+    "alarm_siren_period_ms": 350,
+    "timer_visual": true,
     "dialogue_greeting": "dialogue/greeting.json"
   }
 }
@@ -582,6 +618,12 @@ static const char T_CONFIG[] = R"json({
     "scan_cooldown_ms": 1500,
     "accepts_datatapes": true,
     "datatape_action": "decrypt",
+    "require_tap_to_use": true,
+    "session_timeout_s": 60,
+    "allow_queue": false,
+    "decrypt_required": true,
+    "decrypt_tries": 6,
+    "decrypt_glyphs": 6,
     "dialogue_greeting": "dialogue/greeting.json"
   }
 }
@@ -596,6 +638,17 @@ static const char T_GREETING[] = R"json({
   ],
   "choices": [
     {"label": "[Disconnect]", "next_action": null}
+  ]
+}
+)json";
+
+static const char T_SHOP[] = R"json({
+  "$schema": "swts-shop-v1",
+  "items": [
+    { "id": "JAMMER", "name": "SIGNAL JAMMER",
+      "cost": 300, "effect": "next_hostile_as_neutral" },
+    { "id": "INFORMANT_TIP", "name": "INFORMANT TIP",
+      "cost": 100, "effect": "reveal_bounty_clue" }
   ]
 }
 )json";
@@ -617,6 +670,7 @@ CC8800,1200,300
 static const TestFile FILES[] = {
     { "/SWTS/config.json",            T_CONFIG,   true },
     { "/SWTS/dialogue/greeting.json", T_GREETING, true },
+    { "/SWTS/shop.json",              T_SHOP,     true },
     { "/SWTS/lights.txt",             T_LIGHTS,   true },
 };
 
@@ -650,6 +704,13 @@ static const char T_CONFIG[] = R"json({
     "minigame_default": "purge",
     "purge_targets": 12,
     "purge_time_s": 35,
+    "proximity_enabled": true,
+    "proximity_rssi_start": -60,
+    "proximity_rssi_drop": -72,
+    "proximity_grace_ms": 2000,
+    "mood_enabled": true,
+    "mood_decay_s": 120,
+    "mood_colors": { "hostile": "FF2000", "neutral": "FFAA00", "friendly": "2060FF" },
     "dialogue_greeting": "dialogue/greeting.json"
   }
 }

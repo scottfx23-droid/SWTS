@@ -20,6 +20,7 @@
 #include <ArduinoJson.h>
 #include "swts_mesh.h"
 #include "swts_lights.h"         // addressable RGB strip (/SWTS/lights.txt)
+#include "swts_proximity.h"      // RSSI gate for interactions
 #include "swts_test_configs.h"   // boot-time test provisioning (see header to disable)
 
 #define S Serial
@@ -190,6 +191,11 @@ struct PanelConfig {
     bool slice_first       = true;   // require slice before showing menu
     char auth_cards[4][32] = {};
     int  num_auth_cards    = 0;
+    // Alarm state (tripped by consecutive hostile failures)
+    int  alarm_after_fails = 2;
+    int  alarm_timeout_s   = 90;
+    int  alarm_siren_ms    = 350;
+    bool timer_visual      = false;  // strip red-shifts as a GM countdown runs out
 };
 PanelConfig cfg;
 
@@ -229,6 +235,12 @@ bool loadConfig() {
 
     // Slice-before-menu defaults to "has a minigame"; config may override
     cfg.slice_first = doc["behavior"]["slice_first"] | cfg.has_minigame;
+
+    cfg.alarm_after_fails = doc["behavior"]["alarm_after_fails"]     | cfg.alarm_after_fails;
+    cfg.alarm_timeout_s   = doc["behavior"]["alarm_timeout_s"]       | cfg.alarm_timeout_s;
+    cfg.alarm_siren_ms    = doc["behavior"]["alarm_siren_period_ms"] | cfg.alarm_siren_ms;
+    cfg.timer_visual      = doc["behavior"]["timer_visual"]          | cfg.timer_visual;
+    swts_prox::loadConfig(doc);
 
     JsonArray auth = doc["behavior"]["auth_card_ids"].as<JsonArray>();
     cfg.num_auth_cards = 0;
@@ -298,6 +310,45 @@ unsigned long lastActivity = 0;
 String connectedCallsign = "";
 
 // ═══════════════════════════════════════
+//  ALARM STATE — tripped by consecutive hostile-faction failures
+// ═══════════════════════════════════════
+bool alarmActive = false;
+unsigned long alarmSince = 0;
+// GM countdown (drives the timer_visual red-shift)
+volatile unsigned long timerEndsAt = 0;   // local millis() when it expires (0 = none)
+volatile uint32_t timerTotalS = 0;
+int  hostileFails = 0;
+bool alarmBypass = false;          // hostile reset flow: 1-round Simon in progress
+volatile bool alarmDirty = false;  // loop applies light/siren state changes
+
+void setAlarm(bool on, const char *byFaction, const char *byCallsign) {
+    if (on == alarmActive) return;
+    alarmActive = on;
+    alarmSince = millis();
+    alarmDirty = true;
+    char eventId[40];
+    if (on) {
+        hostileFails = 0;
+        snprintf(eventId, sizeof(eventId), "alarm:%s", cfg.id);
+        swts::gmTriggerEvent(eventId, "Security alarm tripped", 2,
+                             byCallsign ? byCallsign : "", byFaction ? byFaction : "");
+        S.println("[ALARM] TRIPPED");
+    } else {
+        alarmBypass = false;
+        snprintf(eventId, sizeof(eventId), "alarm_clear:%s", cfg.id);
+        swts::gmTriggerEvent(eventId, "Alarm cleared", 0, byCallsign ? byCallsign : "");
+        S.println("[ALARM] cleared");
+    }
+}
+
+// Faction relation of the requesting player to this prop:
+// -1 friendly / 0 neutral / +1 hostile
+int factionRelation(const char *pfac) {
+    if (!pfac[0] || !cfg.faction[0] || strcasecmp(cfg.faction, "neutral") == 0) return 0;
+    return (strcasecmp(cfg.faction, pfac) == 0) ? -1 : +1;
+}
+
+// ═══════════════════════════════════════
 //  HTTP SERVER
 // ═══════════════════════════════════════
 AsyncWebServer server(80);
@@ -336,6 +387,16 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
     lastActivity = millis();
     panelState = STATE_ACTIVE;
 
+    // ── Proximity gate: reject when the datapad's signal is too weak ──
+    int stationRssi = 0;
+    if (!swts_prox::check(&stationRssi)) {
+        char body[64];
+        snprintf(body, sizeof(body), "{\"error\":\"too_far\",\"rssi\":%d}", stationRssi);
+        req->send(403, "application/json", body);
+        S.printf("[PROX] rejected %s (rssi %d)\n", callsign, stationRssi);
+        return;
+    }
+
     JsonDocument resp;
 
     // Which slice action the menu offers depends on the configured minigame.
@@ -346,9 +407,53 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
     // gear is harder. Neutral props (like this cantina board by default)
     // treat everyone the same. -1 friendly / 0 neutral / +1 hostile.
     const char* pfac = reqDoc["player"]["faction"] | "";
-    int facMod = 0;
-    if (pfac[0] && strcasecmp(cfg.faction, "neutral") != 0 && cfg.faction[0]) {
-        facMod = (strcasecmp(cfg.faction, pfac) == 0) ? -1 : +1;
+    int facMod = factionRelation(pfac);
+
+    // A SIGNAL JAMMER in the player's inventory makes a hostile prop treat
+    // them as neutral for this interaction (the datapad consumes the item
+    // when the response confirms it was used).
+    bool usedJammer = false;
+    if (facMod > 0) {
+        for (const char *it : reqDoc["player"]["inventory"].as<JsonArray>()) {
+            if (it && strcasecmp(it, "JAMMER") == 0) { facMod = 0; usedJammer = true; break; }
+        }
+    }
+
+    // ── Alarm gate: while tripped, hostile players may only work the
+    //    reset flow (reset_alarm + its bypass minigame result) ──
+    if (alarmActive && facMod > 0 &&
+        strcmp(action, "reset_alarm") != 0 &&
+        !(alarmBypass && strcmp(action, "minigame_result") == 0)) {
+        req->send(403, "application/json", "{\"error\":\"alarm\"}");
+        return;
+    }
+
+    // ── Keycard auth (no NFC on panels — the datapad sends the card tokens
+    //    it has scanned as player.inventory) ──
+    if (cfg.requires_auth && cfg.num_auth_cards > 0 && strcmp(action, "greet") == 0) {
+        bool authed = false;
+        for (const char *it : reqDoc["player"]["inventory"].as<JsonArray>()) {
+            if (!it) continue;
+            for (int a = 0; a < cfg.num_auth_cards; a++)
+                if (strcasecmp(it, cfg.auth_cards[a]) == 0) { authed = true; break; }
+            if (authed) break;
+        }
+        if (!authed) {
+            resp["type"] = "dialogue";
+            JsonObject sp = resp["speaker"].to<JsonObject>();
+            sp["name"] = cfg.name;
+            JsonArray lines = resp["lines"].to<JsonArray>();
+            JsonObject l1 = lines.add<JsonObject>();
+            l1["text"] = "AUTHORIZATION REQUIRED // KEYCARD NOT DETECTED";
+            l1["style"] = "system";
+            JsonArray choices = resp["choices"].to<JsonArray>();
+            JsonObject c1 = choices.add<JsonObject>();
+            c1["label"] = "[Disconnect]";
+            c1["next_action"] = nullptr;
+            String out; serializeJson(resp, out);
+            req->send(200, "application/json", out);
+            return;
+        }
     }
 
     if (strcmp(action, "greet") == 0) {
@@ -359,6 +464,18 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
 
         JsonArray lines = resp["lines"].to<JsonArray>();
         JsonArray choices = resp["choices"].to<JsonArray>();
+
+        if (alarmActive) {
+            // Friendly/neutral players see the alarm and can reset it
+            // (hostile greets were already rejected above)
+            resp["alarm"] = true;
+            JsonObject la = lines.add<JsonObject>();
+            la["text"] = "!! SECURITY ALARM ACTIVE !!";
+            la["style"] = "system";
+            JsonObject ca = choices.add<JsonObject>();
+            ca["label"] = "Reset alarm (hold)";
+            ca["next_action"] = "reset_alarm";
+        }
 
         if (cfg.slice_first && !playerSliced) {
             // ── LOCKED: must slice first ──
@@ -423,6 +540,7 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
         resp["game"] = cfg.minigame_type;
         resp["difficulty"] = diff;
         resp["time_limit"] = 50 - diff * 5;
+        if (usedJammer) resp["consumed_item"] = "JAMMER";
 
         JsonArray zones = resp["target_zones"].to<JsonArray>();
         JsonObject z1 = zones.add<JsonObject>();
@@ -444,15 +562,31 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
         resp["type"] = "minigame_start";
         resp["game"] = "simon";
         resp["rounds"] = rounds;
+        if (usedJammer) resp["consumed_item"] = "JAMMER";
     }
     else if (strcmp(action, "minigame_result") == 0) {
         bool won = reqDoc["won"] | false;
+        const char *result = reqDoc["result"] | (won ? "won" : "lost");
         resp["type"] = "minigame_result";
         resp["accepted"] = true;
 
-        if (won) {
+        if (alarmBypass) {
+            // Hostile "bypass the klaxon" Simon — clears the alarm, no slice
+            alarmBypass = false;
+            if (won) {
+                setAlarm(false, pfac, callsign);
+                pendingFx = FX_SUCCESS;
+                resp["message"] = "KLAXON BYPASSED -- ALARM SILENCED";
+            } else {
+                pendingFx = FX_FAIL;
+                resp["message"] = "BYPASS FAILED -- ALARM STILL ACTIVE";
+                resp["retry"] = true;
+            }
+        }
+        else if (won) {
             panelState = STATE_HACKED;
             playerSliced = true;
+            hostileFails = 0;
             pendingFx = FX_SUCCESS;
             // Announce the breach — missions can key off this event
             char eventId[40];
@@ -470,8 +604,47 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
         } else {
             panelState = STATE_ACTIVE;
             pendingFx = FX_FAIL;
-            resp["message"] = "SLICE FAILED -- SECURITY HOLDING";
+            resp["message"] = (strcmp(result, "lost_signal") == 0)
+                                  ? "LINK LOST -- INTRUSION LOGGED"
+                                  : "SLICE FAILED -- SECURITY HOLDING";
             resp["retry"] = true;
+            // Consecutive hostile failures (incl. lost signal) trip the alarm
+            if (facMod > 0 && cfg.alarm_after_fails > 0) {
+                hostileFails++;
+                if (!alarmActive && hostileFails >= cfg.alarm_after_fails)
+                    setAlarm(true, pfac, callsign);
+            }
+        }
+        if (usedJammer) resp["consumed_item"] = "JAMMER";
+    }
+    else if (strcmp(action, "reset_alarm") == 0) {
+        resp["type"] = "dialogue";
+        JsonObject sp = resp["speaker"].to<JsonObject>();
+        sp["name"] = cfg.name;
+        JsonArray lines = resp["lines"].to<JsonArray>();
+        JsonArray choices = resp["choices"].to<JsonArray>();
+        if (!alarmActive) {
+            JsonObject l1 = lines.add<JsonObject>();
+            l1["text"] = "NO ALARM CONDITION PRESENT";
+            l1["style"] = "system";
+        } else if (facMod > 0) {
+            // Hostile players must beat a 1-round Simon to silence it
+            alarmBypass = true;
+            panelState = STATE_MINIGAME;
+            resp["type"] = "minigame_start";
+            resp["game"] = "simon";
+            resp["rounds"] = 1;
+        } else {
+            setAlarm(false, pfac, callsign);
+            pendingFx = FX_ACTIVITY;
+            JsonObject l1 = lines.add<JsonObject>();
+            l1["text"] = "ALARM RESET // SECURITY GRID NORMALIZED";
+            l1["style"] = "system";
+        }
+        if (strcmp(resp["type"] | "", "dialogue") == 0) {
+            JsonObject c1 = choices.add<JsonObject>();
+            c1["label"] = "[Disconnect]";
+            c1["next_action"] = nullptr;
         }
     }
     else if (strcmp(action, "send_signal") == 0) {
@@ -607,6 +780,25 @@ void onMeshMsg(const swts::MeshHeader *hdr, const uint8_t *payload, int len) {
             ESP.restart();
             break;
         }
+        case swts::MSG_ALARM_CLEAR: {
+            if (len < (int)sizeof(swts::MeshAlarmClear)) return;
+            const swts::MeshAlarmClear *a = (const swts::MeshAlarmClear *)payload;
+            if (strcmp(a->target_prop, cfg.id) != 0 && strcmp(a->target_prop, "ALL") != 0) return;
+            if (alarmActive) setAlarm(false, "", "GM");
+            break;
+        }
+        case swts::MSG_TIMER: {
+            if (len < (int)sizeof(swts::MeshTimer)) return;
+            const swts::MeshTimer *t = (const swts::MeshTimer *)payload;
+            extern volatile unsigned long timerEndsAt;
+            extern volatile uint32_t timerTotalS;
+            if (!t->active) { timerEndsAt = 0; }
+            else {
+                timerEndsAt = millis() + t->remaining_s * 1000UL;
+                timerTotalS = t->total_s;
+            }
+            break;
+        }
         default: break;
     }
 }
@@ -706,6 +898,41 @@ void setup() {
 void loop() {
     // Lights: idle pattern + any interaction effect queued by HTTP handlers
     applyPendingFx();
+
+    // ── Alarm: strobe + siren while tripped; auto-clear on timeout ──
+    if (alarmDirty) {
+        alarmDirty = false;
+        swts_lights::setAlarm(alarmActive, cfg.alarm_siren_ms);
+    }
+    if (alarmActive) {
+        static unsigned long lastSiren = 0;
+        if (millis() - lastSiren >= (unsigned long)cfg.alarm_siren_ms * 2) {
+            lastSiren = millis();
+            buzzerTone(1400, cfg.alarm_siren_ms);
+        }
+        if (cfg.alarm_timeout_s > 0 &&
+            millis() - alarmSince > (unsigned long)cfg.alarm_timeout_s * 1000UL) {
+            setAlarm(false, "", "timeout");
+            alarmDirty = false;
+            swts_lights::setAlarm(false);
+        }
+    }
+
+    // ── GM countdown: red-shift the idle pattern as it runs out ──
+    if (cfg.timer_visual) {
+        static unsigned long lastTint = 0;
+        if (millis() - lastTint > 1000) {
+            lastTint = millis();
+            uint8_t pct = 0;
+            if (timerEndsAt && timerTotalS > 0) {
+                long remainMs = (long)(timerEndsAt - millis());
+                if (remainMs < 0) remainMs = 0;
+                pct = (uint8_t)(70 - (70 * (remainMs / 1000UL)) / timerTotalS);
+            }
+            swts_lights::setTint(pct);
+        }
+    }
+
     swts_lights::update();
 
     static unsigned long lastPoll = 0;
@@ -726,10 +953,11 @@ void loop() {
     if (millis() - lastBeat > 10000) {
         lastBeat = millis();
         const char* st[] = {"IDLE","CONN","ACTIVE","SLICE","HACKED"};
-        S.printf("[%s] %s | sliced=%d | nfc=%s | card=%s\n",
-                 cfg.id, st[panelState], playerSliced,
+        S.printf("[%s] %s | sliced=%d | alarm=%d | nfc=%s | card=%s\n",
+                 cfg.id, st[panelState], playerSliced, alarmActive,
                  nfcOk ? "ok" : "--", cardPresent ? lastNfcUid : "--");
         swts::sendPing(millis() / 1000);
+        swts::sendPropStatus(millis() / 1000, 0, alarmActive, "");
     }
 
     delay(10);

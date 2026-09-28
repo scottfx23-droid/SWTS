@@ -54,6 +54,19 @@ inline uint16_t      fxPeriod  = 120;
 inline unsigned long fxNext    = 0;
 inline bool          fxLit     = false;
 
+// Persistent alarm strobe — overrides everything until cleared
+inline bool          alarmOn      = false;
+inline uint16_t      alarmPeriod  = 350;
+inline unsigned long alarmNext    = 0;
+inline bool          alarmLit     = false;
+
+// Countdown tint: idle colors blend toward red by tintPct (0 = off)
+inline uint8_t       tintPct = 0;
+
+// Single-pixel override (e.g. droid mood eye on pixel 0). -1 = none.
+inline int      overridePixel = -1;
+inline uint32_t overrideColor = 0;
+
 inline neoPixelType orderFlag(const char *o) {
     if (strcasecmp(o, "RGB") == 0) return NEO_RGB;
     if (strcasecmp(o, "RBG") == 0) return NEO_RBG;
@@ -154,12 +167,56 @@ inline void effectSuccess()  { flash(0x00FF40, 4, 120); }   // green celebration
 inline void effectFail()     { flash(0xFF2000, 3, 170); }   // red rejection
 inline void effectSignal()   { flash(0x00AAFF, 6, 90);  }   // cyan transmit
 
+// ALARM: red strobe until cleared (overrides idle AND flashes)
+inline void setAlarm(bool on, uint16_t periodMs = 350) {
+    alarmOn = on;
+    alarmPeriod = periodMs;
+    alarmNext = 0;
+    if (!on) for (int i = 0; i < ledCount; i++) leds[i].nextChange = 0;  // redraw idle
+}
+
+// Countdown visual: blend idle colors toward red (0 = normal, 100 = pure red)
+inline void setTint(uint8_t pct) {
+    if (pct > 100) pct = 100;
+    if (pct == tintPct) return;
+    tintPct = pct;
+    for (int i = 0; i < ledCount; i++) leds[i].nextChange = 0;   // force redraw
+}
+
+// Pin one pixel to a fixed color (droid mood eye); idx -1 disables
+inline void setPixelOverride(int idx, uint32_t rgb) {
+    overridePixel = idx;
+    overrideColor = rgb;
+    if (idx >= 0 && idx < ledCount) leds[idx].nextChange = 0;
+}
+
+inline uint32_t applyTint(uint32_t rgb) {
+    if (tintPct == 0) return rgb;
+    uint8_t r = (rgb >> 16) & 0xFF, g = (rgb >> 8) & 0xFF, b = rgb & 0xFF;
+    r = r + ((255 - r) * tintPct) / 100;
+    g = g - (g * tintPct) / 100;
+    b = b - (b * tintPct) / 100;
+    return ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+}
+
 // Advance idle pattern + any active effect. Call every loop pass.
 inline void update() {
     if (!strip || ledCount == 0) return;
     unsigned long now = millis();
     static unsigned long lastShow = 0;
     bool dirty = false;
+
+    if (alarmOn) {
+        // Alarm strobe beats everything
+        if (now >= alarmNext) {
+            alarmLit = !alarmLit;
+            for (int i = 0; i < ledCount; i++) setPixel(i, alarmLit ? 0xFF2000 : 0);
+            alarmNext = now + alarmPeriod;
+            dirty = true;
+        }
+        if (dirty && now - lastShow >= 15) { strip->show(); lastShow = now; }
+        return;
+    }
 
     if (fxLeft > 0) {
         // Effect override — whole strip blinks fxColor
@@ -177,14 +234,20 @@ inline void update() {
     } else {
         for (int i = 0; i < ledCount; i++) {
             LedDef &d = leds[i];
+            // Pinned pixel (droid mood eye) ignores its configured behavior
+            if (i == overridePixel) {
+                if (d.nextChange == 0) { setPixel(i, overrideColor); d.nextChange = 1; dirty = true; }
+                continue;
+            }
+            uint32_t base = applyTint(d.color);
             switch (d.mode) {
             case LED_SOLID:
-                if (d.nextChange == 0) { setPixel(i, d.color); d.nextChange = 1; dirty = true; }
+                if (d.nextChange == 0) { setPixel(i, base); d.nextChange = 1; dirty = true; }
                 break;
             case LED_BLINK:
                 if (now >= d.nextChange) {
                     d.lit = (d.nextChange == 0) ? true : !d.lit;
-                    setPixel(i, d.lit ? d.color : 0);
+                    setPixel(i, d.lit ? base : 0);
                     d.nextChange = now + (d.lit ? d.on_ms : d.off_ms);
                     dirty = true;
                 }
@@ -192,8 +255,8 @@ inline void update() {
             case LED_FLICKER:
                 if (now >= d.nextChange) {
                     uint8_t roll = esp_random() % 100;
-                    if (roll < 20) setPixel(i, 0);                              // wink out
-                    else           setPixel(i, scale(d.color, 25 + roll % 76)); // 25-100%
+                    if (roll < 20) setPixel(i, 0);                            // wink out
+                    else           setPixel(i, scale(base, 25 + roll % 76));  // 25-100%
                     d.nextChange = now + 50 + (esp_random() % 140);
                     dirty = true;
                 }

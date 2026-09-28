@@ -22,6 +22,14 @@
     "slice_first": true,
     "minigame_default": "simon",
     "simon_rounds": 3,
+    "proximity_enabled": true,
+    "proximity_rssi_start": -60,
+    "proximity_rssi_drop": -72,
+    "proximity_grace_ms": 2000,
+    "alarm_after_fails": 2,
+    "alarm_timeout_s": 90,
+    "alarm_siren_period_ms": 350,
+    "timer_visual": true,
     "dialogue_greeting": "dialogue/greeting.json"
   }
 }

@@ -96,6 +96,21 @@
       "body": "Signal received, operative. Lambda shuttle on approach -- ETA ten minutes. Proceed to the landing zone and scan the extraction beacon EXTRACT_01 to confirm pickup. Clear skies.",
       "trigger": "event:extraction:PANEL_01",
       "faction": "REBEL"
+    },
+    {
+      "id": "reinforcements",
+      "from": "OUTPOST WATCH",
+      "subject": "REINFORCEMENTS ARRIVE",
+      "body": "Imperial troop shuttles are on the deck. The extraction window is closed -- whatever you were doing, it just got a lot harder.",
+      "trigger": "event:reinforcements_arrive"
+    },
+    {
+      "id": "shadow_freq",
+      "from": "UNKNOWN SENDER",
+      "subject": "INTERCEPTED BURST",
+      "body": "Backup extraction frequency is 121.9 -- memorize it and burn this message. If the comm board is compromised, broadcast from the repair shop decoder instead. Trust no one wearing white armor.",
+      "trigger": "boot",
+      "encrypted": true
     }
   ]
 }

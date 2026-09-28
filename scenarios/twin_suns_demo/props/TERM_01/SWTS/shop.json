@@ -1,0 +1,9 @@
+{
+  "$schema": "swts-shop-v1",
+  "items": [
+    { "id": "JAMMER", "name": "SIGNAL JAMMER",
+      "cost": 300, "effect": "next_hostile_as_neutral" },
+    { "id": "INFORMANT_TIP", "name": "INFORMANT TIP",
+      "cost": 100, "effect": "reveal_bounty_clue" }
+  ]
+}

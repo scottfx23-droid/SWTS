@@ -11,6 +11,10 @@
     "role": "gamemaster"
   },
   "factions": ["REBEL", "IMPERIAL"],
+  "timers": [
+    { "id": "extraction_window", "label": "EXTRACTION WINDOW",
+      "seconds": 600, "on_expire": "reinforcements_arrive", "faction": "" }
+  ],
   "game": {
     "max_score": 1000,
     "event_duration_min": 30,
@@ -69,6 +73,12 @@
       "severity": 2,
       "description": "ISB authorizes force. All Imperial agents move on known rebel positions immediately.",
       "faction": "IMPERIAL"
+    },
+    {
+      "id": "reinforcements_arrive",
+      "name": "REINFORCEMENTS ARRIVE",
+      "severity": 3,
+      "description": "Imperial reinforcements have landed. The extraction window is closed."
     }
   ],
   "comms": [

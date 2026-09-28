@@ -5,5 +5,8 @@
     "version": "0.1-demo",
     "planet": "Outpost 77",
     "currency": "CR"
-  }
+  },
+  "radar_enabled": true,
+  "radar_kid_mode": false,
+  "duel": { "enabled": true, "targets": 5, "stake": 100, "cooldown_s": 120 }
 }

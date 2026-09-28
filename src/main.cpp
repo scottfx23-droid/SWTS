@@ -412,6 +412,44 @@ char factionList[MESH_MAX_FACTIONS][14] = { "REBEL", "IMPERIAL" };
 int  factionCount = 2;
 volatile bool factionListDirty = false;   // roster changed (rebuild pick screen if showing)
 
+// ── Inventory ── item ids from ITEM:<id> cards and shop purchases
+#define MAX_INVENTORY 8
+char inventory[MAX_INVENTORY][20];
+int  inventoryCount = 0;
+
+bool inventoryHas(const char *id) {
+    for (int i = 0; i < inventoryCount; i++)
+        if (strcasecmp(inventory[i], id) == 0) return true;
+    return false;
+}
+bool inventoryAdd(const char *id) {
+    if (!id || !id[0] || inventoryCount >= MAX_INVENTORY || inventoryHas(id)) return false;
+    strlcpy(inventory[inventoryCount++], id, sizeof(inventory[0]));
+    return true;
+}
+void inventoryRemove(const char *id) {
+    for (int i = 0; i < inventoryCount; i++) {
+        if (strcasecmp(inventory[i], id) == 0) {
+            for (int j = i; j < inventoryCount - 1; j++)
+                strlcpy(inventory[j], inventory[j + 1], sizeof(inventory[0]));
+            inventoryCount--;
+            return;
+        }
+    }
+}
+
+// ── Duel (PvP reaction game) config — datapad config.json "duel" ──
+bool duelEnabled = true;
+int  duelTargets = 5, duelStake = 100, duelCooldownS = 120;
+
+// ── Radar config ──
+bool radarEnabled = true;
+bool radarKidMode = false;   // radar hidden for KID players unless true
+
+// ── GM countdown (shown in the home header) ──
+char timerLabel[24] = "";
+volatile unsigned long timerEndsAtMs = 0;   // local millis() at zero (0 = none)
+
 // A mission is available to this player when its faction field is empty,
 // "ALL"/"ANY", or matches the player's declared faction.
 bool missionFactionOk(const MissionDef &m) {
@@ -424,6 +462,9 @@ char scoreSuffix[4] = "CR";  // "CR" or "RP" — loaded from config
 char planetName[24] = "Unknown";
 lv_obj_t *homeScoreLbl = NULL;
 lv_obj_t *homeFactionLbl = NULL;
+lv_obj_t *homeTimerLbl = NULL;
+extern lv_obj_t *scrInventory;   // defined with the inventory screen builder
+void refreshInventoryList();     // forward decl
 lv_obj_t *homeMissionBtn = NULL,  *homeMissionBadge = NULL;
 lv_obj_t *homeBountyBtn  = NULL,  *homeBountyBadge  = NULL;
 lv_obj_t *homeCommBtn    = NULL,  *homeCommBadge    = NULL;
@@ -491,6 +532,11 @@ int completedMissionCount() {
 void triggerComms(const char *trigger);                          // forward decl
 void triggerCommsPrefix(const char *prefix, const char *value);  // forward decl
 void showObjectiveToast(const char *title, const char *body);    // forward decl
+void duelChallenge(const char *target);                          // forward decl
+bool handlePropCommon(JsonDocument &doc);                        // forward decl
+void renderPropDialogue(JsonDocument &doc);                      // forward decl
+extern lv_obj_t *scrRadar;                                       // radar screen
+void refreshRadarList();                                         // forward decl
 bool debriefPending = false;   // set when the endgame mission completes; loop shows debrief
 
 bool startMission(uint8_t defIdx) {
@@ -885,11 +931,26 @@ void buildHomeScreen() {
     lv_obj_add_style(ftr, &s_ftr, 0);
     lv_obj_clear_flag(ftr, LV_OBJ_FLAG_SCROLLABLE);
 
+    // Tapping the footer opens the inventory
+    lv_obj_add_flag(ftr, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(ftr, [](lv_event_t *e) {
+        refreshInventoryList();
+        lv_scr_load_anim(scrInventory, LV_SCR_LOAD_ANIM_MOVE_LEFT, 180, 0, false);
+    }, LV_EVENT_CLICKED, NULL);
+
     lv_obj_t *sys = lv_label_create(ftr);
     lv_label_set_text(sys, "SYSTEMS ACTIVE");
     lv_obj_set_style_text_font(sys, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(sys, C_AMB_DIM, 0);
     lv_obj_align(sys, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_clear_flag(sys, LV_OBJ_FLAG_CLICKABLE);
+
+    // GM countdown readout (header, center) — driven from loop()
+    homeTimerLbl = lv_label_create(scrHome);
+    lv_label_set_text(homeTimerLbl, "");
+    lv_obj_set_style_text_font(homeTimerLbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(homeTimerLbl, C_AMB_BRT, 0);
+    lv_obj_align(homeTimerLbl, LV_ALIGN_TOP_MID, 0, 8);
 
     // Player faction (center) -- updated when allegiance is declared
     homeFactionLbl = lv_label_create(ftr);
@@ -1078,6 +1139,73 @@ void showCardResult(uint8_t *uid, uint8_t len) {
     // Token = the tag's NDEF text (INTEL_01, EXTRACT_01, ...). No UID-hash
     // fallback: a failed read must never map onto a real mission token.
     const char *token = ndefText;
+
+    // ── Operative card: scanning another player's card starts a Duel ──
+    if (strncasecmp(token, "PLAYER:", 7) == 0) {
+        const char *who = token + 7;
+        lv_obj_add_flag(dcSpinner, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(dcPrompt, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(dcResult, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clean(dcResult);
+        lv_obj_t *hd = lv_label_create(dcResult);
+        lv_obj_set_style_text_font(hd, &lv_font_montserrat_18, 0);
+        lv_obj_set_style_text_color(hd, C_AMB_BRT, 0);
+        lv_obj_set_pos(hd, 10, 8);
+        lv_obj_t *bd = lv_label_create(dcResult);
+        lv_obj_set_style_text_font(bd, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(bd, C_AMB, 0);
+        lv_obj_set_width(bd, W - 40);
+        lv_obj_set_pos(bd, 10, 44);
+        if (strcmp(who, callsign) == 0) {
+            lv_label_set_text(hd, "OPERATIVE CARD");
+            lv_label_set_text(bd, "This is your own registry card.");
+        } else {
+            lv_label_set_text(hd, "OPERATIVE DETECTED");
+            char b[96];
+            snprintf(b, sizeof(b), "Card belongs to %s.\n\nSending duel challenge...", who);
+            lv_label_set_text(bd, b);
+            duelChallenge(who);
+        }
+        dcScanning = false;
+        return;
+    }
+
+    // ── Item card: goes straight into the inventory ──
+    if (strncasecmp(token, "ITEM:", 5) == 0) {
+        const char *itemId = token + 5;
+        bool added = inventoryAdd(itemId);
+        if (added) {
+            playerDirty = true; playerLastSave = 0;
+            char eb[40];
+            snprintf(eb, sizeof(eb), "item_pickup:%s", itemId);
+            swts::gmTriggerEvent(eb, "Item picked up", 0, callsign);
+            queueGameEvent(eb);
+            buzzerScanOk();
+        } else {
+            buzzerScanFail();
+        }
+        lv_obj_add_flag(dcSpinner, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(dcPrompt, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(dcResult, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clean(dcResult);
+        lv_obj_t *hd = lv_label_create(dcResult);
+        lv_label_set_text(hd, added ? "ITEM ACQUIRED" : (inventoryHas(itemId) ? "ALREADY CARRIED" : "PACK FULL"));
+        lv_obj_set_style_text_font(hd, &lv_font_montserrat_18, 0);
+        lv_obj_set_style_text_color(hd, added ? C_AMB_BRT : C_AMB_DIM, 0);
+        lv_obj_set_pos(hd, 10, 8);
+        lv_obj_t *nm = lv_label_create(dcResult);
+        lv_label_set_text(nm, itemId);
+        lv_obj_set_style_text_font(nm, &lv_font_montserrat_24, 0);
+        lv_obj_set_style_text_color(nm, C_AMB, 0);
+        lv_obj_set_pos(nm, 10, 40);
+        lv_obj_t *ft = lv_label_create(dcResult);
+        lv_label_set_text(ft, "Stored in inventory (tap the\nhome footer to manage items).");
+        lv_obj_set_style_text_font(ft, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(ft, C_DIM, 0);
+        lv_obj_set_pos(ft, 10, 84);
+        dcScanning = false;
+        return;
+    }
 
     // Deliver any comms keyed to this scan ("scan:<token>")
     triggerCommsPrefix("scan", token);
@@ -1345,6 +1473,31 @@ void buildNearbyScreen() {
     lv_obj_set_style_text_letter_space(nbStatus, 1, 0);
     lv_obj_set_pos(nbStatus, 12, 56);
 
+    // RADAR — mesh-RSSI contact list (ADULT players, when enabled)
+    if (radarEnabled) {
+        lv_obj_t *rb = lv_btn_create(scrNearby);
+        lv_obj_set_size(rb, 78, 26);
+        lv_obj_set_pos(rb, W - 90, 52);
+        lv_obj_set_style_bg_color(rb, C_PNL, 0);
+        lv_obj_set_style_bg_color(rb, C_PNL2, LV_STATE_PRESSED);
+        lv_obj_set_style_border_color(rb, C_AMB_DIM, 0);
+        lv_obj_set_style_border_width(rb, 1, 0);
+        lv_obj_set_style_shadow_width(rb, 0, 0);
+        lv_obj_add_event_cb(rb, [](lv_event_t *e) {
+            if (kidMode && !radarKidMode) {
+                showObjectiveToast("RADAR OFFLINE", "NOT AVAILABLE IN KID MODE");
+                return;
+            }
+            refreshRadarList();
+            lv_scr_load_anim(scrRadar, LV_SCR_LOAD_ANIM_MOVE_LEFT, 180, 0, false);
+        }, LV_EVENT_CLICKED, NULL);
+        lv_obj_t *rl = lv_label_create(rb);
+        lv_label_set_text(rl, "RADAR");
+        lv_obj_set_style_text_font(rl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(rl, C_AMB, 0);
+        lv_obj_center(rl);
+    }
+
     hline(scrNearby, 70, C_FRM, 1);
 
     // Scrollable list
@@ -1598,13 +1751,36 @@ String postInteract(const char* action) {
     JsonObject p = req["player"].to<JsonObject>();
     p["callsign"] = callsign;
     p["faction"] = playerFaction;
+    p["mode"] = kidMode ? "KID" : "ADULT";
+    JsonArray inv = p["inventory"].to<JsonArray>();
+    for (int i = 0; i < inventoryCount; i++) inv.add(inventory[i]);
 
     String body;
     serializeJson(req, body);
     int code = http.POST(body);
     String resp = "";
-    if (code == 200) resp = http.getString();
+    // 403 bodies carry prop errors (too_far, alarm) the caller must render
+    if (code == 200 || code == 403) resp = http.getString();
     else S.printf("[PROP] interact failed: %d\n", code);
+    http.end();
+    return resp;
+}
+
+// Same as postInteract but with one extra request field (shop purchases)
+String postInteractItem(const char* action, const char* item) {
+    HTTPClient http;
+    http.setTimeout(5000);
+    http.begin("http://192.168.4.1/api/interact");
+    http.addHeader("Content-Type", "application/json");
+    JsonDocument req;
+    req["action"] = action;
+    req["item"] = item;
+    JsonObject p = req["player"].to<JsonObject>();
+    p["callsign"] = callsign;
+    p["faction"] = playerFaction;
+    String body; serializeJson(req, body);
+    int code = http.POST(body);
+    String resp = (code == 200 || code == 403) ? http.getString() : String();
     http.end();
     return resp;
 }
@@ -2565,6 +2741,731 @@ void updatePurgeGame() {
 }
 
 // ═══════════════════════════════════════
+//  DECRYPT MINIGAME — Mastermind-style code breaking
+//  Four-glyph code from a palette; each guess reports exact / misplaced
+//  matches. Launched by terminals (prop mode) and by encrypted comms
+//  (local mode).
+// ═══════════════════════════════════════
+enum DecryptMode : uint8_t { DM_PROP, DM_COMM };
+static const char *DCY_GLYPH[8] = { "#", "%", "&", "@", "?", "$", "=", "+" };
+
+DecryptMode dcyMode = DM_PROP;
+int  dcyCommIdx = -1;         // inbox index (comm mode)
+int  dcyCode[4];
+int  dcyCodeLen = 4;
+int  dcyGlyphs = 6;
+int  dcyTriesLeft = 6;
+int  dcyGuess[4];
+int  dcyGuessPos = 0;
+bool dcyActive = false;
+bool dcyWon = false;
+unsigned long dcyEndTime = 0;
+
+lv_obj_t *scrDecrypt = NULL;
+lv_obj_t *dcySlot[4] = {};
+lv_obj_t *dcyStatus = NULL, *dcyTriesLbl = NULL, *dcyHistory = NULL;
+lv_obj_t *dcyPalBtn[8] = {};
+
+static void dcyRefreshSlots() {
+    for (int i = 0; i < 4; i++) {
+        if (!dcySlot[i]) continue;
+        if (i >= dcyCodeLen) { lv_obj_add_flag(dcySlot[i], LV_OBJ_FLAG_HIDDEN); continue; }
+        lv_obj_clear_flag(dcySlot[i], LV_OBJ_FLAG_HIDDEN);
+        lv_obj_t *lbl = lv_obj_get_child(dcySlot[i], 0);
+        lv_label_set_text(lbl, (i < dcyGuessPos) ? DCY_GLYPH[dcyGuess[i]] : "_");
+        lv_obj_set_style_text_color(lbl, (i < dcyGuessPos) ? C_AMB_BRT : C_DIM, 0);
+    }
+    char tb[20];
+    snprintf(tb, sizeof(tb), "ATTEMPTS LEFT %d", dcyTriesLeft);
+    lv_label_set_text(dcyTriesLbl, tb);
+}
+
+static void dcyEnd(bool won) {
+    dcyActive = false;
+    dcyWon = won;
+    dcyEndTime = millis();
+    if (won) {
+        buzzerSuccess();
+        lv_label_set_text(dcyStatus, "CIPHER BROKEN");
+        lv_obj_set_style_text_color(dcyStatus, C_AMB_BRT, 0);
+    } else {
+        buzzerFail();
+        lv_label_set_text(dcyStatus, "CIPHER RESEEDED -- LOCKED OUT");
+        lv_obj_set_style_text_color(dcyStatus, C_AMB_DIM, 0);
+    }
+}
+
+static void ev_dcy_pal(lv_event_t *e) {
+    if (!dcyActive || dcyGuessPos >= dcyCodeLen) return;
+    int g = (int)(intptr_t)lv_event_get_user_data(e);
+    dcyGuess[dcyGuessPos++] = g;
+    buzzerClick();
+    dcyRefreshSlots();
+}
+
+static void ev_dcy_clear(lv_event_t *e) {
+    if (!dcyActive) return;
+    dcyGuessPos = 0;
+    dcyRefreshSlots();
+}
+
+static void ev_dcy_submit(lv_event_t *e) {
+    if (!dcyActive || dcyGuessPos < dcyCodeLen) return;
+
+    // Score the guess: exact + misplaced (classic Mastermind)
+    int exact = 0, partial = 0;
+    bool usedC[4] = {}, usedG[4] = {};
+    for (int i = 0; i < dcyCodeLen; i++)
+        if (dcyGuess[i] == dcyCode[i]) { exact++; usedC[i] = usedG[i] = true; }
+    for (int i = 0; i < dcyCodeLen; i++) {
+        if (usedG[i]) continue;
+        for (int j = 0; j < dcyCodeLen; j++) {
+            if (usedC[j] || dcyGuess[i] != dcyCode[j]) continue;
+            partial++; usedC[j] = true; break;
+        }
+    }
+
+    // History row: "> # % @ ?   2 LOCKED / 1 LOOSE"
+    char row[64] = "> ";
+    for (int i = 0; i < dcyCodeLen; i++) { strcat(row, DCY_GLYPH[dcyGuess[i]]); strcat(row, " "); }
+    char fb[28];
+    snprintf(fb, sizeof(fb), "  %d LOCKED / %d LOOSE", exact, partial);
+    strcat(row, fb);
+    lv_obj_t *r = lv_label_create(dcyHistory);
+    lv_label_set_text(r, row);
+    lv_obj_set_style_text_font(r, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(r, exact == dcyCodeLen ? C_AMB_BRT : C_AMB, 0);
+    lv_obj_scroll_to_view(r, LV_ANIM_OFF);
+
+    dcyGuessPos = 0;
+    dcyTriesLeft--;
+
+    if (exact == dcyCodeLen) { dcyRefreshSlots(); dcyEnd(true); return; }
+    buzzerTone(600, 60);
+    dcyRefreshSlots();
+    if (dcyTriesLeft <= 0) dcyEnd(false);
+}
+
+void buildDecryptScreen() {
+    scrDecrypt = lv_obj_create(NULL);
+    lv_obj_add_style(scrDecrypt, &s_scr, 0);
+    lv_obj_clear_flag(scrDecrypt, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(scrDecrypt);
+    lv_label_set_text(title, "DECRYPT");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(title, C_AMB_BRT, 0);
+    lv_obj_set_style_text_letter_space(title, 2, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 14);
+
+    dcyStatus = lv_label_create(scrDecrypt);
+    lv_obj_set_style_text_font(dcyStatus, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(dcyStatus, C_AMB, 0);
+    lv_obj_align(dcyStatus, LV_ALIGN_TOP_MID, 0, 44);
+
+    dcyTriesLbl = lv_label_create(scrDecrypt);
+    lv_obj_set_style_text_font(dcyTriesLbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(dcyTriesLbl, C_DIM, 0);
+    lv_obj_align(dcyTriesLbl, LV_ALIGN_TOP_MID, 0, 66);
+
+    // Guess slots
+    const int slotW = 48, gap = 10;
+    for (int i = 0; i < 4; i++) {
+        lv_obj_t *s2 = lv_obj_create(scrDecrypt);
+        lv_obj_remove_style_all(s2);
+        lv_obj_set_size(s2, slotW, 46);
+        lv_obj_set_pos(s2, (W - (slotW * 4 + gap * 3)) / 2 + i * (slotW + gap), 86);
+        lv_obj_set_style_bg_color(s2, C_PNL, 0);
+        lv_obj_set_style_bg_opa(s2, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_color(s2, C_AMB_DIM, 0);
+        lv_obj_set_style_border_width(s2, 2, 0);
+        lv_obj_set_style_radius(s2, 4, 0);
+        lv_obj_clear_flag(s2, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_t *lbl = lv_label_create(s2);
+        lv_label_set_text(lbl, "_");
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_24, 0);
+        lv_obj_center(lbl);
+        dcySlot[i] = s2;
+    }
+
+    // Glyph palette (2 rows x 4)
+    const int pbW = 64, pbH = 42, pgap = 8;
+    const int px0 = (W - (pbW * 4 + pgap * 3)) / 2;
+    for (int i = 0; i < 8; i++) {
+        lv_obj_t *b = lv_btn_create(scrDecrypt);
+        lv_obj_set_size(b, pbW, pbH);
+        lv_obj_set_pos(b, px0 + (i % 4) * (pbW + pgap), 144 + (i / 4) * (pbH + pgap));
+        lv_obj_set_style_bg_color(b, C_PNL, 0);
+        lv_obj_set_style_bg_color(b, C_PNL2, LV_STATE_PRESSED);
+        lv_obj_set_style_border_color(b, C_AMB_DIM, 0);
+        lv_obj_set_style_border_width(b, 1, 0);
+        lv_obj_set_style_radius(b, 3, 0);
+        lv_obj_set_style_shadow_width(b, 0, 0);
+        lv_obj_add_event_cb(b, ev_dcy_pal, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+        lv_obj_t *bl = lv_label_create(b);
+        lv_label_set_text(bl, DCY_GLYPH[i]);
+        lv_obj_set_style_text_font(bl, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_color(bl, C_AMB, 0);
+        lv_obj_center(bl);
+        dcyPalBtn[i] = b;
+    }
+
+    // CLEAR / SUBMIT
+    lv_obj_t *clr = lv_btn_create(scrDecrypt);
+    lv_obj_set_size(clr, 120, 40);
+    lv_obj_set_pos(clr, 20, 246);
+    lv_obj_set_style_bg_color(clr, C_PNL, 0);
+    lv_obj_set_style_border_color(clr, C_AMB_DIM, 0);
+    lv_obj_set_style_border_width(clr, 1, 0);
+    lv_obj_set_style_shadow_width(clr, 0, 0);
+    lv_obj_add_event_cb(clr, ev_dcy_clear, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *cl = lv_label_create(clr);
+    lv_label_set_text(cl, "CLEAR");
+    lv_obj_set_style_text_font(cl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(cl, C_AMB, 0);
+    lv_obj_center(cl);
+
+    lv_obj_t *sub = lv_btn_create(scrDecrypt);
+    lv_obj_set_size(sub, 150, 40);
+    lv_obj_set_pos(sub, W - 170, 246);
+    lv_obj_set_style_bg_color(sub, C_AMB_DIM, 0);
+    lv_obj_set_style_bg_color(sub, C_AMB, LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(sub, 0, 0);
+    lv_obj_set_style_shadow_width(sub, 0, 0);
+    lv_obj_add_event_cb(sub, ev_dcy_submit, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *sl = lv_label_create(sub);
+    lv_label_set_text(sl, "SUBMIT");
+    lv_obj_set_style_text_font(sl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(sl, C_BG, 0);
+    lv_obj_center(sl);
+
+    // Guess history
+    dcyHistory = lv_obj_create(scrDecrypt);
+    lv_obj_set_size(dcyHistory, W - 30, H - 350);
+    lv_obj_set_pos(dcyHistory, 15, 298);
+    lv_obj_set_style_bg_color(dcyHistory, C_PNL, 0);
+    lv_obj_set_style_bg_opa(dcyHistory, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(dcyHistory, C_FRM, 0);
+    lv_obj_set_style_border_width(dcyHistory, 1, 0);
+    lv_obj_set_style_pad_all(dcyHistory, 8, 0);
+    lv_obj_set_flex_flow(dcyHistory, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(dcyHistory, 2, 0);
+}
+
+void launchDecryptGame(DecryptMode mode, int tries, int glyphs, int codeLen, int commIdx) {
+    dcyMode = mode;
+    dcyCommIdx = commIdx;
+    if (kidMode) { tries = 10; glyphs = 4; codeLen = 3; }   // gentler cipher for kids
+    dcyTriesLeft = constrain(tries, 1, 12);
+    dcyGlyphs = constrain(glyphs, 3, 8);
+    dcyCodeLen = constrain(codeLen, 3, 4);
+    for (int i = 0; i < dcyCodeLen; i++) dcyCode[i] = esp_random() % dcyGlyphs;
+    dcyGuessPos = 0;
+    dcyActive = true;
+    dcyWon = false;
+    dcyEndTime = 0;
+
+    lv_obj_clean(dcyHistory);
+    for (int i = 0; i < 8; i++) {
+        if (i < dcyGlyphs) lv_obj_clear_flag(dcyPalBtn[i], LV_OBJ_FLAG_HIDDEN);
+        else               lv_obj_add_flag(dcyPalBtn[i], LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_label_set_text(dcyStatus, mode == DM_COMM ? "INTERCEPTED TRANSMISSION" : "AUREK CIPHER ENGAGED");
+    lv_obj_set_style_text_color(dcyStatus, C_AMB, 0);
+    dcyRefreshSlots();
+    lv_scr_load_anim(scrDecrypt, LV_SCR_LOAD_ANIM_MOVE_LEFT, 180, 0, false);
+}
+
+// ═══════════════════════════════════════
+//  DUEL — PvP reaction game over the mesh
+//  Trigger: scan another player's operative card. Both datapads run the
+//  same seeded button sequence; fastest total time (wrong presses cost
+//  +300 ms) takes the stake.
+// ═══════════════════════════════════════
+enum DuelPhase : uint8_t { DUEL_IDLE, DUEL_WAIT_ACCEPT, DUEL_PLAY, DUEL_WAIT_RESULT, DUEL_DONE };
+DuelPhase duelPhase = DUEL_IDLE;
+char duelId[16] = "", duelOpponent[16] = "";
+uint32_t duelSeed = 0, duelRng = 0;
+int  duelStakeCur = 0, duelTargetsCur = 5, duelStep = 0, duelBtn = -1;
+uint32_t duelPenalty = 0;
+unsigned long duelStart = 0, duelPhaseTime = 0;
+uint32_t duelMyTime = 0, duelOppTime = 0xFFFFFFFF;
+bool duelOppDone = false, duelIWon = false;
+char lastDuelPeer[16] = "";
+unsigned long lastDuelAt = 0;
+
+// Pending mesh traffic (set on WiFi task, drained in loop)
+swts::MeshDuelRequest duelReqPending = {};
+volatile bool duelReqFlag = false;
+volatile bool duelAcceptFlag = false, duelDeclineFlag = false;
+swts::MeshDuelResult duelResPending = {};
+volatile bool duelResFlag = false;
+
+lv_obj_t *scrDuel = NULL;
+lv_obj_t *duelTitle = NULL, *duelStatusLbl = NULL, *duelBigLbl = NULL, *duelSubLbl = NULL;
+
+static const char *DUEL_COLOR[3] = { "BLUE", "WHITE", "RED" };
+
+uint32_t duelNextRand() {   // shared LCG — both sides see the same sequence
+    duelRng = duelRng * 1664525UL + 1013904223UL;
+    return duelRng >> 16;
+}
+
+void buildDuelScreen() {
+    scrDuel = lv_obj_create(NULL);
+    lv_obj_add_style(scrDuel, &s_scr, 0);
+    lv_obj_clear_flag(scrDuel, LV_OBJ_FLAG_SCROLLABLE);
+
+    duelTitle = lv_label_create(scrDuel);
+    lv_label_set_text(duelTitle, "DUEL");
+    lv_obj_set_style_text_font(duelTitle, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(duelTitle, C_AMB_BRT, 0);
+    lv_obj_set_style_text_letter_space(duelTitle, 3, 0);
+    lv_obj_align(duelTitle, LV_ALIGN_TOP_MID, 0, 24);
+
+    duelStatusLbl = lv_label_create(scrDuel);
+    lv_obj_set_style_text_font(duelStatusLbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(duelStatusLbl, C_AMB, 0);
+    lv_obj_align(duelStatusLbl, LV_ALIGN_TOP_MID, 0, 62);
+
+    duelBigLbl = lv_label_create(scrDuel);
+    lv_label_set_text(duelBigLbl, "");
+    lv_obj_set_style_text_font(duelBigLbl, &lv_font_montserrat_36, 0);
+    lv_obj_set_style_text_color(duelBigLbl, C_AMB_BRT, 0);
+    lv_obj_align(duelBigLbl, LV_ALIGN_CENTER, 0, -30);
+
+    duelSubLbl = lv_label_create(scrDuel);
+    lv_label_set_text(duelSubLbl, "");
+    lv_obj_set_style_text_font(duelSubLbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(duelSubLbl, C_AMB, 0);
+    lv_obj_set_style_text_align(duelSubLbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(duelSubLbl, LV_ALIGN_CENTER, 0, 50);
+}
+
+void duelShowTarget() {
+    duelBtn = duelNextRand() % 3;
+    ledAllOff();
+    digitalWrite(BUTTONS[duelBtn].led, HIGH);
+    btnState[duelBtn].ledHeld = true;
+    lv_label_set_text(duelBigLbl, DUEL_COLOR[duelBtn]);
+    char pb[24];
+    snprintf(pb, sizeof(pb), "%d / %d", duelStep + 1, duelTargetsCur);
+    lv_label_set_text(duelSubLbl, pb);
+}
+
+void duelStartPlay() {
+    duelRng = duelSeed;
+    duelStep = 0;
+    duelPenalty = 0;
+    duelMyTime = 0;
+    duelOppTime = 0xFFFFFFFF;
+    duelOppDone = false;
+    duelPhase = DUEL_PLAY;
+    btnHandler = [](BtnColor) {};   // suppress default press tones
+    for (int i = 0; i < 3; i++) btnState[i].pressed = false;
+    char sb[48];
+    snprintf(sb, sizeof(sb), "VS %s -- STAKE %d %s", duelOpponent, duelStakeCur, scoreSuffix);
+    lv_label_set_text(duelStatusLbl, sb);
+    buzzerScanOk();
+    duelStart = millis();
+    duelShowTarget();
+    lv_scr_load_anim(scrDuel, LV_SCR_LOAD_ANIM_FADE_ON, 150, 0, false);
+}
+
+void duelFinishLocal() {
+    duelMyTime = (millis() - duelStart) + duelPenalty;
+    ledAllOff();
+    btnHandler = defaultBtnTone;
+    // Send twice for radio reliability (receiver treats repeats idempotently)
+    swts::sendDuelResult(duelId, callsign, duelMyTime, 0);
+    swts::sendDuelResult(duelId, callsign, duelMyTime, 0);
+    duelPhase = DUEL_WAIT_RESULT;
+    duelPhaseTime = millis();
+    lv_label_set_text(duelBigLbl, "DONE");
+    char tb[40];
+    snprintf(tb, sizeof(tb), "YOUR TIME %lu.%03lus\nWAITING FOR OPPONENT...",
+             (unsigned long)duelMyTime / 1000, (unsigned long)duelMyTime % 1000);
+    lv_label_set_text(duelSubLbl, tb);
+}
+
+void duelResolve() {
+    // Lower time wins; tie goes to the alphabetically-first callsign so both
+    // sides agree without another exchange
+    bool win;
+    if (duelMyTime != duelOppTime) win = duelMyTime < duelOppTime;
+    else win = strcmp(callsign, duelOpponent) < 0;
+    duelIWon = win;
+    duelPhase = DUEL_DONE;
+    duelPhaseTime = millis();
+    strlcpy(lastDuelPeer, duelOpponent, sizeof(lastDuelPeer));
+    lastDuelAt = millis();
+
+    if (win) {
+        score += duelStakeCur;
+        buzzerSuccess();
+        lv_label_set_text(duelBigLbl, "VICTORY");
+        char eb[40];
+        snprintf(eb, sizeof(eb), "duel_won:%s:%s", callsign, duelOpponent);
+        swts::gmTriggerEvent(eb, "Duel won", 0, callsign);
+        queueGameEvent(eb);
+    } else {
+        score -= duelStakeCur;
+        if (score < 0) score = 0;
+        buzzerFail();
+        lv_label_set_text(duelBigLbl, "DEFEATED");
+    }
+    char sb[64];
+    snprintf(sb, sizeof(sb), "YOU %lu.%03lus  /  %s %lu.%03lus\n%+d %s",
+             (unsigned long)duelMyTime / 1000, (unsigned long)duelMyTime % 1000,
+             duelOpponent,
+             (unsigned long)duelOppTime / 1000, (unsigned long)duelOppTime % 1000,
+             win ? duelStakeCur : -duelStakeCur, scoreSuffix);
+    lv_label_set_text(duelSubLbl, sb);
+    refreshScoreLabel();
+    playerDirty = true;
+    playerLastSave = 0;
+}
+
+// Challenge another player (from scanning their operative card)
+void duelChallenge(const char *target) {
+    if (!duelEnabled || duelPhase != DUEL_IDLE) return;
+    if (kidMode) { showObjectiveToast("DUELS DISABLED", "KID MODE ACTIVE"); return; }
+    if (strcmp(lastDuelPeer, target) == 0 &&
+        millis() - lastDuelAt < (unsigned long)duelCooldownS * 1000UL) {
+        showObjectiveToast("DUEL COOLDOWN", "TOO SOON FOR A REMATCH");
+        return;
+    }
+    snprintf(duelId, sizeof(duelId), "D%08lX", (unsigned long)esp_random());
+    strlcpy(duelOpponent, target, sizeof(duelOpponent));
+    duelSeed = esp_random();
+    duelStakeCur = duelStake;
+    duelTargetsCur = duelTargets;
+    swts::sendDuelRequest(duelId, callsign, target, duelStakeCur, duelSeed, duelTargetsCur);
+    duelPhase = DUEL_WAIT_ACCEPT;
+    duelPhaseTime = millis();
+    char b[48];
+    snprintf(b, sizeof(b), "CHALLENGE SENT TO %s", target);
+    showObjectiveToast("DUEL", b);
+}
+
+// ── Incoming challenge prompt (overlay on whatever screen is active) ──
+lv_obj_t *duelPrompt = NULL;
+
+static void duelClosePrompt() {
+    if (duelPrompt) { lv_obj_del(duelPrompt); duelPrompt = NULL; }
+}
+
+static void ev_duel_accept(lv_event_t *e) {
+    strlcpy(duelId, duelReqPending.duel_id, sizeof(duelId));
+    strlcpy(duelOpponent, duelReqPending.challenger, sizeof(duelOpponent));
+    duelSeed = duelReqPending.seed;
+    duelStakeCur = duelReqPending.stake;
+    duelTargetsCur = duelReqPending.targets;
+    duelClosePrompt();
+    swts::sendDuelAccept(duelId, callsign, true);
+    swts::sendDuelAccept(duelId, callsign, true);
+    duelStartPlay();
+}
+
+static void ev_duel_decline(lv_event_t *e) {
+    swts::sendDuelAccept(duelReqPending.duel_id, callsign, false);
+    duelClosePrompt();
+}
+
+void duelShowPrompt() {
+    if (duelPrompt) return;
+    duelPrompt = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(duelPrompt, W - 30, 190);
+    lv_obj_center(duelPrompt);
+    lv_obj_set_style_bg_color(duelPrompt, C_PNL, 0);
+    lv_obj_set_style_bg_opa(duelPrompt, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(duelPrompt, C_AMB_BRT, 0);
+    lv_obj_set_style_border_width(duelPrompt, 2, 0);
+    lv_obj_set_style_radius(duelPrompt, 4, 0);
+    lv_obj_clear_flag(duelPrompt, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *t = lv_label_create(duelPrompt);
+    lv_label_set_text(t, "DUEL CHALLENGE");
+    lv_obj_set_style_text_font(t, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(t, C_AMB_BRT, 0);
+    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 4);
+
+    char b[72];
+    snprintf(b, sizeof(b), "%s challenges you!\nSTAKE: %d %s",
+             duelReqPending.challenger, (int)duelReqPending.stake, scoreSuffix);
+    lv_obj_t *bd = lv_label_create(duelPrompt);
+    lv_label_set_text(bd, b);
+    lv_obj_set_style_text_font(bd, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bd, C_AMB, 0);
+    lv_obj_set_style_text_align(bd, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(bd, LV_ALIGN_TOP_MID, 0, 40);
+
+    lv_obj_t *acc = lv_btn_create(duelPrompt);
+    lv_obj_set_size(acc, 110, 42);
+    lv_obj_align(acc, LV_ALIGN_BOTTOM_LEFT, 8, -8);
+    lv_obj_set_style_bg_color(acc, C_AMB_DIM, 0);
+    lv_obj_set_style_shadow_width(acc, 0, 0);
+    lv_obj_add_event_cb(acc, ev_duel_accept, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *al = lv_label_create(acc);
+    lv_label_set_text(al, "ACCEPT");
+    lv_obj_set_style_text_color(al, C_BG, 0);
+    lv_obj_center(al);
+
+    lv_obj_t *dec = lv_btn_create(duelPrompt);
+    lv_obj_set_size(dec, 110, 42);
+    lv_obj_align(dec, LV_ALIGN_BOTTOM_RIGHT, -8, -8);
+    lv_obj_set_style_bg_color(dec, C_PNL2, 0);
+    lv_obj_set_style_border_color(dec, C_AMB_DIM, 0);
+    lv_obj_set_style_border_width(dec, 1, 0);
+    lv_obj_set_style_shadow_width(dec, 0, 0);
+    lv_obj_add_event_cb(dec, ev_duel_decline, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *dl = lv_label_create(dec);
+    lv_label_set_text(dl, "DECLINE");
+    lv_obj_set_style_text_color(dl, C_AMB, 0);
+    lv_obj_center(dl);
+
+    buzzerScanOk();
+}
+
+// ═══════════════════════════════════════
+//  INVENTORY SCREEN — items from ITEM: cards and shop purchases
+// ═══════════════════════════════════════
+lv_obj_t *scrInventory = NULL;
+lv_obj_t *invList = NULL;
+
+static void ev_inv_back(lv_event_t *e) { lv_scr_load_anim(scrHome, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 180, 0, false); }
+void refreshInventoryList();
+
+static void ev_inv_drop(lv_event_t *e) {
+    int i = (int)(intptr_t)lv_event_get_user_data(e);
+    if (i < 0 || i >= inventoryCount) return;
+    inventoryRemove(inventory[i]);
+    playerDirty = true; playerLastSave = 0;
+    buzzerClick();
+    refreshInventoryList();
+}
+
+static void ev_inv_use(lv_event_t *e) {
+    int i = (int)(intptr_t)lv_event_get_user_data(e);
+    if (i < 0 || i >= inventoryCount) return;
+    if (strcasecmp(inventory[i], "INFORMANT_TIP") != 0 &&
+        strcasecmp(inventory[i], "clue") != 0) return;
+    // Ping the GM to release the next bounty clue
+    swts::gmTriggerEvent("informant_tip", "Informant tip cashed in", 1, callsign);
+    inventoryRemove(inventory[i]);
+    playerDirty = true; playerLastSave = 0;
+    buzzerScanOk();
+    showObjectiveToast("TIP CASHED IN", "COMMAND WILL TRANSMIT INTEL");
+    refreshInventoryList();
+}
+
+void refreshInventoryList() {
+    if (!invList) return;
+    lv_obj_clean(invList);
+    if (inventoryCount == 0) {
+        lv_obj_t *empty = lv_label_create(invList);
+        lv_label_set_text(empty, "NO ITEMS CARRIED\n\nScan ITEM cards or visit\na supply exchange terminal.");
+        lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_color(empty, C_DIM, 0);
+        lv_obj_set_style_text_font(empty, &lv_font_montserrat_14, 0);
+        lv_obj_set_width(empty, lv_pct(100));
+        return;
+    }
+    for (int i = 0; i < inventoryCount; i++) {
+        lv_obj_t *card = lv_obj_create(invList);
+        lv_obj_set_size(card, W - 20, 56);
+        lv_obj_add_style(card, &s_pnl, 0);
+        lv_obj_set_style_border_color(card, C_AMB_DIM, 0);
+        lv_obj_set_style_border_side(card, LV_BORDER_SIDE_LEFT, 0);
+        lv_obj_set_style_border_width(card, 3, 0);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *nm = lv_label_create(card);
+        lv_label_set_text(nm, inventory[i]);
+        lv_obj_set_style_text_font(nm, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(nm, C_AMB, 0);
+        lv_obj_align(nm, LV_ALIGN_LEFT_MID, 4, 0);
+
+        bool usable = (strcasecmp(inventory[i], "INFORMANT_TIP") == 0 ||
+                       strcasecmp(inventory[i], "clue") == 0);
+        if (usable) {
+            lv_obj_t *ub = lv_btn_create(card);
+            lv_obj_set_size(ub, 60, 32);
+            lv_obj_align(ub, LV_ALIGN_RIGHT_MID, -70, 0);
+            lv_obj_set_style_bg_color(ub, C_AMB_DIM, 0);
+            lv_obj_set_style_shadow_width(ub, 0, 0);
+            lv_obj_add_event_cb(ub, ev_inv_use, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+            lv_obj_t *ul = lv_label_create(ub);
+            lv_label_set_text(ul, "USE");
+            lv_obj_set_style_text_font(ul, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(ul, C_BG, 0);
+            lv_obj_center(ul);
+        }
+        lv_obj_t *db = lv_btn_create(card);
+        lv_obj_set_size(db, 60, 32);
+        lv_obj_align(db, LV_ALIGN_RIGHT_MID, -4, 0);
+        lv_obj_set_style_bg_color(db, C_PNL2, 0);
+        lv_obj_set_style_border_color(db, C_AMB_DIM, 0);
+        lv_obj_set_style_border_width(db, 1, 0);
+        lv_obj_set_style_shadow_width(db, 0, 0);
+        lv_obj_add_event_cb(db, ev_inv_drop, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+        lv_obj_t *dl = lv_label_create(db);
+        lv_label_set_text(dl, "DROP");
+        lv_obj_set_style_text_font(dl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(dl, C_AMB, 0);
+        lv_obj_center(dl);
+    }
+}
+
+void buildInventoryScreen() {
+    scrInventory = lv_obj_create(NULL);
+    lv_obj_add_style(scrInventory, &s_scr, 0);
+    lv_obj_clear_flag(scrInventory, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(scrInventory);
+    lv_label_set_text(title, "INVENTORY");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, C_AMB_BRT, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 14);
+
+    lv_obj_t *bb = lv_btn_create(scrInventory);
+    lv_obj_set_size(bb, 70, 34); lv_obj_set_pos(bb, 6, 6);
+    lv_obj_set_style_bg_color(bb, C_BG, 0);
+    lv_obj_set_style_border_color(bb, C_AMB_DIM, 0);
+    lv_obj_set_style_border_width(bb, 1, 0);
+    lv_obj_set_style_shadow_width(bb, 0, 0);
+    lv_obj_add_event_cb(bb, ev_inv_back, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *bl = lv_label_create(bb);
+    lv_label_set_text(bl, "< BACK");
+    lv_obj_set_style_text_font(bl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(bl, C_AMB, 0);
+    lv_obj_center(bl);
+
+    hline(scrInventory, 48, C_FRM, 1);
+
+    invList = lv_obj_create(scrInventory);
+    lv_obj_set_size(invList, W - 12, H - 66);
+    lv_obj_set_pos(invList, 6, 56);
+    lv_obj_set_style_bg_opa(invList, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(invList, 0, 0);
+    lv_obj_set_style_pad_all(invList, 0, 0);
+    lv_obj_set_flex_flow(invList, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(invList, 6, 0);
+}
+
+// ═══════════════════════════════════════
+//  RADAR — nearby operatives/props from mesh RSSI
+// ═══════════════════════════════════════
+lv_obj_t *scrRadar = NULL;
+lv_obj_t *radarList = NULL;
+
+// Faction cache for other datapads (heard from their MSG_STATUS broadcasts)
+struct PeerFaction { char id[16]; char faction[14]; };
+PeerFaction peerFactions[MESH_PEER_TABLE] = {};
+
+void peerFactionNote(const char *id, const char *fac) {
+    for (int i = 0; i < MESH_PEER_TABLE; i++) {
+        if (peerFactions[i].id[0] == 0 || strcmp(peerFactions[i].id, id) == 0) {
+            strlcpy(peerFactions[i].id, id, sizeof(peerFactions[i].id));
+            strlcpy(peerFactions[i].faction, fac, sizeof(peerFactions[i].faction));
+            return;
+        }
+    }
+}
+
+const char* peerFactionGet(const char *id) {
+    for (int i = 0; i < MESH_PEER_TABLE; i++)
+        if (strcmp(peerFactions[i].id, id) == 0) return peerFactions[i].faction;
+    return "";
+}
+
+static void ev_radar_back(lv_event_t *e) { lv_scr_load_anim(scrNearby, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 180, 0, false); }
+
+void refreshRadarList() {
+    if (!radarList) return;
+    lv_obj_clean(radarList);
+    int shown = 0;
+    for (int i = 0; i < MESH_PEER_TABLE; i++) {
+        swts::SenderSeq &p = swts::seqTable[i];
+        if (!p.id[0] || strcmp(p.id, callsign) == 0) continue;
+        if (millis() - p.lastHeard > 10000) continue;   // stale — expired
+        shown++;
+
+        const char *bucket = (p.rssi == 0) ? "?"
+                           : (p.rssi >= -55) ? "NEAR"
+                           : (p.rssi >= -68) ? "CLOSE" : "FAR";
+        bool isPlayer = (p.role == swts::ROLE_DATAPAD);
+        const char *fac = isPlayer ? peerFactionGet(p.id) : "";
+        lv_color_t col = !isPlayer ? C_AMB
+                       : (!fac[0]) ? C_DIM
+                       : (strcasecmp(fac, playerFaction) == 0) ? lv_color_hex(0x00CC44)
+                                                               : lv_color_hex(0xDD2200);
+
+        lv_obj_t *row = lv_obj_create(radarList);
+        lv_obj_set_size(row, W - 20, 40);
+        lv_obj_add_style(row, &s_pnl, 0);
+        lv_obj_set_style_border_color(row, col, 0);
+        lv_obj_set_style_border_side(row, LV_BORDER_SIDE_LEFT, 0);
+        lv_obj_set_style_border_width(row, 3, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *nm = lv_label_create(row);
+        lv_label_set_text(nm, p.id);
+        lv_obj_set_style_text_font(nm, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(nm, col, 0);
+        lv_obj_align(nm, LV_ALIGN_LEFT_MID, 4, 0);
+
+        lv_obj_t *bk = lv_label_create(row);
+        lv_label_set_text(bk, bucket);
+        lv_obj_set_style_text_font(bk, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(bk, C_AMB_BRT, 0);
+        lv_obj_align(bk, LV_ALIGN_RIGHT_MID, -6, 0);
+    }
+    if (shown == 0) {
+        lv_obj_t *empty = lv_label_create(radarList);
+        lv_label_set_text(empty, "NO CONTACTS");
+        lv_obj_set_style_text_color(empty, C_DIM, 0);
+        lv_obj_set_style_text_font(empty, &lv_font_montserrat_14, 0);
+    }
+}
+
+void buildRadarScreen() {
+    scrRadar = lv_obj_create(NULL);
+    lv_obj_add_style(scrRadar, &s_scr, 0);
+    lv_obj_clear_flag(scrRadar, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(scrRadar);
+    lv_label_set_text(title, "RADAR");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, C_AMB_BRT, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 14);
+
+    lv_obj_t *bb = lv_btn_create(scrRadar);
+    lv_obj_set_size(bb, 70, 34); lv_obj_set_pos(bb, 6, 6);
+    lv_obj_set_style_bg_color(bb, C_BG, 0);
+    lv_obj_set_style_border_color(bb, C_AMB_DIM, 0);
+    lv_obj_set_style_border_width(bb, 1, 0);
+    lv_obj_set_style_shadow_width(bb, 0, 0);
+    lv_obj_add_event_cb(bb, ev_radar_back, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *bl = lv_label_create(bb);
+    lv_label_set_text(bl, "< BACK");
+    lv_obj_set_style_text_font(bl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(bl, C_AMB, 0);
+    lv_obj_center(bl);
+
+    hline(scrRadar, 48, C_FRM, 1);
+
+    radarList = lv_obj_create(scrRadar);
+    lv_obj_set_size(radarList, W - 12, H - 66);
+    lv_obj_set_pos(radarList, 6, 56);
+    lv_obj_set_style_bg_opa(radarList, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(radarList, 0, 0);
+    lv_obj_set_style_pad_all(radarList, 0, 0);
+    lv_obj_set_flex_flow(radarList, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(radarList, 5, 0);
+}
+
+// ═══════════════════════════════════════
 //  NAME ENTRY — first-boot player identification
 //  Shown instead of the home screen while the callsign is still a
 //  placeholder (OPERATIVE / DATAPAD-xxxx). Rental flow: every player
@@ -2599,14 +3500,14 @@ static void applyPlayerName(const char *raw) {
 }
 
 void showFactionPick();   // forward decl
+void showCardWrite();     // forward decl
 
 static void ev_name_ready(lv_event_t *e) {
     const char *txt = lv_textarea_get_text(nameTa);
     if (!txt || !txt[0]) return;   // need a name before continuing
     applyPlayerName(txt);
     if (isUnassignedCallsign(callsign)) return;   // nothing usable typed
-    if (!playerFaction[0]) showFactionPick();     // declare allegiance next
-    else lv_scr_load_anim(scrHome, LV_SCR_LOAD_ANIM_FADE_ON, 250, 0, false);
+    showCardWrite();   // write the operative card, then declare allegiance
 }
 
 void buildNameEntryScreen() {
@@ -2652,6 +3553,113 @@ void buildNameEntryScreen() {
     lv_obj_set_style_bg_color(kb, C_BG, 0);
     // Checkmark on the keyboard confirms
     lv_obj_add_event_cb(kb, ev_name_ready, LV_EVENT_READY, NULL);
+}
+
+// ═══════════════════════════════════════
+//  OPERATIVE CARD — written at registration
+//  A blank NFC card gets an NDEF text record PLAYER:<callsign>. It opens
+//  tap-to-use sessions on terminals and triggers Duels when another
+//  player scans it. Skippable (20 s timeout or SKIP) — terminals then
+//  fall back to their RSSI gate only.
+// ═══════════════════════════════════════
+lv_obj_t *scrCardWrite = NULL;
+lv_obj_t *cardWriteStatus = NULL;
+bool cardWriteActive = false;
+unsigned long cardWriteSince = 0;
+
+extern bool nfcOk;   // defined with the NFC reader
+
+// Write "PLAYER:<callsign>" as an NDEF text record to an NTAG2xx card
+bool writePlayerCard() {
+    char text[24];
+    snprintf(text, sizeof(text), "PLAYER:%s", callsign);
+    int tlen = strlen(text);
+
+    uint8_t rec[40];
+    int r = 0;
+    rec[r++] = 0xD1;            // MB|ME|SR, TNF=well-known
+    rec[r++] = 0x01;            // type length
+    rec[r++] = (uint8_t)(tlen + 3);   // payload length (status + "en" + text)
+    rec[r++] = 0x54;            // 'T' — text record
+    rec[r++] = 0x02;            // status: UTF-8, 2-char language code
+    rec[r++] = 'e'; rec[r++] = 'n';
+    memcpy(rec + r, text, tlen); r += tlen;
+
+    uint8_t buf[52];
+    int b = 0;
+    buf[b++] = 0x03;            // NDEF TLV
+    buf[b++] = (uint8_t)r;
+    memcpy(buf + b, rec, r); b += r;
+    buf[b++] = 0xFE;            // terminator
+    while (b % 4) buf[b++] = 0x00;
+
+    extern Adafruit_PN532 nfc;
+    for (int page = 0; page < b / 4; page++)
+        if (!nfc.ntag2xx_WritePage(4 + page, buf + page * 4)) return false;
+    return true;
+}
+
+void cardWriteFinish() {
+    cardWriteActive = false;
+    if (!playerFaction[0]) showFactionPick();
+    else lv_scr_load_anim(scrHome, LV_SCR_LOAD_ANIM_FADE_ON, 250, 0, false);
+}
+
+static void ev_cardwrite_skip(lv_event_t *e) { cardWriteFinish(); }
+
+void showCardWrite() {
+    if (scrCardWrite) { lv_obj_del(scrCardWrite); scrCardWrite = NULL; }
+    scrCardWrite = lv_obj_create(NULL);
+    lv_obj_add_style(scrCardWrite, &s_scr, 0);
+    lv_obj_clear_flag(scrCardWrite, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *hd = lv_label_create(scrCardWrite);
+    lv_label_set_text(hd, "ALLIANCE REGISTRY");
+    lv_obj_set_style_text_font(hd, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(hd, C_AMB, 0);
+    lv_obj_set_style_text_letter_space(hd, 2, 0);
+    lv_obj_align(hd, LV_ALIGN_TOP_MID, 0, 22);
+
+    lv_obj_t *t = lv_label_create(scrCardWrite);
+    lv_label_set_text(t, "PRESENT YOUR\nOPERATIVE CARD");
+    lv_obj_set_style_text_font(t, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(t, C_AMB_BRT, 0);
+    lv_obj_set_style_text_align(t, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 60);
+
+    char sb[64];
+    snprintf(sb, sizeof(sb), "It will be encoded as\nPLAYER:%s", callsign);
+    lv_obj_t *sub = lv_label_create(scrCardWrite);
+    lv_label_set_text(sub, sb);
+    lv_obj_set_style_text_font(sub, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(sub, C_DIM, 0);
+    lv_obj_set_style_text_align(sub, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(sub, LV_ALIGN_TOP_MID, 0, 140);
+
+    cardWriteStatus = lv_label_create(scrCardWrite);
+    lv_label_set_text(cardWriteStatus, nfcOk ? "HOLD A BLANK CARD TO THE READER" : "NFC OFFLINE -- SKIPPING");
+    lv_obj_set_style_text_font(cardWriteStatus, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(cardWriteStatus, C_AMB, 0);
+    lv_obj_set_style_text_align(cardWriteStatus, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(cardWriteStatus, LV_ALIGN_CENTER, 0, 40);
+
+    lv_obj_t *skip = lv_btn_create(scrCardWrite);
+    lv_obj_set_size(skip, W - 120, 42);
+    lv_obj_align(skip, LV_ALIGN_BOTTOM_MID, 0, -30);
+    lv_obj_set_style_bg_color(skip, C_PNL, 0);
+    lv_obj_set_style_border_color(skip, C_AMB_DIM, 0);
+    lv_obj_set_style_border_width(skip, 1, 0);
+    lv_obj_set_style_shadow_width(skip, 0, 0);
+    lv_obj_add_event_cb(skip, ev_cardwrite_skip, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *sl = lv_label_create(skip);
+    lv_label_set_text(sl, "SKIP");
+    lv_obj_set_style_text_font(sl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(sl, C_AMB, 0);
+    lv_obj_center(sl);
+
+    cardWriteActive = true;
+    cardWriteSince = millis();
+    lv_scr_load_anim(scrCardWrite, LV_SCR_LOAD_ANIM_MOVE_LEFT, 180, 0, false);
 }
 
 // ═══════════════════════════════════════
@@ -2747,45 +3755,32 @@ void showFactionPick() {
 }
 
 static void ev_prop_slice(lv_event_t *e) {
-    // Request minigame start from prop
+    // Request minigame start from prop; handlePropCommon launches it (and
+    // renders 403 problems like too_far/alarm)
     String resp = postInteract("start_minigame");
     if (resp.length() == 0) return;
-
-    // Parse difficulty from response; kid mode plays one notch easier
     JsonDocument doc;
     deserializeJson(doc, resp);
-    int diff = doc["difficulty"] | 2;
-    if (kidMode && diff > 1) diff--;
-
-    launchSliceGame(diff);
+    if (handlePropCommon(doc)) return;
+    renderPropDialogue(doc);
 }
 
 static void ev_prop_simon(lv_event_t *e) {
-    // Request Simon Says (pattern lock) start from the panel.
-    // The panel supplies the round count in its JSON; default to 3.
     String resp = postInteract("start_simon");
     if (resp.length() == 0) return;
-
     JsonDocument doc;
     deserializeJson(doc, resp);
-    int rounds = doc["rounds"] | SIMON_DEFAULT_ROUNDS;
-    if (kidMode && rounds > 1) rounds--;   // one fewer round for kids
-
-    launchSimonGame(rounds);
+    if (handlePropCommon(doc)) return;
+    renderPropDialogue(doc);
 }
 
 static void ev_prop_purge(lv_event_t *e) {
-    // Request Core Purge (memory defrag) start from the prop.
-    // The prop supplies targets + time limit in its JSON.
     String resp = postInteract("start_purge");
     if (resp.length() == 0) return;
-
     JsonDocument doc;
     deserializeJson(doc, resp);
-    int targets = doc["targets"]    | PURGE_DEFAULT_TARGETS;
-    int timeS   = doc["time_limit"] | PURGE_DEFAULT_TIME_S;
-
-    launchPurgeGame(targets, timeS);
+    if (handlePropCommon(doc)) return;
+    renderPropDialogue(doc);
 }
 
 static void ev_prop_logs(lv_event_t *e) {
@@ -2851,6 +3846,8 @@ void showPropGreeting() {
 
     JsonDocument doc;
     deserializeJson(doc, resp);
+    bool handlePropCommon(JsonDocument &doc);   // fwd decl (defined below)
+    if (handlePropCommon(doc)) return;          // 403 problems, shops, ...
     renderPropDialogue(doc);
 }
 
@@ -2858,6 +3855,244 @@ void showPropGreeting() {
 // keep their action string here; buttons carry an index into this table.
 static char propChoiceActions[8][24];
 static int  propChoiceCount = 0;
+
+bool handlePropCommon(JsonDocument &doc);   // forward decl
+void renderShop(JsonDocument &doc);         // forward decl
+
+// ── Prop problem states (403 responses: proximity / alarm) ──
+static unsigned long resetHoldStart = 0;
+
+static void ev_prop_retry(lv_event_t *e) { showPropGreeting(); }
+
+static void ev_reset_pressed(lv_event_t *e) { resetHoldStart = millis(); }
+static void ev_reset_released(lv_event_t *e) {
+    unsigned long held = resetHoldStart ? millis() - resetHoldStart : 0;
+    resetHoldStart = 0;
+    if (held < 5000) {
+        showObjectiveToast("HOLD TO RESET", "KEEP HOLDING FOR 5 SECONDS");
+        return;
+    }
+    String resp = postInteract("reset_alarm");
+    if (resp.length() == 0) return;
+    JsonDocument doc;
+    deserializeJson(doc, resp);
+    if (handlePropCommon(doc)) return;
+    renderPropDialogue(doc);
+}
+
+// Wire a "hold 5 s" reset button (used by problem screens and greet choices)
+static void wireResetHold(lv_obj_t *btn) {
+    lv_obj_add_event_cb(btn, ev_reset_pressed, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(btn, ev_reset_released, LV_EVENT_RELEASED, NULL);
+}
+
+void renderPropProblem(const char *err, JsonDocument &doc) {
+    lv_obj_clean(propContent);
+    propChoiceCount = 0;
+
+    bool tooFar = (strcmp(err, "too_far") == 0);
+    lv_obj_t *hd = lv_label_create(propContent);
+    lv_label_set_text(hd, tooFar ? "SIGNAL TOO WEAK" : "!! ALARM ACTIVE !!");
+    lv_obj_set_style_text_font(hd, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(hd, C_AMB_BRT, 0);
+    lv_obj_set_pos(hd, 10, 8);
+
+    lv_obj_t *bd = lv_label_create(propContent);
+    if (tooFar) {
+        char b[80];
+        int r = doc["rssi"] | 0;
+        snprintf(b, sizeof(b), "MOVE CLOSER TO THE PROP\n(signal %d dBm)", r);
+        lv_label_set_text(bd, b);
+    } else {
+        lv_label_set_text(bd, "Security klaxon is sounding.\nThis system refuses your codes\nuntil the alarm is silenced.");
+    }
+    lv_obj_set_style_text_font(bd, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bd, C_AMB, 0);
+    lv_obj_set_width(bd, W - 60);
+    lv_obj_set_pos(bd, 10, 44);
+
+    // Action button: RETRY (proximity) or hold-to-reset (alarm)
+    lv_obj_t *btn = lv_btn_create(propContent);
+    lv_obj_set_size(btn, W - 30, 42);
+    lv_obj_set_pos(btn, 4, 120);
+    lv_obj_set_style_bg_color(btn, C_PNL, 0);
+    lv_obj_set_style_bg_color(btn, C_PNL2, LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(btn, C_AMB_DIM, 0);
+    lv_obj_set_style_border_width(btn, 1, 0);
+    lv_obj_set_style_shadow_width(btn, 0, 0);
+    lv_obj_t *bl = lv_label_create(btn);
+    lv_obj_set_style_text_font(bl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bl, C_AMB, 0);
+    lv_obj_center(bl);
+    if (tooFar) {
+        lv_label_set_text(bl, "RETRY");
+        lv_obj_add_event_cb(btn, ev_prop_retry, LV_EVENT_CLICKED, NULL);
+    } else {
+        lv_label_set_text(bl, "RESET ALARM (HOLD 5s)");
+        wireResetHold(btn);
+    }
+
+    lv_obj_t *back = lv_btn_create(propContent);
+    lv_obj_set_size(back, W - 30, 42);
+    lv_obj_set_pos(back, 4, 170);
+    lv_obj_set_style_bg_color(back, C_PNL, 0);
+    lv_obj_set_style_border_color(back, C_FRM, 0);
+    lv_obj_set_style_border_width(back, 1, 0);
+    lv_obj_set_style_shadow_width(back, 0, 0);
+    lv_obj_add_event_cb(back, ev_prop_back, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *bkl = lv_label_create(back);
+    lv_label_set_text(bkl, "[Disconnect]");
+    lv_obj_set_style_text_font(bkl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bkl, C_DIM, 0);
+    lv_obj_center(bkl);
+}
+
+// ── Shop (terminal supply exchange) ──
+static char shopIds[8][20];
+static char shopNames[8][28];
+static int  shopCosts[8];
+static int  shopN = 0;
+
+static void ev_shop_buy(lv_event_t *e) {
+    int i = (int)(intptr_t)lv_event_get_user_data(e);
+    if (i < 0 || i >= shopN) return;
+    if (score < shopCosts[i]) {
+        showObjectiveToast("INSUFFICIENT CREDITS", shopNames[i]);
+        buzzerFail();
+        return;
+    }
+    String resp = postInteractItem("buy", shopIds[i]);
+    if (resp.length() == 0) return;
+    JsonDocument doc;
+    deserializeJson(doc, resp);
+    bool ok = doc["ok"] | false;
+    if (!ok) {
+        showObjectiveToast("PURCHASE FAILED", doc["message"] | "DECLINED");
+        buzzerFail();
+        return;
+    }
+    int cost = doc["cost"] | shopCosts[i];
+    score -= cost;
+    if (score < 0) score = 0;
+    inventoryAdd(doc["item"] | shopIds[i]);
+    refreshScoreLabel();
+    playerDirty = true; playerLastSave = 0;
+    buzzerScanOk();
+    showObjectiveToast("PURCHASED", doc["name"] | shopIds[i]);
+    showPropGreeting();
+}
+
+void renderShop(JsonDocument &doc) {
+    lv_obj_clean(propContent);
+    shopN = 0;
+
+    lv_obj_t *hd = lv_label_create(propContent);
+    lv_label_set_text(hd, doc["title"] | "SUPPLY EXCHANGE");
+    lv_obj_set_style_text_font(hd, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(hd, C_AMB_BRT, 0);
+    lv_obj_set_pos(hd, 10, 4);
+
+    char cb[32];
+    snprintf(cb, sizeof(cb), "CREDITS: %d %s", score, scoreSuffix);
+    lv_obj_t *cr = lv_label_create(propContent);
+    lv_label_set_text(cr, cb);
+    lv_obj_set_style_text_font(cr, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(cr, C_DIM, 0);
+    lv_obj_set_pos(cr, 10, 30);
+
+    int y = 52;
+    for (JsonObject it : doc["items"].as<JsonArray>()) {
+        if (shopN >= 8) break;
+        strlcpy(shopIds[shopN], it["id"] | "", sizeof(shopIds[0]));
+        strlcpy(shopNames[shopN], it["name"] | "", sizeof(shopNames[0]));
+        shopCosts[shopN] = it["cost"] | 100;
+
+        lv_obj_t *btn = lv_btn_create(propContent);
+        lv_obj_set_size(btn, W - 30, 46);
+        lv_obj_set_pos(btn, 4, y);
+        lv_obj_set_style_bg_color(btn, C_PNL, 0);
+        lv_obj_set_style_bg_color(btn, C_PNL2, LV_STATE_PRESSED);
+        lv_obj_set_style_border_color(btn, C_AMB_DIM, 0);
+        lv_obj_set_style_border_width(btn, 1, 0);
+        lv_obj_set_style_shadow_width(btn, 0, 0);
+        lv_obj_add_event_cb(btn, ev_shop_buy, LV_EVENT_CLICKED, (void*)(intptr_t)shopN);
+        char lb[52];
+        snprintf(lb, sizeof(lb), "%s  --  %d %s", shopNames[shopN], shopCosts[shopN], scoreSuffix);
+        lv_obj_t *bl = lv_label_create(btn);
+        lv_label_set_text(bl, lb);
+        lv_obj_set_style_text_font(bl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(bl, C_AMB, 0);
+        lv_obj_center(bl);
+        y += 52;
+        shopN++;
+    }
+
+    lv_obj_t *back = lv_btn_create(propContent);
+    lv_obj_set_size(back, W - 30, 42);
+    lv_obj_set_pos(back, 4, y + 6);
+    lv_obj_set_style_bg_color(back, C_PNL, 0);
+    lv_obj_set_style_border_color(back, C_FRM, 0);
+    lv_obj_set_style_border_width(back, 1, 0);
+    lv_obj_set_style_shadow_width(back, 0, 0);
+    lv_obj_add_event_cb(back, ev_prop_retry, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *bkl = lv_label_create(back);
+    lv_label_set_text(bkl, "< BACK");
+    lv_obj_set_style_text_font(bkl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bkl, C_DIM, 0);
+    lv_obj_center(bkl);
+}
+
+// Shared processing of every prop response: errors, mission events, item
+// consumption, credit costs, shop screens and minigame launches. Returns
+// true when the response was fully handled (caller must not render it).
+bool handlePropCommon(JsonDocument &doc) {
+    const char *err = doc["error"].as<const char*>();
+    if (err && err[0]) { renderPropProblem(err, doc); return true; }
+
+    const char *gev = doc["game_event"].as<const char*>();
+    if (gev && gev[0]) queueGameEvent(gev);
+
+    const char *ci = doc["consumed_item"].as<const char*>();
+    if (ci && ci[0]) {
+        inventoryRemove(ci);
+        playerDirty = true; playerLastSave = 0;
+        showObjectiveToast("ITEM CONSUMED", ci);
+    }
+
+    int cost = doc["cost"] | 0;
+    if (cost > 0) {
+        score -= cost;
+        if (score < 0) score = 0;
+        refreshScoreLabel();
+        playerDirty = true; playerLastSave = 0;
+        char cb[24];
+        snprintf(cb, sizeof(cb), "-%d %s", cost, scoreSuffix);
+        showObjectiveToast("CREDITS SPENT", cb);
+    }
+
+    const char *rt = doc["type"] | "";
+    if (strcmp(rt, "shop") == 0) { renderShop(doc); return true; }
+    if (strcmp(rt, "minigame_start") == 0) {
+        const char *g = doc["game"] | "";
+        if (strcmp(g, "simon") == 0) {
+            int rounds = doc["rounds"] | SIMON_DEFAULT_ROUNDS;
+            if (kidMode && rounds > 1) rounds--;
+            launchSimonGame(rounds);
+        } else if (strcmp(g, "decrypt") == 0) {
+            launchDecryptGame(DM_PROP, doc["tries"] | 6, doc["glyphs"] | 6,
+                              doc["code_len"] | 4, -1);
+        } else if (strcmp(g, "purge") == 0) {
+            launchPurgeGame(doc["targets"] | PURGE_DEFAULT_TARGETS,
+                            doc["time_limit"] | PURGE_DEFAULT_TIME_S);
+        } else {
+            int diff = doc["difficulty"] | 2;
+            if (kidMode && diff > 1) diff--;
+            launchSliceGame(diff);
+        }
+        return true;
+    }
+    return false;
+}
 
 static void ev_prop_action(lv_event_t *e) {
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
@@ -2870,11 +4105,7 @@ static void ev_prop_action(lv_event_t *e) {
 
     JsonDocument doc;
     deserializeJson(doc, resp);
-
-    // Props may attach a game event to a dialogue response (mission hook)
-    const char *gev = doc["game_event"].as<const char*>();
-    if (gev && gev[0]) queueGameEvent(gev);
-
+    if (handlePropCommon(doc)) return;
     renderPropDialogue(doc);
 }
 
@@ -2954,6 +4185,9 @@ void renderPropDialogue(JsonDocument &doc) {
             lv_obj_add_event_cb(btn, ev_prop_purge, LV_EVENT_CLICKED, NULL);
         } else if (actStr == "read_logs") {
             lv_obj_add_event_cb(btn, ev_prop_logs, LV_EVENT_CLICKED, NULL);
+        } else if (actStr == "reset_alarm") {
+            // Alarm reset requires a deliberate 5-second hold
+            wireResetHold(btn);
         } else if (actStr.length() > 0 && actStr != "null" && propChoiceCount < 8) {
             // Generic dialogue action (deliver_intel, send_signal, ...) —
             // posts the action and renders whatever dialogue comes back
@@ -2974,11 +4208,17 @@ void renderPropDialogue(JsonDocument &doc) {
 // Report a finished minigame to the panel, award points on a win, and return
 // to the prop screen with a fresh greeting. Game-specific result fields
 // (score, rounds, ...) go into `req` before calling.
+bool minigameLostSignal = false;   // set when the RSSI grace window expires mid-game
+
 static void finishMinigameAndReturn(JsonDocument &req, bool won) {
     req["action"] = "minigame_result";
     req["won"] = won;
+    if (minigameLostSignal) { req["result"] = "lost_signal"; minigameLostSignal = false; }
     JsonObject p = req["player"].to<JsonObject>();
     p["callsign"] = callsign;
+    p["faction"] = playerFaction;
+    JsonArray inv = p["inventory"].to<JsonArray>();
+    for (int i = 0; i < inventoryCount; i++) inv.add(inventory[i]);
 
     HTTPClient http;
     http.setTimeout(5000);
@@ -2989,12 +4229,18 @@ static void finishMinigameAndReturn(JsonDocument &req, bool won) {
     String respBody = (code == 200) ? http.getString() : String();
     http.end();
 
-    // The prop may attach a game event to the result (e.g. panel_sliced:...)
+    // The prop may attach a game event and/or a consumed item to the result
     if (respBody.length()) {
         JsonDocument rdoc;
         if (!deserializeJson(rdoc, respBody)) {
             const char *gev = rdoc["game_event"].as<const char*>();
             if (gev && gev[0]) queueGameEvent(gev);
+            const char *ci = rdoc["consumed_item"].as<const char*>();
+            if (ci && ci[0]) {
+                inventoryRemove(ci);
+                playerDirty = true; playerLastSave = 0;
+                showObjectiveToast("ITEM CONSUMED", ci);
+            }
         }
     }
 
@@ -3013,6 +4259,22 @@ static void finishMinigameAndReturn(JsonDocument &req, bool won) {
     lv_obj_clean(propContent);
     showPropGreeting();
     lv_scr_load_anim(scrProp, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 180, 0, false);
+}
+
+// Mid-minigame proximity (datapad-side mirror of the prop's RSSI gate):
+// abort when the prop AP's signal stays below the drop threshold for the
+// grace window, or the link is gone entirely.
+bool minigameSignalLost() {
+    static unsigned long weakSince = 0;
+    if (WiFi.status() != WL_CONNECTED) { weakSince = 0; return true; }
+    int r = WiFi.RSSI();
+    if (r != 0 && r < -78) {
+        if (!weakSince) { weakSince = millis(); return false; }
+        if (millis() - weakSince > 2500) { weakSince = 0; return true; }
+        return false;
+    }
+    weakSince = 0;
+    return false;
 }
 
 // Labels we update dynamically on connect
@@ -3959,6 +5221,9 @@ struct CommMsg {
     bool loaded;         // in the pool (loaded from SD)
     bool delivered;      // shown to player (in inbox)
     bool read;           // player has opened it
+    bool encrypted;      // body shows scrambled until decrypted
+    bool decrypted;      // player has beaten the Decrypt minigame on it
+    unsigned long lastDecryptTry;   // retry lockout timestamp
 };
 
 #define MAX_COMMS 16
@@ -4062,6 +5327,23 @@ int  playerReadCommCount = 0;
 char playerWonBounties[MAX_WON_BOUNTIES][24];
 int  playerWonBountyCount = 0;
 
+#define MAX_DECRYPTED_COMMS 16
+char playerDecryptedComms[MAX_DECRYPTED_COMMS][20];
+int  playerDecryptedCommCount = 0;
+
+bool playerHasDecryptedComm(const char *id) {
+    for (int i = 0; i < playerDecryptedCommCount; i++)
+        if (strcmp(playerDecryptedComms[i], id) == 0) return true;
+    return false;
+}
+void playerMarkCommDecrypted(const char *id) {
+    if (playerHasDecryptedComm(id)) return;
+    if (playerDecryptedCommCount >= MAX_DECRYPTED_COMMS) return;
+    strlcpy(playerDecryptedComms[playerDecryptedCommCount++], id, 20);
+    playerDirty = true;
+    playerLastSave = 0;
+}
+
 bool playerHasReadComm(const char *id) {
     for (int i = 0; i < playerReadCommCount; i++)
         if (strcmp(playerReadComms[i], id) == 0) return true;
@@ -4127,6 +5409,12 @@ bool savePlayerState() {
 
     JsonArray cr = doc["comms_read"].to<JsonArray>();
     for (int i = 0; i < playerReadCommCount; i++) cr.add(playerReadComms[i]);
+
+    JsonArray cd = doc["comms_decrypted"].to<JsonArray>();
+    for (int i = 0; i < playerDecryptedCommCount; i++) cd.add(playerDecryptedComms[i]);
+
+    JsonArray iv = doc["inventory"].to<JsonArray>();
+    for (int i = 0; i < inventoryCount; i++) iv.add(inventory[i]);
 
     JsonArray bw = doc["bounties_won"].to<JsonArray>();
     for (int i = 0; i < playerWonBountyCount; i++) bw.add(playerWonBounties[i]);
@@ -4207,6 +5495,15 @@ bool loadPlayerState() {
     }
 
     playerReadCommCount = 0;
+    playerDecryptedCommCount = 0;
+    for (const char *id : doc["comms_decrypted"].as<JsonArray>()) {
+        if (playerDecryptedCommCount >= MAX_DECRYPTED_COMMS) break;
+        strlcpy(playerDecryptedComms[playerDecryptedCommCount++], id ? id : "", 20);
+    }
+    inventoryCount = 0;
+    for (const char *id : doc["inventory"].as<JsonArray>()) {
+        if (id && id[0]) inventoryAdd(id);
+    }
     for (const char *id : doc["comms_read"].as<JsonArray>()) {
         if (playerReadCommCount >= MAX_READ_COMMS) break;
         strlcpy(playerReadComms[playerReadCommCount++], id ? id : "", 20);
@@ -4252,6 +5549,9 @@ void loadCommsFromSD() {
         c.loaded = true;
         c.delivered = false;
         c.read = false;
+        c.encrypted = m["encrypted"] | false;
+        c.decrypted = c.encrypted ? playerHasDecryptedComm(c.id) : true;
+        c.lastDecryptTry = 0;
         commPoolCount++;
     }
 
@@ -4521,6 +5821,50 @@ void onMeshMsg(const swts::MeshHeader *hdr, const uint8_t *payload, int len) {
             swts::sendStatus(up, score, activeMissions, completedMissionCount(), totalScans, slicesWonCount, playerFaction, kidMode, xp);
             break;
         }
+        case swts::MSG_STATUS: {
+            // Other datapads' broadcasts — cache their faction for the radar
+            if (hdr->role != swts::ROLE_DATAPAD) return;
+            if (len < (int)sizeof(swts::MeshStatus)) return;
+            const swts::MeshStatus *s = (const swts::MeshStatus *)payload;
+            peerFactionNote(hdr->from_id, s->faction);
+            break;
+        }
+        case swts::MSG_TIMER: {
+            if (len < (int)sizeof(swts::MeshTimer)) return;
+            const swts::MeshTimer *t = (const swts::MeshTimer *)payload;
+            // Faction-scoped timers only show for that faction
+            if (t->faction[0] && strcasecmp(t->faction, playerFaction) != 0) return;
+            if (!t->active) { timerEndsAtMs = 0; timerLabel[0] = 0; break; }
+            strlcpy(timerLabel, t->label, sizeof(timerLabel));
+            timerEndsAtMs = millis() + t->remaining_s * 1000UL;
+            break;
+        }
+        case swts::MSG_DUEL_REQUEST: {
+            if (len < (int)sizeof(swts::MeshDuelRequest)) return;
+            const swts::MeshDuelRequest *d = (const swts::MeshDuelRequest *)payload;
+            if (strcmp(d->target, swts::myId) != 0) return;
+            if (duelPhase != DUEL_IDLE || duelReqFlag) return;   // busy
+            memcpy(&duelReqPending, d, sizeof(duelReqPending));
+            duelReqFlag = true;   // loop() shows the accept/decline prompt
+            break;
+        }
+        case swts::MSG_DUEL_ACCEPT: {
+            if (len < (int)sizeof(swts::MeshDuelAccept)) return;
+            const swts::MeshDuelAccept *d = (const swts::MeshDuelAccept *)payload;
+            if (duelPhase != DUEL_WAIT_ACCEPT || strcmp(d->duel_id, duelId) != 0) return;
+            if (d->accept) duelAcceptFlag = true;
+            else           duelDeclineFlag = true;
+            break;
+        }
+        case swts::MSG_DUEL_RESULT: {
+            if (len < (int)sizeof(swts::MeshDuelResult)) return;
+            const swts::MeshDuelResult *d = (const swts::MeshDuelResult *)payload;
+            if (strcmp(d->duel_id, duelId) != 0) return;
+            if (strcmp(d->callsign, duelOpponent) != 0) return;   // only theirs
+            memcpy(&duelResPending, d, sizeof(duelResPending));
+            duelResFlag = true;
+            break;
+        }
         case swts::MSG_FACTIONS: {
             // GM broadcasts the scenario's faction roster
             if (len < (int)sizeof(swts::MeshFactions)) return;
@@ -4598,9 +5942,24 @@ static void ev_comm_back(lv_event_t *e) {
     }
 }
 
-static void ev_comm_tap(lv_event_t *e) {
-    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+lv_obj_t *commDecryptBtn = NULL;
+int commDetailIdx = -1;
+
+// Glyph-substitute the body of an undecrypted transmission
+static void scrambleBody(const char *src, char *dst, size_t dstSz) {
+    static const char G[] = "#%&@?$=+*<>/";
+    size_t n = 0;
+    for (const char *p = src; *p && n < dstSz - 1; p++, n++) {
+        char c = *p;
+        if (c == ' ' || c == '\n' || c == '.' || c == ',' || c == '-') dst[n] = c;
+        else dst[n] = G[((uint8_t)c * 7 + n * 3) % (sizeof(G) - 1)];
+    }
+    dst[n] = 0;
+}
+
+void showCommDetail(int idx) {
     if (idx < 0 || idx >= commInboxCount) return;
+    commDetailIdx = idx;
     CommMsg &m = *commInbox[idx];
     m.read = true;
     playerMarkCommRead(m.id);   // persist read state to player.json
@@ -4610,14 +5969,40 @@ static void ev_comm_tap(lv_event_t *e) {
     for (int i = 0; i < commInboxCount; i++)
         if (!commInbox[i]->read) unreadComms++;
 
-    // Show detail
     lv_label_set_text(commDetailFrom, m.from);
     lv_label_set_text(commDetailSubj, m.subject);
-    lv_label_set_text(commDetailBody, m.body);
+
+    if (m.encrypted && !m.decrypted) {
+        static char scr[280];
+        scrambleBody(m.body, scr, sizeof(scr));
+        lv_label_set_text(commDetailBody, scr);
+        if (commDecryptBtn) lv_obj_clear_flag(commDecryptBtn, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_label_set_text(commDetailBody, m.body);
+        if (commDecryptBtn) lv_obj_add_flag(commDecryptBtn, LV_OBJ_FLAG_HIDDEN);
+    }
 
     lv_obj_add_flag(commList, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(commDetail, LV_OBJ_FLAG_HIDDEN);
     commShowingDetail = true;
+}
+
+static void ev_comm_tap(lv_event_t *e) {
+    showCommDetail((int)(intptr_t)lv_event_get_user_data(e));
+}
+
+static void ev_comm_decrypt(lv_event_t *e) {
+    if (commDetailIdx < 0 || commDetailIdx >= commInboxCount) return;
+    CommMsg &m = *commInbox[commDetailIdx];
+    if (!m.encrypted || m.decrypted) return;
+    if (m.lastDecryptTry && millis() - m.lastDecryptTry < 30000) {
+        char b[40];
+        snprintf(b, sizeof(b), "CIPHER RESEEDING -- %lus",
+                 30 - (millis() - m.lastDecryptTry) / 1000);
+        showObjectiveToast("LOCKED OUT", b);
+        return;
+    }
+    launchDecryptGame(DM_COMM, 6, 6, 4, commDetailIdx);
 }
 
 static lv_obj_t *makeBadge(lv_obj_t *parent, int count) {
@@ -4771,6 +6156,22 @@ void buildCommsScreen() {
     lv_obj_set_width(commDetailBody, W - 30);
     lv_obj_set_pos(commDetailBody, 0, 60);
 
+    // DECRYPT button — shown only on encrypted, not-yet-broken transmissions
+    commDecryptBtn = lv_btn_create(commDetail);
+    lv_obj_set_size(commDecryptBtn, W - 60, 44);
+    lv_obj_align(commDecryptBtn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(commDecryptBtn, C_AMB_DIM, 0);
+    lv_obj_set_style_bg_color(commDecryptBtn, C_AMB, LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(commDecryptBtn, 0, 0);
+    lv_obj_set_style_shadow_width(commDecryptBtn, 0, 0);
+    lv_obj_add_flag(commDecryptBtn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(commDecryptBtn, ev_comm_decrypt, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *dcl = lv_label_create(commDecryptBtn);
+    lv_label_set_text(dcl, "DECRYPT TRANSMISSION");
+    lv_obj_set_style_text_font(dcl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(dcl, C_BG, 0);
+    lv_obj_center(dcl);
+
     // Header + back button on top of everything
     lv_obj_t *hdr = lv_obj_create(scrComms);
     lv_obj_set_size(hdr, W, 46);
@@ -4868,7 +6269,14 @@ void setup() {
                 const char *planet = doc["scenario"]["planet"] | "Unknown";
                 strlcpy(scoreSuffix, cur, sizeof(scoreSuffix));
                 strlcpy(planetName, planet, sizeof(planetName));
-                S.printf("[CFG] Planet: %s | Currency: %s\n", planetName, scoreSuffix);
+                radarEnabled  = doc["radar_enabled"]  | radarEnabled;
+                radarKidMode  = doc["radar_kid_mode"] | radarKidMode;
+                duelEnabled   = doc["duel"]["enabled"]    | duelEnabled;
+                duelTargets   = doc["duel"]["targets"]    | duelTargets;
+                duelStake     = doc["duel"]["stake"]      | duelStake;
+                duelCooldownS = doc["duel"]["cooldown_s"] | duelCooldownS;
+                S.printf("[CFG] Planet: %s | Currency: %s | radar=%d duel=%d\n",
+                         planetName, scoreSuffix, radarEnabled, duelEnabled);
             }
             cfg.close();
         }
@@ -4932,6 +6340,10 @@ void setup() {
     buildSliceScreen();
     buildSimonScreen();
     buildPurgeScreen();
+    buildDecryptScreen();
+    buildDuelScreen();
+    buildInventoryScreen();
+    buildRadarScreen();
     buildNameEntryScreen();
     // Registration flow: fresh player cards ask for a name, then a faction.
     // Fully-registered players go straight to the home screen.
@@ -4948,6 +6360,7 @@ void setup() {
     // WiFi must be in STA mode for ESPNOW (it already is after our scan)
     WiFi.mode(WIFI_STA);
     swts::meshInit(callsign, swts::ROLE_DATAPAD, onMeshMsg);
+    if (radarEnabled) swts::meshEnableRssi();   // per-peer RSSI for the radar
 }
 
 // ═══════════════════════════════════════
@@ -5050,6 +6463,96 @@ void loop() {
         if (scrFactionPick && lv_scr_act() == scrFactionPick) showFactionPick();
     }
 
+    // ── Operative card write (registration) ──
+    if (cardWriteActive) {
+        if (!nfcOk || millis() - cardWriteSince > 20000) {
+            cardWriteFinish();
+        } else {
+            static unsigned long lastCardTry = 0;
+            if (millis() - lastCardTry > 400) {
+                lastCardTry = millis();
+                uint8_t cuid[7]; uint8_t culen;
+                if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, cuid, &culen, 60)) {
+                    if (writePlayerCard()) {
+                        buzzerScanOk();
+                        showObjectiveToast("CARD ENCODED", callsign);
+                        cardWriteFinish();
+                    } else {
+                        buzzerScanFail();
+                        lv_label_set_text(cardWriteStatus, "WRITE FAILED -- TRY AGAIN OR SKIP");
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Duel flow ──
+    if (duelReqFlag) {
+        duelReqFlag = false;
+        if (kidMode || !duelEnabled || duelPhase != DUEL_IDLE) {
+            swts::sendDuelAccept(duelReqPending.duel_id, callsign, false);
+        } else if (strcmp(lastDuelPeer, duelReqPending.challenger) == 0 &&
+                   millis() - lastDuelAt < (unsigned long)duelCooldownS * 1000UL) {
+            swts::sendDuelAccept(duelReqPending.duel_id, callsign, false);
+        } else {
+            duelShowPrompt();
+        }
+    }
+    if (duelPhase == DUEL_WAIT_ACCEPT) {
+        if (duelAcceptFlag) {
+            duelAcceptFlag = false;
+            duelStartPlay();
+        } else if (duelDeclineFlag || millis() - duelPhaseTime > 20000) {
+            duelDeclineFlag = false;
+            duelPhase = DUEL_IDLE;
+            showObjectiveToast("DUEL", "CHALLENGE DECLINED");
+        }
+    }
+    if (duelPhase == DUEL_PLAY) {
+        BtnColor pb;
+        if (buttonAnyConsume(&pb)) {
+            if ((int)pb == duelBtn) {
+                buzzerClick();
+                duelStep++;
+                if (duelStep >= duelTargetsCur) duelFinishLocal();
+                else duelShowTarget();
+            } else {
+                duelPenalty += 300;
+                buzzerTone(200, 80);
+            }
+        }
+    }
+    if (duelPhase == DUEL_WAIT_RESULT) {
+        if (duelResFlag) {
+            duelResFlag = false;
+            duelOppTime = duelResPending.time_ms;
+            duelResolve();
+        } else if (millis() - duelPhaseTime > 30000) {
+            duelOppTime = 0xFFFFFFFE;   // opponent never reported — forfeit
+            duelResolve();
+        }
+    }
+    if (duelPhase == DUEL_DONE && millis() - duelPhaseTime > 4000) {
+        duelPhase = DUEL_IDLE;
+        lv_scr_load_anim(scrHome, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 180, 0, false);
+    }
+
+    // ── Countdown HUD (home header) ──
+    static unsigned long lastTimerHud = 0;
+    if (homeTimerLbl && millis() - lastTimerHud > 500) {
+        lastTimerHud = millis();
+        if (timerEndsAtMs) {
+            long rem = (long)(timerEndsAtMs - millis());
+            if (rem < 0) rem = 0;
+            char tb[40];
+            snprintf(tb, sizeof(tb), "%s %02ld:%02ld", timerLabel, rem / 60000, (rem / 1000) % 60);
+            lv_label_set_text(homeTimerLbl, tb);
+            if (rem == 0) { timerEndsAtMs = 0; timerLabel[0] = 0; }
+        } else if (lv_label_get_text(homeTimerLbl)[0]) {
+            lv_label_set_text(homeTimerLbl, "");
+        }
+    }
+
     // Endgame debrief — small delay so the final objective feedback is seen first
     static unsigned long debriefAt = 0;
     if (debriefPending) { debriefPending = false; debriefAt = millis() + 2500; }
@@ -5060,6 +6563,15 @@ void loop() {
 
     // Slice minigame: update cursor each frame, report result 2s after it ends
     if (act == scrSlice) {
+        if (sliceActive && minigameSignalLost()) {
+            minigameLostSignal = true;
+            sliceActive = false;
+            sliceWon = false;
+            sliceEndTime = millis();
+            lv_label_set_text(sliceStatus, "LINK LOST");
+            lv_label_set_text(sliceHintLbl, "SIGNAL DROPPED -- MOVE CLOSER");
+            buzzerFail();
+        }
         updateSliceGame();
 
         if (!sliceActive && sliceEndTime && millis() - sliceEndTime > 2000) {
@@ -5073,6 +6585,11 @@ void loop() {
     // Simon Says minigame: advance state machine each frame, report result
     // 2.5s after it ends
     if (act == scrSimon) {
+        if (simonActive && minigameSignalLost()) {
+            minigameLostSignal = true;
+            simonFail();
+            lv_label_set_text(simonHintLbl, "SIGNAL DROPPED -- MOVE CLOSER");
+        }
         updateSimonGame();
 
         if (!simonActive && simonEndTime && millis() - simonEndTime > 2500) {
@@ -5089,6 +6606,10 @@ void loop() {
 
     // Core Purge minigame: advance each frame, report result 2.5s after it ends
     if (act == scrPurge) {
+        if (purgeActive && minigameSignalLost()) {
+            minigameLostSignal = true;
+            purgeFail("LINK LOST -- SIGNAL DROPPED");
+        }
         updatePurgeGame();
 
         if (!purgeActive && purgeEndTime && millis() - purgeEndTime > 2500) {
@@ -5098,6 +6619,47 @@ void loop() {
             req["purged"] = purgePurged;
             req["strikes"] = purgeStrikes;
             finishMinigameAndReturn(req, purgeWon);
+        }
+    }
+
+    // Decrypt minigame end: report to the prop, or unlock the comm locally
+    if (act == scrDecrypt) {
+        if (dcyActive && dcyMode == DM_PROP && minigameSignalLost()) {
+            minigameLostSignal = true;
+            dcyEnd(false);
+            lv_label_set_text(dcyStatus, "LINK LOST -- SIGNAL DROPPED");
+        }
+        if (!dcyActive && dcyEndTime && millis() - dcyEndTime > 2500) {
+            dcyEndTime = 0;
+            if (dcyMode == DM_PROP) {
+                JsonDocument req;
+                req["game"] = "decrypt";
+                finishMinigameAndReturn(req, dcyWon);
+            } else {
+                if (dcyCommIdx >= 0 && dcyCommIdx < commInboxCount) {
+                    CommMsg &m = *commInbox[dcyCommIdx];
+                    if (dcyWon) {
+                        m.decrypted = true;
+                        playerMarkCommDecrypted(m.id);
+                        char eb[40];
+                        snprintf(eb, sizeof(eb), "comm_decrypted:%s", m.id);
+                        queueGameEvent(eb);
+                    } else {
+                        m.lastDecryptTry = millis();
+                    }
+                }
+                lv_scr_load_anim(scrComms, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 180, 0, false);
+                showCommDetail(dcyCommIdx);
+            }
+        }
+    }
+
+    // Radar: refresh contacts once a second while open
+    if (act == scrRadar) {
+        static unsigned long lastRadarTick = 0;
+        if (millis() - lastRadarTick > 1000) {
+            lastRadarTick = millis();
+            refreshRadarList();
         }
     }
 

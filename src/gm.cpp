@@ -168,6 +168,10 @@ struct TrackedDevice {
     bool kid;           // difficulty mode (GM-toggled, confirmed via MSG_STATUS)
     int  xp;            // experience points (from MSG_STATUS)
     int  missionsDone;  // completed missions (from MSG_STATUS)
+    // Prop extensions
+    int  mood;          // droid mood -5..+5
+    bool alarm;         // prop alarm state
+    char sessionCs[16]; // terminal: open session's callsign
 };
 
 #define MAX_DEVICES 32
@@ -296,6 +300,23 @@ EventTemplate  eventTemplates[MAX_TEMPLATES];   int eventCount = 0;
 CommTemplate   commTemplates[MAX_TEMPLATES];    int commCount = 0;
 BountyTemplate bountyTemplates[MAX_TEMPLATES];  int bountyCount = 0;
 
+// ── Countdown timers ("dead man's switch") ──
+#define MAX_TIMERS 6
+struct GmTimer {
+    char id[16];
+    char label[24];
+    int  seconds;
+    char on_expire[32];   // event id fired automatically at zero
+    char faction[14];     // scope ("" = everyone)
+};
+GmTimer gmTimers[MAX_TIMERS];
+int gmTimerCount = 0;
+
+int  activeTimerIdx = -1;
+unsigned long timerEndsAt = 0;      // millis() at zero
+unsigned long timerLastBcast = 0;
+lv_obj_t *timerBtnLbl[MAX_TIMERS] = {};
+
 bool loadGmConfig() {
     File f = SD_MMC.open("/SWTS/gm_config.json", FILE_READ);
     if (!f) {
@@ -359,8 +380,84 @@ bool loadGmConfig() {
             strlcpy(t.clues[t.clueCount++], cl ? cl : "", 160);
         }
     }
-    S.printf("[GM] Config: %d events, %d comms, %d bounties\n", eventCount, commCount, bountyCount);
+    gmTimerCount = 0;
+    for (JsonObject t : doc["timers"].as<JsonArray>()) {
+        if (gmTimerCount >= MAX_TIMERS) break;
+        GmTimer &gt = gmTimers[gmTimerCount++];
+        memset(&gt, 0, sizeof(gt));
+        strlcpy(gt.id, t["id"] | "", sizeof(gt.id));
+        strlcpy(gt.label, t["label"] | "", sizeof(gt.label));
+        gt.seconds = t["seconds"] | 300;
+        strlcpy(gt.on_expire, t["on_expire"] | "", sizeof(gt.on_expire));
+        strlcpy(gt.faction, t["faction"] | "", sizeof(gt.faction));
+    }
+
+    S.printf("[GM] Config: %d events, %d comms, %d bounties, %d timers\n",
+             eventCount, commCount, bountyCount, gmTimerCount);
     return true;
+}
+
+// ── Countdown runtime ──
+void refreshTimerButtons() {
+    for (int i = 0; i < gmTimerCount; i++) {
+        if (!timerBtnLbl[i]) continue;
+        char b[48];
+        if (i == activeTimerIdx && timerEndsAt) {
+            long rem = (long)(timerEndsAt - millis());
+            if (rem < 0) rem = 0;
+            snprintf(b, sizeof(b), "%s  %02ld:%02ld  [CANCEL]",
+                     gmTimers[i].label, rem / 60000, (rem / 1000) % 60);
+        } else {
+            snprintf(b, sizeof(b), "%s  (%d:%02d)",
+                     gmTimers[i].label, gmTimers[i].seconds / 60, gmTimers[i].seconds % 60);
+        }
+        lv_label_set_text(timerBtnLbl[i], b);
+    }
+}
+
+static void ev_timer_btn(lv_event_t *e) {
+    int i = (int)(intptr_t)lv_event_get_user_data(e);
+    if (i < 0 || i >= gmTimerCount) return;
+    char log[80];
+    if (activeTimerIdx == i) {
+        // Cancel
+        swts::gmSendTimer(gmTimers[i].id, gmTimers[i].label, gmTimers[i].seconds, 0,
+                          gmTimers[i].faction, false);
+        snprintf(log, sizeof(log), "TIMER CANCELLED: %s", gmTimers[i].label);
+        logActivity(log, 5);
+        activeTimerIdx = -1;
+        timerEndsAt = 0;
+    } else if (activeTimerIdx < 0) {
+        activeTimerIdx = i;
+        timerEndsAt = millis() + (unsigned long)gmTimers[i].seconds * 1000UL;
+        timerLastBcast = 0;   // broadcast immediately
+        snprintf(log, sizeof(log), "TIMER STARTED: %s (%ds)", gmTimers[i].label, gmTimers[i].seconds);
+        logActivity(log, 0);
+    }
+    refreshTimerButtons();
+}
+
+// Called from loop(): rebroadcast every 5 s, fire on_expire at zero
+void tickCountdown() {
+    if (activeTimerIdx < 0) return;
+    GmTimer &t = gmTimers[activeTimerIdx];
+    long rem = (long)(timerEndsAt - millis());
+    if (rem <= 0) {
+        char log[80];
+        snprintf(log, sizeof(log), "TIMER EXPIRED: %s -> %s", t.label, t.on_expire);
+        logActivity(log, 4);
+        swts::gmSendTimer(t.id, t.label, t.seconds, 0, t.faction, false);
+        if (t.on_expire[0])
+            swts::gmTriggerEvent(t.on_expire, t.label, 1, "timer", t.faction);
+        activeTimerIdx = -1;
+        timerEndsAt = 0;
+        refreshTimerButtons();
+        return;
+    }
+    if (millis() - timerLastBcast > 5000) {
+        timerLastBcast = millis();
+        swts::gmSendTimer(t.id, t.label, t.seconds, (uint32_t)(rem / 1000), t.faction, true);
+    }
 }
 
 // ═══════════════════════════════════════════════
@@ -498,6 +595,14 @@ void onMeshMsg(const swts::MeshHeader *hdr, const uint8_t *payload, int len) {
         d->xp = s->xp;
         strlcpy(d->faction, s->faction, sizeof(d->faction));
         d->kid = (s->kid != 0);
+        d->mood = s->mood;
+        bool wasAlarm = d->alarm;
+        d->alarm = (s->alarm != 0);
+        strlcpy(d->sessionCs, s->session, sizeof(d->sessionCs));
+        if (d->alarm && !wasAlarm) {
+            snprintf(log, sizeof(log), "ALARM on %s", hdr->from_id);
+            logActivity(log, 4);
+        }
         gmDirty = true;
     }
     else if (hdr->type == swts::MSG_SCORE && len >= (int)sizeof(swts::MeshScore)) {
@@ -524,6 +629,15 @@ void onMeshMsg(const swts::MeshHeader *hdr, const uint8_t *payload, int len) {
         snprintf(log, sizeof(log), "%s minigame @ %s", r->won ? "WON" : "LOST", r->panel_id);
         plogAdd(hdr->from_id, log);
         if (r->won) { d->slicesWon++; gmDirty = true; }
+    }
+    else if (hdr->type == swts::MSG_DUEL_RESULT && len >= (int)sizeof(swts::MeshDuelResult)) {
+        const swts::MeshDuelResult *r = (const swts::MeshDuelResult *)payload;
+        snprintf(log, sizeof(log), "DUEL: %s finished in %lu.%03lus",
+                 r->callsign, (unsigned long)r->time_ms / 1000, (unsigned long)r->time_ms % 1000);
+        logActivity(log, 3);
+        snprintf(log, sizeof(log), "Duel time %lu.%03lus",
+                 (unsigned long)r->time_ms / 1000, (unsigned long)r->time_ms % 1000);
+        plogAdd(r->callsign, log);
     }
     else if (hdr->type == swts::MSG_EVENT && len >= (int)sizeof(swts::MeshEvent)) {
         // Prop-originated game events (panel_sliced, droid_handoff, extraction,
@@ -1210,13 +1324,47 @@ void buildEventsTab(lv_obj_t *tab) {
     lv_obj_set_style_text_font(title, &lv_font_montserrat_28, 0);
 
     lv_obj_t *cont = lv_obj_create(tab);
-    lv_obj_set_size(cont, lv_pct(100), 320);
+    lv_obj_set_size(cont, lv_pct(100), 250);
     lv_obj_set_pos(cont, 0, 44);
     lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_style_bg_opa(cont, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(cont, 0, 0);
     lv_obj_set_style_pad_all(cont, 0, 0);
     lv_obj_set_style_pad_gap(cont, 12, 0);
+
+    // ── Countdown timers row ──
+    if (gmTimerCount > 0) {
+        lv_obj_t *tl = lv_label_create(tab);
+        lv_label_set_text(tl, "COUNTDOWNS  (tap to start / cancel)");
+        lv_obj_set_style_text_color(tl, C_CYN, 0);
+        lv_obj_set_style_text_font(tl, &lv_font_montserrat_14, 0);
+        lv_obj_set_pos(tl, 0, 300);
+
+        lv_obj_t *trow = lv_obj_create(tab);
+        lv_obj_set_size(trow, lv_pct(100), 54);
+        lv_obj_set_pos(trow, 0, 320);
+        lv_obj_set_flex_flow(trow, LV_FLEX_FLOW_ROW);
+        lv_obj_set_style_bg_opa(trow, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(trow, 0, 0);
+        lv_obj_set_style_pad_all(trow, 0, 0);
+        lv_obj_set_style_pad_gap(trow, 10, 0);
+
+        for (int i = 0; i < gmTimerCount; i++) {
+            lv_obj_t *btn = lv_btn_create(trow);
+            lv_obj_set_size(btn, 360, 46);
+            lv_obj_set_style_bg_color(btn, C_PNL, 0);
+            lv_obj_set_style_bg_color(btn, C_PNL2, LV_STATE_PRESSED);
+            lv_obj_set_style_border_color(btn, C_CYN, 0);
+            lv_obj_set_style_border_width(btn, 2, 0);
+            lv_obj_set_style_radius(btn, 4, 0);
+            lv_obj_add_event_cb(btn, ev_timer_btn, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+            timerBtnLbl[i] = lv_label_create(btn);
+            lv_obj_set_style_text_color(timerBtnLbl[i], C_WHITE, 0);
+            lv_obj_set_style_text_font(timerBtnLbl[i], &lv_font_montserrat_16, 0);
+            lv_obj_center(timerBtnLbl[i]);
+        }
+        refreshTimerButtons();
+    }
 
     for (int i = 0; i < eventCount; i++) {
         EventTemplate *t = &eventTemplates[i];
@@ -2384,33 +2532,61 @@ void refreshLiveLists() {
     for (int i = 0; i < panelN; i++) {
         TrackedDevice &d = trackedDevs[pidx[i]];
         lv_obj_t *card = lv_obj_create(panelList);
-        lv_obj_set_size(card, 220, 100);
+        lv_obj_set_size(card, 240, 120);
         lv_obj_set_style_bg_color(card, C_PNL, 0);
         bool stale = (millis() - d.lastHeard > 30000);
-        lv_obj_set_style_border_color(card, stale ? C_RED : C_GRN, 0);
-        lv_obj_set_style_border_width(card, 2, 0);
+        lv_obj_set_style_border_color(card, d.alarm ? C_RED : stale ? C_RED : C_GRN, 0);
+        lv_obj_set_style_border_width(card, d.alarm ? 3 : 2, 0);
         lv_obj_set_style_radius(card, 4, 0);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
         lv_obj_t *n = lv_label_create(card);
         lv_label_set_text(n, d.id);
         lv_obj_set_style_text_color(n, C_WHITE, 0);
         lv_obj_set_style_text_font(n, &lv_font_montserrat_18, 0);
-        lv_obj_set_pos(n, 10, 8);
+        lv_obj_set_pos(n, 10, 4);
 
+        // Status line: ALARM beats online/offline; sessions and mood shown too
+        char stx[40];
+        if (d.alarm)                 strlcpy(stx, "!! ALARM !!", sizeof(stx));
+        else if (d.sessionCs[0])     snprintf(stx, sizeof(stx), "IN USE: %s", d.sessionCs);
+        else                         strlcpy(stx, stale ? "OFFLINE" : "ONLINE", sizeof(stx));
         lv_obj_t *st = lv_label_create(card);
-        lv_label_set_text(st, stale ? "OFFLINE" : "ONLINE");
-        lv_obj_set_style_text_color(st, stale ? C_RED : C_GRN, 0);
+        lv_label_set_text(st, stx);
+        lv_obj_set_style_text_color(st, d.alarm ? C_RED : stale ? C_RED : C_GRN, 0);
         lv_obj_set_style_text_font(st, &lv_font_montserrat_14, 0);
-        lv_obj_set_pos(st, 10, 34);
+        lv_obj_set_pos(st, 10, 28);
 
-        char age[24];
+        char age[40];
         unsigned long secs = (millis() - d.lastHeard) / 1000;
-        snprintf(age, sizeof(age), "Last seen: %lus", secs);
+        if (d.mood != 0) snprintf(age, sizeof(age), "Mood %+d  /  seen %lus", d.mood, secs);
+        else             snprintf(age, sizeof(age), "Last seen: %lus", secs);
         lv_obj_t *a = lv_label_create(card);
         lv_label_set_text(a, age);
         lv_obj_set_style_text_color(a, C_DIM, 0);
         lv_obj_set_style_text_font(a, &lv_font_montserrat_12, 0);
-        lv_obj_set_pos(a, 10, 64);
+        lv_obj_set_pos(a, 10, 50);
+
+        if (d.alarm) {
+            lv_obj_t *cb = lv_btn_create(card);
+            lv_obj_set_size(cb, 150, 34);
+            lv_obj_align(cb, LV_ALIGN_BOTTOM_MID, 0, -6);
+            lv_obj_set_style_bg_color(cb, C_RED, 0);
+            lv_obj_add_event_cb(cb, [](lv_event_t *e) {
+                TrackedDevice *td = (TrackedDevice *)lv_event_get_user_data(e);
+                if (!td) return;
+                swts::gmAlarmClear(td->id);
+                td->alarm = false;   // optimistic; next status confirms
+                char log[64];
+                snprintf(log, sizeof(log), "GM cleared alarm on %s", td->id);
+                logActivity(log, 5);
+            }, LV_EVENT_CLICKED, &trackedDevs[pidx[i]]);
+            lv_obj_t *cl = lv_label_create(cb);
+            lv_label_set_text(cl, "CLEAR ALARM");
+            lv_obj_set_style_text_color(cl, C_WHITE, 0);
+            lv_obj_set_style_text_font(cl, &lv_font_montserrat_14, 0);
+            lv_obj_center(cl);
+        }
     }
 
     if (statusLabel) {
@@ -2597,6 +2773,14 @@ void loop() {
     if (millis() - lastFacBcast > 10000) {
         lastFacBcast = millis();
         swts::gmSendFactions(gmConfig.factions, gmConfig.factionCount);
+    }
+
+    // Countdown: rebroadcast + expiry, and keep the button labels ticking
+    tickCountdown();
+    static unsigned long lastTimerUi = 0;
+    if (activeTimerIdx >= 0 && millis() - lastTimerUi > 1000) {
+        lastTimerUi = millis();
+        refreshTimerButtons();
     }
 
     // Debounced GM state save

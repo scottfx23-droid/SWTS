@@ -25,6 +25,7 @@
 #include <ESPAsyncWebServer.h>
 #include "swts_mesh.h"
 #include "swts_lights.h"         // addressable RGB strip (/SWTS/lights.txt)
+#include "swts_proximity.h"      // RSSI gate for interactions
 #include "swts_test_configs.h"   // boot-time test provisioning (see header to disable)
 
 #define S Serial
@@ -85,8 +86,66 @@ struct DroidConfig {
     char minigame_type[16] = "purge";
     int  purge_targets  = 12;   // corrupted blocks to clear
     int  purge_time_s   = 35;   // time limit in seconds
+    // Mood system
+    bool mood_enabled   = false;
+    int  mood_decay_s   = 120;
+    uint32_t mood_hostile  = 0xFF2000;
+    uint32_t mood_neutral  = 0xFFAA00;
+    uint32_t mood_friendly = 0x2060FF;
 };
 DroidConfig cfg;
+
+// ═══════════════════════════════════════
+//  MOOD — one signed int, persisted to /SWTS/droid_state.json
+//  Interactions move it; it decays toward 0. Drives the eye color
+//  (strip pixel 0), the greeting tone, and Core Purge difficulty.
+// ═══════════════════════════════════════
+int  mood = 0;
+bool moodDirty = false;
+unsigned long moodLastDecay = 0;
+bool sdMounted = false;
+
+int moodBand() {   // -1 hostile, 0 neutral, +1 friendly
+    if (mood <= -2) return -1;
+    if (mood >= 2)  return +1;
+    return 0;
+}
+
+void moodApplyEye() {
+    if (!cfg.mood_enabled) return;
+    uint32_t c = (moodBand() < 0) ? cfg.mood_hostile
+               : (moodBand() > 0) ? cfg.mood_friendly : cfg.mood_neutral;
+    swts_lights::setPixelOverride(0, c);
+}
+
+void moodAdd(int delta) {
+    if (!cfg.mood_enabled) return;
+    mood += delta;
+    if (mood > 5)  mood = 5;
+    if (mood < -5) mood = -5;
+    moodDirty = true;
+    S.printf("[MOOD] %+d -> %d\n", delta, mood);
+}
+
+void moodSave() {
+    if (!sdMounted) return;
+    File f = SD.open("/SWTS/droid_state.json", FILE_WRITE);
+    if (!f) return;
+    JsonDocument doc;
+    doc["mood"] = mood;
+    serializeJson(doc, f);
+    f.close();
+}
+
+void moodLoad() {
+    File f = SD.open("/SWTS/droid_state.json", FILE_READ);
+    if (!f) return;
+    JsonDocument doc;
+    if (!deserializeJson(doc, f)) mood = doc["mood"] | 0;
+    f.close();
+    if (mood > 5) mood = 5;
+    if (mood < -5) mood = -5;
+}
 
 bool loadConfig() {
     File f = SD.open("/SWTS/config.json", FILE_READ);
@@ -107,6 +166,18 @@ bool loadConfig() {
     if (cfg.has_minigame) strlcpy(cfg.minigame_type, mg, sizeof(cfg.minigame_type));
     cfg.purge_targets = doc["behavior"]["purge_targets"] | cfg.purge_targets;
     cfg.purge_time_s  = doc["behavior"]["purge_time_s"]  | cfg.purge_time_s;
+
+    cfg.mood_enabled = doc["behavior"]["mood_enabled"] | cfg.mood_enabled;
+    cfg.mood_decay_s = doc["behavior"]["mood_decay_s"] | cfg.mood_decay_s;
+    const char *mc;
+    mc = doc["behavior"]["mood_colors"]["hostile"].as<const char*>();
+    if (mc) cfg.mood_hostile = (uint32_t)strtoul(mc, nullptr, 16);
+    mc = doc["behavior"]["mood_colors"]["neutral"].as<const char*>();
+    if (mc) cfg.mood_neutral = (uint32_t)strtoul(mc, nullptr, 16);
+    mc = doc["behavior"]["mood_colors"]["friendly"].as<const char*>();
+    if (mc) cfg.mood_friendly = (uint32_t)strtoul(mc, nullptr, 16);
+
+    swts_prox::loadConfig(doc);
 
     S.printf("[CFG] %s id=%s ssid=%s faction=%s minigame=%s\n",
              cfg.name, cfg.id, cfg.ssid, cfg.faction,
@@ -145,21 +216,85 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
     }
     const char *action   = reqDoc["action"]            | "greet";
     const char *callsign = reqDoc["player"]["callsign"]| "UNKNOWN";
+    const char *pfac     = reqDoc["player"]["faction"] | "";
     strlcpy(connectedCallsign, callsign, sizeof(connectedCallsign));
     S.printf("[HTTP] %s by %s\n", action, callsign);
 
+    // ── Proximity gate ──
+    int stationRssi = 0;
+    if (!swts_prox::check(&stationRssi)) {
+        char body[64];
+        snprintf(body, sizeof(body), "{\"error\":\"too_far\",\"rssi\":%d}", stationRssi);
+        req->send(403, "application/json", body);
+        return;
+    }
+
+    // Faction relation: -1 friendly / 0 neutral / +1 hostile
+    int frel = 0;
+    if (pfac[0] && cfg.faction[0] && strcasecmp(cfg.faction, "neutral") != 0)
+        frel = (strcasecmp(cfg.faction, pfac) == 0) ? -1 : +1;
+    // A SIGNAL JAMMER makes a hostile player read as neutral (consumed)
+    bool usedJammer = false;
+    if (frel > 0) {
+        for (const char *it : reqDoc["player"]["inventory"].as<JsonArray>()) {
+            if (it && strcasecmp(it, "JAMMER") == 0) { frel = 0; usedJammer = true; break; }
+        }
+    }
+
+    if (strcmp(action, "apologize") == 0) {
+        // Costs 50 CR (the datapad deducts on seeing "cost"), soothes the droid
+        moodAdd(+2);
+        moodApplyEye();
+        astromechChirp();
+        JsonDocument ap;
+        ap["type"] = "dialogue";
+        ap["cost"] = 50;
+        JsonObject sp = ap["speaker"].to<JsonObject>();
+        sp["name"] = cfg.name;
+        JsonArray lines = ap["lines"].to<JsonArray>();
+        JsonObject l1 = lines.add<JsonObject>();
+        l1["text"] = "BWOOP... beep. (Translation: Fine. Apology accepted. Credits appreciated.)";
+        l1["style"] = "droid";
+        JsonArray chs = ap["choices"].to<JsonArray>();
+        JsonObject c1 = chs.add<JsonObject>();
+        c1["label"] = "[Disconnect]";
+        c1["next_action"] = nullptr;
+        String out; serializeJson(ap, out);
+        req->send(200, "application/json", out);
+        return;
+    }
+
     if (strcmp(action, "start_purge") == 0) {
+        // A deeply annoyed droid refuses to open his core at all
+        if (cfg.mood_enabled && mood <= -4) {
+            JsonDocument rf;
+            rf["type"] = "dialogue";
+            JsonObject sp = rf["speaker"].to<JsonObject>();
+            sp["name"] = cfg.name;
+            JsonArray lines = rf["lines"].to<JsonArray>();
+            JsonObject l1 = lines.add<JsonObject>();
+            l1["text"] = "BZZZT! WHIRR-CLUNK!! (Translation: Absolutely not. You lot have done enough damage.)";
+            l1["style"] = "droid";
+            JsonArray chs = rf["choices"].to<JsonArray>();
+            JsonObject c1 = chs.add<JsonObject>();
+            c1["label"] = "Apologize (50 CR)";
+            c1["next_action"] = "apologize";
+            JsonObject c2 = chs.add<JsonObject>();
+            c2["label"] = "[Disconnect]";
+            c2["next_action"] = nullptr;
+            String out; serializeJson(rf, out);
+            req->send(200, "application/json", out);
+            return;
+        }
+
         // ── Core Purge minigame start — datapad runs the game on its screen ──
-        // Faction relation tunes it: this droid's own faction gets a gentler
-        // purge (his core trusts them), the enemy gets more corruption and
-        // less time.
-        const char *pfac = reqDoc["player"]["faction"] | "";
+        // Faction relation tunes it (own faction gentler, enemy harder), then
+        // mood shifts targets: a happy droid opens up, an angry one fights back.
         int targets = cfg.purge_targets;
         int timeS   = cfg.purge_time_s;
-        if (pfac[0] && cfg.faction[0] && strcasecmp(cfg.faction, "neutral") != 0) {
-            if (strcasecmp(cfg.faction, pfac) == 0) { targets -= 4; timeS += 10; }
-            else                                    { targets += 4; timeS -= 5;  }
-        }
+        if (frel < 0)      { targets -= 4; timeS += 10; }
+        else if (frel > 0) { targets += 4; timeS -= 5;  }
+        if (cfg.mood_enabled) targets -= mood;
         if (targets < 4)  targets = 4;
         if (timeS < 10)   timeS = 10;
 
@@ -170,6 +305,7 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
         mg["game"]       = "purge";
         mg["targets"]    = targets;
         mg["time_limit"] = timeS;
+        if (usedJammer) mg["consumed_item"] = "JAMMER";
         String out;
         serializeJson(mg, out);
         req->send(200, "application/json", out);
@@ -181,6 +317,10 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
         JsonDocument mr;
         mr["type"]     = "minigame_result";
         mr["accepted"] = true;
+        // Mood: hostile players wiping his core hurts; any failure annoys
+        if (won && frel > 0) moodAdd(-3);
+        else if (!won)       moodAdd(-1);
+        moodApplyEye();
         if (won) {
             coreSliced = true;
             pendingFx = FX_SUCCESS;
@@ -231,6 +371,8 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
     if (strcmp(action, "deliver_intel") == 0) {
         // ── Player is handing off the decrypted intel — completes the mission ──
         intelDelivered = true;
+        moodAdd(+2);
+        moodApplyEye();
         pendingFx = FX_SIGNAL;
         astromechChirp();
         delay(120);
@@ -272,9 +414,46 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
     pendingFx = FX_ACTIVITY;
     astromechChirp();
 
-    JsonObject l1 = lines.add<JsonObject>();
-    l1["text"] = "BEEP-BWEEP-WHIRR-CLICK. (Translation: About time you showed up.)";
-    l1["style"] = "droid";
+    // Friendly faces cheer him up (rate-limited so it can't be farmed)
+    static unsigned long lastMoodGreet = 0;
+    if (cfg.mood_enabled && frel < 0 && millis() - lastMoodGreet > 60000) {
+        lastMoodGreet = millis();
+        moodAdd(+1);
+        moodApplyEye();
+    }
+
+    // Greeting tone follows his mood: try dialogue/greet_<band>.json on the
+    // card, else use the built-in line for that band
+    {
+        const char *fn = !cfg.mood_enabled ? nullptr
+                       : moodBand() < 0 ? "/SWTS/dialogue/greet_hostile.json"
+                       : moodBand() > 0 ? "/SWTS/dialogue/greet_friendly.json"
+                                        : "/SWTS/dialogue/greet_neutral.json";
+        bool fromFile = false;
+        if (fn && sdMounted) {
+            File gf = SD.open(fn, FILE_READ);
+            if (gf) {
+                JsonDocument gd;
+                if (!deserializeJson(gd, gf)) {
+                    for (JsonObject ln : gd["lines"].as<JsonArray>()) {
+                        JsonObject l = lines.add<JsonObject>();
+                        l["text"]  = ln["text"]  | "";
+                        l["style"] = ln["style"] | "droid";
+                        fromFile = true;
+                    }
+                }
+                gf.close();
+            }
+        }
+        if (!fromFile) {
+            JsonObject l1 = lines.add<JsonObject>();
+            l1["text"] = !cfg.mood_enabled ? "BEEP-BWEEP-WHIRR-CLICK. (Translation: About time you showed up.)"
+                       : moodBand() < 0 ? "GRZZT. BWOP. (Translation: Oh. It's you people again. What.)"
+                       : moodBand() > 0 ? "BWEEE-DEET-DEET! (Translation: Hey! Good to see a friendly face!)"
+                                        : "BEEP-BWEEP-WHIRR-CLICK. (Translation: About time you showed up.)";
+            l1["style"] = "droid";
+        }
+    }
 
     JsonObject l2 = lines.add<JsonObject>();
     if (intelDelivered) {
@@ -287,7 +466,12 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
     l2["style"] = "system";
 
     if (!intelDelivered) {
-        if (cfg.has_minigame && !coreSliced) {
+        if (cfg.mood_enabled && mood <= -4 && !coreSliced) {
+            // Too angry to cooperate — only an apology moves things forward
+            JsonObject c1 = choices.add<JsonObject>();
+            c1["label"]       = "Apologize (50 CR)";
+            c1["next_action"] = "apologize";
+        } else if (cfg.has_minigame && !coreSliced) {
             JsonObject c1 = choices.add<JsonObject>();
             c1["label"]       = "Purge memory core";
             c1["next_action"] = "start_purge";
@@ -380,6 +564,10 @@ void setup() {
         swts_test::writeTestConfigs(SD);
         loadConfig();
         swts_lights::load(SD);   // RGB strip pattern (/SWTS/lights.txt)
+        sdMounted = true;
+        moodLoad();
+        moodApplyEye();
+        S.printf("[MOOD] enabled=%d mood=%d\n", cfg.mood_enabled, mood);
     } else {
         S.println("[SD] No SD card / mount failed — insert configured card");
         SD.end();
@@ -423,12 +611,29 @@ void loop() {
         nextChirp = millis() + 30000 + random(0, 30000);
     }
 
-    // Mesh heartbeat every 5s
+    // Mesh heartbeat every 5s (+ prop status with mood)
     static unsigned long lastBeat = 0;
     if (millis() - lastBeat > 5000) {
         lastBeat = millis();
         swts::sendPing(millis() / 1000);
-        S.printf("[MESH] ping seq sent (uptime %lus)\n", millis() / 1000);
+        swts::sendPropStatus(millis() / 1000, cfg.mood_enabled ? mood : 0, false, "");
+        S.printf("[MESH] ping seq sent (uptime %lus, mood %d)\n", millis() / 1000, mood);
+    }
+
+    // Mood decay toward 0 + debounced persistence
+    if (cfg.mood_enabled) {
+        if (mood != 0 && millis() - moodLastDecay > (unsigned long)cfg.mood_decay_s * 1000UL) {
+            moodLastDecay = millis();
+            mood += (mood > 0) ? -1 : +1;
+            moodDirty = true;
+            moodApplyEye();
+        }
+        static unsigned long lastMoodSave = 0;
+        if (moodDirty && millis() - lastMoodSave > 3000) {
+            lastMoodSave = millis();
+            moodDirty = false;
+            moodSave();
+        }
     }
 
     delay(50);

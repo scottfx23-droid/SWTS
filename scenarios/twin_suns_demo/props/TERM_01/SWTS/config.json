@@ -19,6 +19,12 @@
     "scan_cooldown_ms": 1500,
     "accepts_datatapes": true,
     "datatape_action": "decrypt",
+    "require_tap_to_use": true,
+    "session_timeout_s": 60,
+    "allow_queue": false,
+    "decrypt_required": true,
+    "decrypt_tries": 6,
+    "decrypt_glyphs": 6,
     "dialogue_greeting": "dialogue/greeting.json"
   }
 }
