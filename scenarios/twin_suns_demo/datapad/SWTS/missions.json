@@ -66,10 +66,41 @@
           "xp": 120
         }
       ]
+    },
+    {
+      "id": "counter_slice",
+      "title": "COUNTER-SLICE",
+      "subtitle": "Trace the rebel slicer network and seize their dead drop",
+      "faction": "IMPERIAL",
+      "briefing": "ISB has flagged slicer traffic on the cantina's backroom comm board. The rebels are moving something through this outpost.\n\nBreach the board yourself and pull its private ledger, then locate the dead-dropped datacard before their courier collects it. Log it as evidence.\n\nThe Empire rewards efficiency.",
+      "difficulty": 2,
+      "reward_credits": 350,
+      "reward_xp": 250,
+      "reward_item": "IMPERIAL COMMENDATION",
+      "unlocks": "",
+      "starts_unlocked": true,
+      "endgame": true,
+      "steps": [
+        {
+          "title": "Breach the comm board",
+          "description": "Slice the Cantina Comm Board's pattern lock and recover its backroom ledger.",
+          "type": "event",
+          "target": "panel_sliced:PANEL_01",
+          "xp": 80
+        },
+        {
+          "title": "Seize the dead drop",
+          "description": "Locate the rebel datacard INTEL_01 and scan it to log it as evidence.",
+          "type": "scan_nfc",
+          "target": "INTEL_01",
+          "xp": 120
+        }
+      ]
     }
   ],
   "nfc_triggers": [
-    { "token": "INTEL_01",   "action": "step", "mission": "intel_run",  "step": 0 },
-    { "token": "EXTRACT_01", "action": "step", "mission": "extraction", "step": 1 }
+    { "token": "INTEL_01",   "action": "step", "mission": "intel_run",     "step": 0 },
+    { "token": "INTEL_01",   "action": "step", "mission": "counter_slice", "step": 1 },
+    { "token": "EXTRACT_01", "action": "step", "mission": "extraction",    "step": 1 }
   ]
 }

@@ -303,6 +303,15 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
     const char* mgAction = (strcmp(cfg.minigame_type, "simon") == 0)
                                ? "start_simon" : "start_minigame";
 
+    // Faction relation: slicing your own faction's gear is easier, enemy
+    // gear is harder. Neutral props (like this cantina board by default)
+    // treat everyone the same. -1 friendly / 0 neutral / +1 hostile.
+    const char* pfac = reqDoc["player"]["faction"] | "";
+    int facMod = 0;
+    if (pfac[0] && strcasecmp(cfg.faction, "neutral") != 0 && cfg.faction[0]) {
+        facMod = (strcasecmp(cfg.faction, pfac) == 0) ? -1 : +1;
+    }
+
     if (strcmp(action, "greet") == 0) {
         resp["type"] = "dialogue";
         JsonObject speaker = resp["speaker"].to<JsonObject>();
@@ -365,27 +374,34 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
     }
     else if (strcmp(action, "start_minigame") == 0) {
         panelState = STATE_MINIGAME;
+        // Faction relation shifts the timing-bar difficulty (friendly -1, hostile +1)
+        int diff = cfg.minigame_diff + facMod;
+        if (diff < 1) diff = 1;
+        if (diff > 5) diff = 5;
         resp["type"] = "minigame_start";
         resp["game"] = cfg.minigame_type;
-        resp["difficulty"] = cfg.minigame_diff;
-        resp["time_limit"] = 50 - cfg.minigame_diff * 5;
+        resp["difficulty"] = diff;
+        resp["time_limit"] = 50 - diff * 5;
 
         JsonArray zones = resp["target_zones"].to<JsonArray>();
         JsonObject z1 = zones.add<JsonObject>();
         z1["start"] = 0.20; z1["end"] = 0.38; z1["points"] = 100;
         JsonObject z2 = zones.add<JsonObject>();
         z2["start"] = 0.60; z2["end"] = 0.78; z2["points"] = 80;
-        if (cfg.minigame_diff >= 3) {
+        if (diff >= 3) {
             JsonObject z3 = zones.add<JsonObject>();
             z3["start"] = 0.85; z3["end"] = 0.95; z3["points"] = 120;
         }
     }
     else if (strcmp(action, "start_simon") == 0) {
-        // Simon Says (pattern lock) — rounds come from config.
+        // Simon Says (pattern lock) — rounds from config, adjusted by the
+        // player's faction relation (friendly -1, hostile +2)
         panelState = STATE_MINIGAME;
+        int rounds = cfg.simon_rounds + (facMod < 0 ? -1 : facMod > 0 ? 2 : 0);
+        if (rounds < 1) rounds = 1;
         resp["type"] = "minigame_start";
         resp["game"] = "simon";
-        resp["rounds"] = cfg.simon_rounds;
+        resp["rounds"] = rounds;
     }
     else if (strcmp(action, "minigame_result") == 0) {
         bool won = reqDoc["won"] | false;
@@ -395,6 +411,11 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
         if (won) {
             panelState = STATE_HACKED;
             playerSliced = true;
+            // Announce the breach — missions can key off this event
+            char eventId[40];
+            snprintf(eventId, sizeof(eventId), "panel_sliced:%s", cfg.id);
+            swts::gmTriggerEvent(eventId, "Panel security breached", 0, callsign);
+            resp["game_event"] = eventId;
             resp["message"] = "SYSTEM BREACHED -- ACCESS GRANTED";
             resp["unlocked"] = true;
             JsonObject rewards = resp["rewards"].to<JsonObject>();

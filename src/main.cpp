@@ -397,10 +397,33 @@ bool isUnassignedCallsign(const char *cs) {
     if (strncmp(cs, "DATAPAD-", 8) == 0) return true;
     return false;
 }
+
+// ── Faction ──
+// The player declares an allegiance at registration. The roster comes from
+// the GM datapad (MSG_FACTIONS broadcast); these defaults cover testing and
+// GM-less boots.
+char playerFaction[14] = "";   // "" = not chosen yet; persisted in player.json
+
+// Difficulty mode — GM can flip a player to KID (easier minigames) from the
+// PLAYERS tab. Adults (default) play everything at full difficulty.
+bool kidMode = false;
+
+char factionList[MESH_MAX_FACTIONS][14] = { "REBEL", "IMPERIAL" };
+int  factionCount = 2;
+volatile bool factionListDirty = false;   // roster changed (rebuild pick screen if showing)
+
+// A mission is available to this player when its faction field is empty,
+// "ALL"/"ANY", or matches the player's declared faction.
+bool missionFactionOk(const MissionDef &m) {
+    if (!m.faction[0]) return true;
+    if (strcasecmp(m.faction, "ALL") == 0 || strcasecmp(m.faction, "ANY") == 0) return true;
+    return strcasecmp(m.faction, playerFaction) == 0;
+}
 int score = 0;          // credits or reputation — starts at 0
 char scoreSuffix[4] = "CR";  // "CR" or "RP" — loaded from config
 char planetName[24] = "Unknown";
 lv_obj_t *homeScoreLbl = NULL;
+lv_obj_t *homeFactionLbl = NULL;
 lv_obj_t *homeMissionBtn = NULL,  *homeMissionBadge = NULL;
 lv_obj_t *homeBountyBtn  = NULL,  *homeBountyBadge  = NULL;
 lv_obj_t *homeCommBtn    = NULL,  *homeCommBadge    = NULL;
@@ -410,10 +433,17 @@ void refreshScoreLabel() {
     snprintf(b, sizeof(b), "%d %s", score, scoreSuffix);
     lv_label_set_text(homeScoreLbl, b);
 }
+// Footer faction readout -- bright once declared, dim placeholder before
+void refreshFactionLabel() {
+    if (!homeFactionLbl) return;
+    lv_label_set_text(homeFactionLbl, playerFaction[0] ? playerFaction : "NO ALLEGIANCE");
+    lv_obj_set_style_text_color(homeFactionLbl, playerFaction[0] ? C_AMB : C_MUT, 0);
+}
 void refreshHomeBadges();   // forward decl, defined after styles exist
 int activeBountyCount();    // forward decl, defined alongside the bounty pool
 int xp = 0;
 int activeMissions = 0, inventoryItems = 0, unreadComms = 0, totalScans = 0;
+int slicesWonCount = 0;   // minigames won (any type) — reported to the GM
 
 // ── Player state forward decls (full impl lives near the SD loaders) ──
 extern volatile bool playerDirty;
@@ -451,6 +481,14 @@ int findActive(uint8_t defIdx) {
     return -1;
 }
 
+int completedMissionCount() {
+    int n = 0;
+    for (int i = 0; i < MAX_ACTIVE; i++)
+        if (msnSlots[i].def_idx >= 0 && msnSlots[i].complete) n++;
+    return n;
+}
+
+void triggerComms(const char *trigger);                          // forward decl
 void triggerCommsPrefix(const char *prefix, const char *value);  // forward decl
 void showObjectiveToast(const char *title, const char *body);    // forward decl
 bool debriefPending = false;   // set when the endgame mission completes; loop shows debrief
@@ -458,6 +496,7 @@ bool debriefPending = false;   // set when the endgame mission completes; loop s
 bool startMission(uint8_t defIdx) {
     if (defIdx >= NUM_MISSIONS) return false;
     if (!msnUnlocked[defIdx]) return false;
+    if (!missionFactionOk(ALL_MISSIONS[defIdx])) return false; // wrong faction
     if (findActive(defIdx) >= 0) return false; // Already active
     for (int i = 0; i < MAX_ACTIVE; i++) {
         if (msnSlots[i].def_idx == -1) {
@@ -482,6 +521,7 @@ bool startMission(uint8_t defIdx) {
 void autoStartMissions() {
     for (int i = 0; i < NUM_MISSIONS; i++) {
         if (!msnUnlocked[i] || !ALL_MISSIONS[i].starts_unlocked) continue;
+        if (!missionFactionOk(ALL_MISSIONS[i])) continue;
         bool seen = false;
         for (int s2 = 0; s2 < MAX_ACTIVE; s2++)
             if (msnSlots[s2].def_idx == i) { seen = true; break; }
@@ -499,6 +539,11 @@ bool advanceStep(uint8_t defIdx, uint8_t stepIdx) {
     playerDirty = true;
     playerLastSave = 0;
     S.printf("Step complete: %s step %d\n", m.title, stepIdx);
+
+    // Report progress to the GM for the per-player activity log
+    char reason[40];
+    snprintf(reason, sizeof(reason), "STEP %d/%d %s", stepIdx + 1, m.num_steps, m.id);
+    swts::sendScore(score, m.steps[stepIdx].xp_reward, reason);
     // Check if mission complete
     if (msnSlots[slot].current_step >= m.num_steps) {
         msnSlots[slot].complete = true;
@@ -520,6 +565,8 @@ bool advanceStep(uint8_t defIdx, uint8_t stepIdx) {
             }
         }
         S.printf("Mission COMPLETE: %s (+%d cr, +%d xp)\n", m.title, m.reward_credits, m.reward_xp);
+        snprintf(reason, sizeof(reason), "MISSION DONE %s", m.id);
+        swts::sendScore(score, m.reward_credits, reason);
         if (m.is_endgame) debriefPending = true;   // loop() shows the debrief screen
         return true;
     }
@@ -844,6 +891,13 @@ void buildHomeScreen() {
     lv_obj_set_style_text_color(sys, C_AMB_DIM, 0);
     lv_obj_align(sys, LV_ALIGN_LEFT_MID, 0, 0);
 
+    // Player faction (center) -- updated when allegiance is declared
+    homeFactionLbl = lv_label_create(ftr);
+    refreshFactionLabel();
+    lv_obj_set_style_text_font(homeFactionLbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_letter_space(homeFactionLbl, 1, 0);
+    lv_obj_align(homeFactionLbl, LV_ALIGN_CENTER, 0, 0);
+
     // SD status (small checkmark or X in footer)
     lv_obj_t *sdIco = lv_label_create(ftr);
     lv_label_set_text(sdIco, sdOk ? LV_SYMBOL_OK : LV_SYMBOL_CLOSE);
@@ -1027,6 +1081,9 @@ void showCardResult(uint8_t *uid, uint8_t len) {
 
     // Deliver any comms keyed to this scan ("scan:<token>")
     triggerCommsPrefix("scan", token);
+
+    // Report the scan to the GM (per-player activity log)
+    if (token[0]) swts::sendNfcScan(token, token, "datacard");
 
     lv_obj_add_flag(dcSpinner, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(dcPrompt, LV_OBJ_FLAG_HIDDEN);
@@ -1540,7 +1597,7 @@ String postInteract(const char* action) {
     req["action"] = action;
     JsonObject p = req["player"].to<JsonObject>();
     p["callsign"] = callsign;
-    p["faction"] = "REBEL";
+    p["faction"] = playerFaction;
 
     String body;
     serializeJson(req, body);
@@ -1929,6 +1986,12 @@ void updateSliceGame() {
 // Per-color playback tones (match the boot-time button tones)
 static const int SIMON_TONE[3] = { 600, 1500, 3000 };  // BLUE, WHITE, RED
 
+// Live playback timing — reset per game; kid mode gets a slower pattern
+// and a longer input window
+int simonOnMs    = SIMON_ON_MS;
+int simonOffMs   = SIMON_OFF_MS;
+int simonInputMs = SIMON_INPUT_MS;
+
 enum SimonPhase : uint8_t {
     SP_PRE,        // short pause, then playback
     SP_PLAY,       // flashing the sequence back
@@ -1990,6 +2053,11 @@ void startSimonGame(int rounds) {
     simonRounds = rounds;
     if (simonRounds < 1) simonRounds = 1;
     if (simonRounds > SIMON_MAX_ROUNDS) simonRounds = SIMON_MAX_ROUNDS;
+
+    // Kid mode: slower playback, more time to answer
+    simonOnMs    = kidMode ? 620   : SIMON_ON_MS;
+    simonOffMs   = kidMode ? 300   : SIMON_OFF_MS;
+    simonInputMs = kidMode ? 15000 : SIMON_INPUT_MS;
 
     // Pre-generate the full random sequence; reveal one more step each round.
     for (int i = 0; i < simonRounds; i++) simonSeq[i] = (uint8_t)(esp_random() % 3);
@@ -2150,13 +2218,13 @@ void updateSimonGame() {
         // simonPhaseTime marks the last on/off transition. A lit step lasts
         // SIMON_ON_MS; the dark gap between steps lasts SIMON_OFF_MS.
         if (simonLedOn) {
-            if (now - simonPhaseTime >= SIMON_ON_MS) {
+            if (now - simonPhaseTime >= (unsigned long)simonOnMs) {
                 simonShow(simonSeq[simonPlayIdx], false);
                 simonPlayIdx++;
                 simonLedOn = false;
                 simonPhaseTime = now;
             }
-        } else if (now - simonPhaseTime >= SIMON_OFF_MS) {
+        } else if (now - simonPhaseTime >= (unsigned long)simonOffMs) {
             if (simonPlayIdx >= simonLen) {
                 // Sequence finished — hand off to the player
                 simonAllPadsOff();
@@ -2170,7 +2238,7 @@ void updateSimonGame() {
             }
             int c = simonSeq[simonPlayIdx];
             simonShow(c, true);
-            buzzerTone(SIMON_TONE[c], SIMON_ON_MS - 40);
+            buzzerTone(SIMON_TONE[c], simonOnMs - 40);
             simonLedOn = true;
             simonPhaseTime = now;
         }
@@ -2211,7 +2279,7 @@ void updateSimonGame() {
                 if (!btnState[i].ledHeld && btnState[i].ledUntil == 0)
                     simonPadSet(i, false);
             // Input timeout
-            if (now - simonInputTime >= SIMON_INPUT_MS) simonFail();
+            if (now - simonInputTime >= (unsigned long)simonInputMs) simonFail();
         }
         break;
     }
@@ -2261,6 +2329,7 @@ int  purgePurged  = 0;
 int  purgeStrikes = 0;
 bool purgeActive  = false;
 bool purgeWon     = false;
+int  purgeLifeMs  = PURGE_LIFE_MS;   // block lifetime; longer in kid mode
 unsigned long purgeStartTime = 0;
 unsigned long purgeSpawnTime = 0;
 unsigned long purgeEndTime   = 0;   // millis() when the game ended (0 = still running)
@@ -2434,8 +2503,11 @@ void buildPurgeScreen() {
 }
 
 void launchPurgeGame(int targets, int timeS) {
-    purgeTargets = constrain(targets, 1, 99);
-    purgeTimeS   = constrain(timeS, 5, 300);
+    // Kid mode: fewer blocks, more time, and each block lingers longer
+    if (kidMode) { targets -= 4; timeS += 15; }
+    purgeLifeMs  = kidMode ? 2200 : PURGE_LIFE_MS;
+    purgeTargets = constrain(targets, 4, 99);
+    purgeTimeS   = constrain(timeS, 10, 300);
     purgePurged  = 0;
     purgeStrikes = 0;
     purgeActive  = true;
@@ -2486,10 +2558,192 @@ void updatePurgeGame() {
             if (purgeCell[i] != PC_EMPTY) continue;
             bool decoy = (esp_random() % 100) < PURGE_DECOY_PCT;
             purgeSetCell(i, decoy ? PC_DECOY : PC_CORRUPT);
-            purgeCellDie[i] = now + PURGE_LIFE_MS;
+            purgeCellDie[i] = now + purgeLifeMs;
             break;
         }
     }
+}
+
+// ═══════════════════════════════════════
+//  NAME ENTRY — first-boot player identification
+//  Shown instead of the home screen while the callsign is still a
+//  placeholder (OPERATIVE / DATAPAD-xxxx). Rental flow: every player
+//  names their operative when they're handed the datapad.
+// ═══════════════════════════════════════
+lv_obj_t *scrNameEntry = NULL;
+lv_obj_t *nameTa = NULL;
+
+// Sanitize + apply the typed name: uppercase, A-Z 0-9 and dashes only
+// (it becomes the mesh id, so no spaces), max 12 chars.
+static void applyPlayerName(const char *raw) {
+    char nm[16];
+    int n = 0;
+    for (const char *p = raw; *p && n < 12; p++) {
+        char c = *p;
+        if (c >= 'a' && c <= 'z') c -= 32;
+        if (c == ' ') c = '-';
+        if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-')
+            nm[n++] = c;
+    }
+    nm[n] = 0;
+    if (n == 0) return;
+
+    strlcpy(callsign, nm, sizeof(callsign));
+    strlcpy(swts::myId, callsign, sizeof(swts::myId));
+    playerDirty = true;
+    playerLastSave = 0;
+    S.printf("[PLAYER] Named: %s\n", callsign);
+    buzzerScanOk();
+    // Fresh status so the GM roster shows the new name right away
+    swts::sendStatus(millis() / 1000, score, activeMissions, completedMissionCount(), totalScans, slicesWonCount, playerFaction, kidMode, xp);
+}
+
+void showFactionPick();   // forward decl
+
+static void ev_name_ready(lv_event_t *e) {
+    const char *txt = lv_textarea_get_text(nameTa);
+    if (!txt || !txt[0]) return;   // need a name before continuing
+    applyPlayerName(txt);
+    if (isUnassignedCallsign(callsign)) return;   // nothing usable typed
+    if (!playerFaction[0]) showFactionPick();     // declare allegiance next
+    else lv_scr_load_anim(scrHome, LV_SCR_LOAD_ANIM_FADE_ON, 250, 0, false);
+}
+
+void buildNameEntryScreen() {
+    scrNameEntry = lv_obj_create(NULL);
+    lv_obj_add_style(scrNameEntry, &s_scr, 0);
+    lv_obj_clear_flag(scrNameEntry, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *hd = lv_label_create(scrNameEntry);
+    lv_label_set_text(hd, "ALLIANCE REGISTRY");
+    lv_obj_set_style_text_font(hd, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(hd, C_AMB, 0);
+    lv_obj_set_style_text_letter_space(hd, 2, 0);
+    lv_obj_align(hd, LV_ALIGN_TOP_MID, 0, 22);
+
+    lv_obj_t *t = lv_label_create(scrNameEntry);
+    lv_label_set_text(t, "IDENTIFY YOURSELF");
+    lv_obj_set_style_text_font(t, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(t, C_AMB_BRT, 0);
+    lv_obj_set_style_text_letter_space(t, 1, 0);
+    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 46);
+
+    lv_obj_t *sub = lv_label_create(scrNameEntry);
+    lv_label_set_text(sub, "ENTER OPERATIVE CALLSIGN");
+    lv_obj_set_style_text_font(sub, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(sub, C_DIM, 0);
+    lv_obj_align(sub, LV_ALIGN_TOP_MID, 0, 80);
+
+    nameTa = lv_textarea_create(scrNameEntry);
+    lv_textarea_set_one_line(nameTa, true);
+    lv_textarea_set_max_length(nameTa, 12);
+    lv_textarea_set_placeholder_text(nameTa, "CALLSIGN");
+    lv_obj_set_size(nameTa, W - 60, 46);
+    lv_obj_align(nameTa, LV_ALIGN_TOP_MID, 0, 104);
+    lv_obj_set_style_bg_color(nameTa, C_PNL, 0);
+    lv_obj_set_style_border_color(nameTa, C_AMB_DIM, 0);
+    lv_obj_set_style_text_font(nameTa, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(nameTa, C_AMB_BRT, 0);
+
+    lv_obj_t *kb = lv_keyboard_create(scrNameEntry);
+    lv_keyboard_set_textarea(kb, nameTa);
+    lv_obj_set_size(kb, W, H / 2 - 20);
+    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(kb, C_BG, 0);
+    // Checkmark on the keyboard confirms
+    lv_obj_add_event_cb(kb, ev_name_ready, LV_EVENT_READY, NULL);
+}
+
+// ═══════════════════════════════════════
+//  FACTION PICK — declare allegiance at registration
+//  Roster comes from the GM (MSG_FACTIONS); defaults to REBEL/IMPERIAL when
+//  no GM has been heard. Built fresh each time so a late roster broadcast
+//  still shows the right list.
+// ═══════════════════════════════════════
+lv_obj_t *scrFactionPick = NULL;
+
+static void applyFaction(const char *fac) {
+    strlcpy(playerFaction, fac, sizeof(playerFaction));
+    playerDirty = true;
+    playerLastSave = 0;
+    S.printf("[PLAYER] Faction: %s\n", playerFaction);
+    buzzerSuccess();
+    swts::sendStatus(millis() / 1000, score, activeMissions, completedMissionCount(), totalScans, slicesWonCount, playerFaction, kidMode, xp);
+    // Day-one missions are faction-filtered, so (re)start them now, and
+    // re-run boot comms so faction-tagged welcome messages deliver
+    autoStartMissions();
+    triggerComms("boot");
+    refreshHomeBadges();
+    refreshFactionLabel();
+}
+
+static void ev_faction_pick(lv_event_t *e) {
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= factionCount) return;
+    applyFaction(factionList[idx]);
+    lv_scr_load_anim(scrHome, LV_SCR_LOAD_ANIM_FADE_ON, 250, 0, false);
+}
+
+void showFactionPick() {
+    if (scrFactionPick) { lv_obj_del(scrFactionPick); scrFactionPick = NULL; }
+    scrFactionPick = lv_obj_create(NULL);
+    lv_obj_add_style(scrFactionPick, &s_scr, 0);
+    lv_obj_clear_flag(scrFactionPick, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *hd = lv_label_create(scrFactionPick);
+    lv_label_set_text(hd, "ALLIANCE REGISTRY");
+    lv_obj_set_style_text_font(hd, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(hd, C_AMB, 0);
+    lv_obj_set_style_text_letter_space(hd, 2, 0);
+    lv_obj_align(hd, LV_ALIGN_TOP_MID, 0, 22);
+
+    lv_obj_t *t = lv_label_create(scrFactionPick);
+    lv_label_set_text(t, "DECLARE ALLEGIANCE");
+    lv_obj_set_style_text_font(t, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(t, C_AMB_BRT, 0);
+    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 46);
+
+    char wb[48];
+    snprintf(wb, sizeof(wb), "OPERATIVE %s -- CHOOSE A SIDE", callsign);
+    lv_obj_t *sub = lv_label_create(scrFactionPick);
+    lv_label_set_text(sub, wb);
+    lv_obj_set_style_text_font(sub, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(sub, C_DIM, 0);
+    lv_obj_align(sub, LV_ALIGN_TOP_MID, 0, 80);
+
+    hline(scrFactionPick, 104, C_FRM, 1);
+
+    int y = 130;
+    for (int i = 0; i < factionCount; i++) {
+        lv_obj_t *btn = lv_btn_create(scrFactionPick);
+        lv_obj_set_size(btn, W - 60, 56);
+        lv_obj_set_pos(btn, 30, y);
+        lv_obj_set_style_bg_color(btn, C_PNL, 0);
+        lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(btn, C_PNL2, LV_STATE_PRESSED);
+        lv_obj_set_style_border_color(btn, C_AMB_DIM, 0);
+        lv_obj_set_style_border_width(btn, 2, 0);
+        lv_obj_set_style_radius(btn, 2, 0);
+        lv_obj_set_style_shadow_width(btn, 0, 0);
+        lv_obj_add_event_cb(btn, ev_faction_pick, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+
+        lv_obj_t *bl = lv_label_create(btn);
+        lv_label_set_text(bl, factionList[i]);
+        lv_obj_set_style_text_font(bl, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_color(bl, C_AMB_BRT, 0);
+        lv_obj_set_style_text_letter_space(bl, 2, 0);
+        lv_obj_center(bl);
+        y += 68;
+    }
+
+    lv_obj_t *ftr = lv_label_create(scrFactionPick);
+    lv_label_set_text(ftr, "YOUR MISSIONS DEPEND ON YOUR SIDE.\nCHOOSE WISELY.");
+    lv_obj_set_style_text_font(ftr, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ftr, C_DIM, 0);
+    lv_obj_set_style_text_align(ftr, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(ftr, LV_ALIGN_BOTTOM_MID, 0, -24);
+
+    lv_scr_load_anim(scrFactionPick, LV_SCR_LOAD_ANIM_MOVE_LEFT, 180, 0, false);
 }
 
 static void ev_prop_slice(lv_event_t *e) {
@@ -2497,10 +2751,11 @@ static void ev_prop_slice(lv_event_t *e) {
     String resp = postInteract("start_minigame");
     if (resp.length() == 0) return;
 
-    // Parse difficulty from response
+    // Parse difficulty from response; kid mode plays one notch easier
     JsonDocument doc;
     deserializeJson(doc, resp);
     int diff = doc["difficulty"] | 2;
+    if (kidMode && diff > 1) diff--;
 
     launchSliceGame(diff);
 }
@@ -2514,6 +2769,7 @@ static void ev_prop_simon(lv_event_t *e) {
     JsonDocument doc;
     deserializeJson(doc, resp);
     int rounds = doc["rounds"] | SIMON_DEFAULT_ROUNDS;
+    if (kidMode && rounds > 1) rounds--;   // one fewer round for kids
 
     launchSimonGame(rounds);
 }
@@ -2729,16 +2985,30 @@ static void finishMinigameAndReturn(JsonDocument &req, bool won) {
     http.begin("http://192.168.4.1/api/interact");
     http.addHeader("Content-Type", "application/json");
     String body; serializeJson(req, body);
-    http.POST(body);
+    int code = http.POST(body);
+    String respBody = (code == 200) ? http.getString() : String();
     http.end();
+
+    // The prop may attach a game event to the result (e.g. panel_sliced:...)
+    if (respBody.length()) {
+        JsonDocument rdoc;
+        if (!deserializeJson(rdoc, respBody)) {
+            const char *gev = rdoc["game_event"].as<const char*>();
+            if (gev && gev[0]) queueGameEvent(gev);
+        }
+    }
 
     if (won) {
         score += 50;
         xp += 50;
+        slicesWonCount++;
         refreshScoreLabel();
         playerDirty = true;
         playerLastSave = 0;
     }
+
+    // Report the minigame outcome to the GM (which prop + won/lost)
+    swts::sendSliceResult(propId[0] ? propId : "PROP", won, 0, won ? 50 : 0, 0);
 
     lv_obj_clean(propContent);
     showPropGreeting();
@@ -2979,6 +3249,7 @@ void refreshMissionList() {
         for (int s2 = 0; s2 < MAX_ACTIVE; s2++)
             if (msnSlots[s2].def_idx == i) { slot = s2; break; }
         if (slot < 0 && !msnUnlocked[i]) continue;
+        if (slot < 0 && !missionFactionOk(ALL_MISSIONS[i])) continue;   // other faction's op
 
         const MissionDef &m = ALL_MISSIONS[i];
         bool complete = (slot >= 0 && msnSlots[slot].complete);
@@ -3619,6 +3890,7 @@ void showCargoResult(uint8_t *uid, uint8_t len) {
     }
 
     // Real cargo identification
+    swts::sendNfcScan(ndefText, ndefText, "cargo");
     lv_obj_set_style_border_color(cgResult, C_AMB, 0);
 
     lv_obj_t *hd = lv_label_create(cgResult);
@@ -3683,6 +3955,7 @@ struct CommMsg {
     char subject[40];
     char body[256];
     char trigger[40];   // "boot", "mission_start:ghost_signal", "slice_win", "event:xxx"
+    char faction[14];   // "" = everyone, else only players of this faction
     bool loaded;         // in the pool (loaded from SD)
     bool delivered;      // shown to player (in inbox)
     bool read;           // player has opened it
@@ -3827,9 +4100,12 @@ bool savePlayerState() {
 
     JsonDocument doc;
     doc["callsign"]   = callsign;
+    doc["faction"]    = playerFaction;
+    doc["mode"]       = kidMode ? "KID" : "ADULT";
     doc["score"]      = score;
     doc["xp"]         = xp;
     doc["totalScans"] = totalScans;
+    doc["slicesWon"]  = slicesWonCount;
 
     JsonArray msnArr = doc["missions"].to<JsonArray>();
     for (int i = 0; i < NUM_MISSIONS; i++) {
@@ -3891,9 +4167,12 @@ bool loadPlayerState() {
 
     strlcpy(callsign, doc["callsign"] | "OPERATIVE", sizeof(callsign));
     if (isUnassignedCallsign(callsign)) defaultCallsignFromMac(callsign, sizeof(callsign));
+    strlcpy(playerFaction, doc["faction"] | "", sizeof(playerFaction));
+    kidMode = (strcasecmp(doc["mode"] | "ADULT", "KID") == 0);
     score      = doc["score"]      | 0;
     xp         = doc["xp"]          | 0;
     totalScans = doc["totalScans"]  | 0;
+    slicesWonCount = doc["slicesWon"] | 0;
 
     // Missions — restore unlock + in-progress step
     activeMissions = 0;
@@ -3969,6 +4248,7 @@ void loadCommsFromSD() {
         strlcpy(c.subject, m["subject"] | "", sizeof(c.subject));
         strlcpy(c.body, m["body"] | "", sizeof(c.body));
         strlcpy(c.trigger, m["trigger"] | "manual", sizeof(c.trigger));
+        strlcpy(c.faction, m["faction"] | "", sizeof(c.faction));
         c.loaded = true;
         c.delivered = false;
         c.read = false;
@@ -3985,6 +4265,9 @@ void loadCommsFromSD() {
 void triggerComms(const char *trigger) {
     for (int i = 0; i < commPoolCount; i++) {
         if (commPool[i].delivered) continue;
+        // Faction-tagged comms only reach players of that faction
+        if (commPool[i].faction[0] &&
+            strcasecmp(commPool[i].faction, playerFaction) != 0) continue;
         if (strcmp(commPool[i].trigger, trigger) == 0) {
             commPool[i].delivered = true;
             // Restore read flag from persisted player state
@@ -4045,8 +4328,12 @@ void onMeshMsg(const swts::MeshHeader *hdr, const uint8_t *payload, int len) {
         case swts::MSG_COMM: {
             if (len < (int)sizeof(swts::MeshComm)) return;
             const swts::MeshComm *c = (const swts::MeshComm *)payload;
-            // Check if targeted at us or broadcast
-            if (strlen(c->target) > 0 && strcmp(c->target, swts::myId) != 0) return;
+            // Targeting: "" = broadcast, "@FACTION" = faction-wide, else one callsign
+            if (c->target[0] == '@') {
+                if (strcasecmp(c->target + 1, playerFaction) != 0) return;
+            } else if (c->target[0] != '\0' && strcmp(c->target, swts::myId) != 0) {
+                return;
+            }
             extern void addComm(const char *id, const char *from, const char *subject, const char *body);
             addComm(c->comm_id, c->from, c->subject, c->body);
             S.printf("[MESH] Comm received: %s\n", c->subject);
@@ -4180,6 +4467,11 @@ void onMeshMsg(const swts::MeshHeader *hdr, const uint8_t *payload, int len) {
         case swts::MSG_EVENT: {
             if (len < (int)sizeof(swts::MeshEvent)) return;
             const swts::MeshEvent *e = (const swts::MeshEvent *)payload;
+            // Faction-scoped events only reach players of that faction
+            if (e->faction[0] && strcasecmp(e->faction, playerFaction) != 0) {
+                S.printf("[MESH] Event %s is for %s — ignored\n", e->event_id, e->faction);
+                return;
+            }
             S.printf("[MESH] Event: %s (sev %d)\n", e->event_name, e->severity);
             // Queued, not handled inline: this callback can run on the WiFi task.
             // loop() drains the queue → fires comms + advances mission steps.
@@ -4205,14 +4497,42 @@ void onMeshMsg(const swts::MeshHeader *hdr, const uint8_t *payload, int len) {
             playerLastSave = 0;
             // Send a fresh status with the new ID so the GM can drop the "OPERATIVE/DATAPAD-xxxx" entry
             unsigned long up = millis() / 1000;
-            swts::sendStatus(up, score, activeMissions, 0, totalScans, 0);
+            swts::sendStatus(up, score, activeMissions, completedMissionCount(), totalScans, slicesWonCount, playerFaction, kidMode, xp);
             break;
         }
         case swts::MSG_SYNC_REQUEST: {
             // GM is asking everyone to re-report their state.
             unsigned long up = millis() / 1000;
-            swts::sendStatus(up, score, activeMissions, 0, totalScans, 0);
+            swts::sendStatus(up, score, activeMissions, completedMissionCount(), totalScans, slicesWonCount, playerFaction, kidMode, xp);
             S.println("[MESH] Sync request — replied with status");
+            break;
+        }
+        case swts::MSG_PLAYER_MODE: {
+            // GM sets this player's difficulty mode (ADULT/KID)
+            if (len < (int)sizeof(swts::MeshPlayerMode)) return;
+            const swts::MeshPlayerMode *m = (const swts::MeshPlayerMode *)payload;
+            if (strcmp(m->target, swts::myId) != 0) return;
+            kidMode = (m->kid != 0);
+            playerDirty = true;
+            playerLastSave = 0;
+            S.printf("[MESH] Difficulty mode set: %s\n", kidMode ? "KID" : "ADULT");
+            showObjectiveToast("DIFFICULTY UPDATED", kidMode ? "KID MODE" : "ADULT MODE");
+            unsigned long up = millis() / 1000;
+            swts::sendStatus(up, score, activeMissions, completedMissionCount(), totalScans, slicesWonCount, playerFaction, kidMode, xp);
+            break;
+        }
+        case swts::MSG_FACTIONS: {
+            // GM broadcasts the scenario's faction roster
+            if (len < (int)sizeof(swts::MeshFactions)) return;
+            const swts::MeshFactions *f = (const swts::MeshFactions *)payload;
+            if (f->count == 0) return;
+            factionCount = 0;
+            for (int i = 0; i < f->count && i < MESH_MAX_FACTIONS; i++) {
+                if (!f->names[i][0]) continue;
+                strlcpy(factionList[factionCount++], f->names[i], sizeof(factionList[0]));
+            }
+            if (factionCount == 0) { strlcpy(factionList[0], "REBEL", 14); factionCount = 1; }
+            factionListDirty = true;
             break;
         }
         case swts::MSG_SCORE_SET: {
@@ -4612,7 +4932,17 @@ void setup() {
     buildSliceScreen();
     buildSimonScreen();
     buildPurgeScreen();
-    lv_scr_load(scrHome);
+    buildNameEntryScreen();
+    // Registration flow: fresh player cards ask for a name, then a faction.
+    // Fully-registered players go straight to the home screen.
+    if (isUnassignedCallsign(callsign)) {
+        lv_scr_load(scrNameEntry);
+    } else if (!playerFaction[0]) {
+        lv_scr_load(scrHome);
+        showFactionPick();
+    } else {
+        lv_scr_load(scrHome);
+    }
 
     // ── ESPNOW Mesh ──
     // WiFi must be in STA mode for ESPNOW (it already is after our scan)
@@ -4714,6 +5044,12 @@ void loop() {
     // Game events (mesh + prop responses): fire comms, advance mission steps
     processGameEvents();
 
+    // GM sent a new faction roster while the pick screen is up -- rebuild it
+    if (factionListDirty) {
+        factionListDirty = false;
+        if (scrFactionPick && lv_scr_act() == scrFactionPick) showFactionPick();
+    }
+
     // Endgame debrief — small delay so the final objective feedback is seen first
     static unsigned long debriefAt = 0;
     if (debriefPending) { debriefPending = false; debriefAt = millis() + 2500; }
@@ -4783,7 +5119,7 @@ void loop() {
                  (unsigned)freeHeap, (unsigned)heapMinEver, (unsigned)freePsram);
 
         // Tell GM we're alive + send full status
-        swts::sendStatus(up, score, activeMissions, 0, totalScans, 0);
+        swts::sendStatus(up, score, activeMissions, completedMissionCount(), totalScans, slicesWonCount, playerFaction, kidMode, xp);
     }
 
     delay(5);

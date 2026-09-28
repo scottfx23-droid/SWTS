@@ -10,6 +10,7 @@
     "id": "GM-1",
     "role": "gamemaster"
   },
+  "factions": ["REBEL", "IMPERIAL"],
   "game": {
     "max_score": 1000,
     "event_duration_min": 30,
@@ -59,7 +60,15 @@
       "id": "extraction_inbound",
       "name": "EXTRACTION INBOUND",
       "severity": 0,
-      "description": "Lambda shuttle inbound for pickup. All operatives complete current objectives and report in."
+      "description": "Lambda shuttle inbound for pickup. All operatives complete current objectives and report in.",
+      "faction": "REBEL"
+    },
+    {
+      "id": "isb_crackdown",
+      "name": "ISB CRACKDOWN",
+      "severity": 2,
+      "description": "ISB authorizes force. All Imperial agents move on known rebel positions immediately.",
+      "faction": "IMPERIAL"
     }
   ],
   "comms": [
@@ -79,13 +88,22 @@
       "id": "gm_extraction_brief",
       "from": "ALLIANCE COMMAND",
       "subject": "EXTRACTION DETAILS",
-      "body": "Once R5 has the intel, regroup at the cafe for pickup. Lambda shuttle ETA 10 minutes."
+      "body": "Once R5 has the intel, regroup at the cafe for pickup. Lambda shuttle ETA 10 minutes.",
+      "faction": "REBEL"
     },
     {
       "id": "gm_well_done",
       "from": "ALLIANCE COMMAND",
       "subject": "FIELD COMMENDATION",
-      "body": "Outstanding work, operative. Mission objectives complete. Your service is logged."
+      "body": "Outstanding work, operative. Mission objectives complete. Your service is logged.",
+      "faction": "REBEL"
+    },
+    {
+      "id": "gm_imperial_orders",
+      "from": "ISB COMMAND",
+      "subject": "PRIORITY DIRECTIVE",
+      "body": "Agents: rebel sympathizers are operating inside the cantina. Increase surveillance and report all datacard traffic to ISB immediately.",
+      "faction": "IMPERIAL"
     }
   ],
   "bounties": [

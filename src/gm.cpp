@@ -164,11 +164,67 @@ struct TrackedDevice {
     int scans;
     int slicesWon;
     bool active;
+    char faction[14];   // from MSG_STATUS ("" = not chosen / not a datapad)
+    bool kid;           // difficulty mode (GM-toggled, confirmed via MSG_STATUS)
+    int  xp;            // experience points (from MSG_STATUS)
+    int  missionsDone;  // completed missions (from MSG_STATUS)
 };
 
 #define MAX_DEVICES 32
 TrackedDevice trackedDevs[MAX_DEVICES];
 int deviceCount = 0;
+
+// ═══════════════════════════════════════════════
+//  PER-PLAYER INTERACTION LOG (gameplay analytics)
+//  Everything a datapad reports — scans, minigame results, mission
+//  progress, events — is kept in a small ring buffer per player and
+//  shown in the player detail view.
+// ═══════════════════════════════════════════════
+#define PLOG_ENTRIES 14
+#define MAX_PLOGS    16
+struct PlayerLogEntry { char text[56]; unsigned long when; };
+struct PlayerLog {
+    char id[16];
+    PlayerLogEntry e[PLOG_ENTRIES];
+    uint8_t head;    // next write slot
+    uint8_t count;
+};
+PlayerLog playerLogs[MAX_PLOGS];
+int playerLogCount = 0;
+
+PlayerLog* plogFind(const char *id, bool add) {
+    for (int i = 0; i < playerLogCount; i++)
+        if (strcmp(playerLogs[i].id, id) == 0) return &playerLogs[i];
+    if (!add || playerLogCount >= MAX_PLOGS) return nullptr;
+    PlayerLog &p = playerLogs[playerLogCount++];
+    memset(&p, 0, sizeof(p));
+    strlcpy(p.id, id, sizeof(p.id));
+    return &p;
+}
+
+void plogAdd(const char *id, const char *text) {
+    PlayerLog *p = plogFind(id, true);
+    if (!p) return;
+    PlayerLogEntry &en = p->e[p->head];
+    strlcpy(en.text, text, sizeof(en.text));
+    en.when = millis();
+    p->head = (p->head + 1) % PLOG_ENTRIES;
+    if (p->count < PLOG_ENTRIES) p->count++;
+}
+
+// Rename-safe: when the GM assigns a new callsign, carry the log over
+void plogRename(const char *oldId, const char *newId) {
+    PlayerLog *p = plogFind(oldId, false);
+    if (p) strlcpy(p->id, newId, sizeof(p->id));
+}
+
+// "12s" / "4m" / "1h07" — relative age for log rows
+void fmtAgo(unsigned long when, char *out, size_t outSz) {
+    unsigned long s = (millis() - when) / 1000;
+    if (s < 60)        snprintf(out, outSz, "%lus", s);
+    else if (s < 3600) snprintf(out, outSz, "%lum", s / 60);
+    else               snprintf(out, outSz, "%luh%02lu", s / 3600, (s / 60) % 60);
+}
 
 // Activity log — recent events for dashboard feed
 #define MAX_ACTIVITY 12
@@ -212,13 +268,17 @@ struct GmConfig {
     char planet[24]   = "Tatooine";
     char gm_id[16]    = "GM-1";
     int  max_score    = 1000;
+    // Faction roster — broadcast to datapads for the allegiance pick screen.
+    // Overridden by gm_config.json "factions"; defaults for testing.
+    char factions[MESH_MAX_FACTIONS][14] = { "REBEL", "IMPERIAL" };
+    int  factionCount = 2;
 };
 GmConfig gmConfig;
 
 #define MAX_TEMPLATES 16
 #define MAX_CLUES 5
-struct EventTemplate { char id[24]; char name[40]; uint8_t severity; char description[80]; };
-struct CommTemplate  { char id[24]; char from[24]; char subject[40]; char body[120]; };
+struct EventTemplate { char id[24]; char name[40]; uint8_t severity; char description[80]; char faction[14]; };
+struct CommTemplate  { char id[24]; char from[24]; char subject[40]; char body[120]; char faction[14]; };
 struct BountyTemplate{
     char id[24];
     char target_name[24];
@@ -253,6 +313,17 @@ bool loadGmConfig() {
     strlcpy(gmConfig.gm_id,    doc["device"]["id"] | "GM-1", sizeof(gmConfig.gm_id));
     gmConfig.max_score = doc["game"]["max_score"] | 1000;
 
+    // Faction roster (keeps REBEL/IMPERIAL defaults when absent)
+    JsonArray fac = doc["factions"].as<JsonArray>();
+    if (!fac.isNull() && fac.size() > 0) {
+        gmConfig.factionCount = 0;
+        for (const char *fn : fac) {
+            if (gmConfig.factionCount >= MESH_MAX_FACTIONS) break;
+            if (fn && fn[0])
+                strlcpy(gmConfig.factions[gmConfig.factionCount++], fn, sizeof(gmConfig.factions[0]));
+        }
+    }
+
     eventCount = 0;
     for (JsonObject e : doc["events"].as<JsonArray>()) {
         if (eventCount >= MAX_TEMPLATES) break;
@@ -261,6 +332,7 @@ bool loadGmConfig() {
         strlcpy(t.name, e["name"] | "", sizeof(t.name));
         t.severity = e["severity"] | 1;
         strlcpy(t.description, e["description"] | "", sizeof(t.description));
+        strlcpy(t.faction, e["faction"] | "", sizeof(t.faction));
     }
     commCount = 0;
     for (JsonObject c : doc["comms"].as<JsonArray>()) {
@@ -270,6 +342,7 @@ bool loadGmConfig() {
         strlcpy(t.from, c["from"] | "GM", sizeof(t.from));
         strlcpy(t.subject, c["subject"] | "", sizeof(t.subject));
         strlcpy(t.body, c["body"] | "", sizeof(t.body));
+        strlcpy(t.faction, c["faction"] | "", sizeof(t.faction));
     }
     bountyCount = 0;
     for (JsonObject b : doc["bounties"].as<JsonArray>()) {
@@ -322,6 +395,10 @@ bool saveGmState() {
     JsonArray d = doc["devices"].to<JsonArray>();
     for (int i = 0; i < deviceCount; i++) {
         TrackedDevice &td = trackedDevs[i];
+        // Only persist devices actually heard this session — a restored
+        // snapshot entry that never re-appeared would otherwise haunt the
+        // roster forever (ghost players from old scenarios/callsigns).
+        if (td.lastHeard == 0) continue;
         JsonObject o = d.add<JsonObject>();
         o["id"]        = td.id;
         o["role"]      = td.role;
@@ -329,6 +406,10 @@ bool saveGmState() {
         o["scans"]     = td.scans;
         o["slicesWon"] = td.slicesWon;
         o["activeMsn"] = td.activeMsn;
+        o["faction"]   = td.faction;
+        o["kid"]       = td.kid;
+        o["xp"]        = td.xp;
+        o["msnDone"]   = td.missionsDone;
     }
 
     serializeJson(doc, f);
@@ -371,6 +452,10 @@ bool loadGmState() {
         td.scans     = o["scans"]     | 0;
         td.slicesWon = o["slicesWon"] | 0;
         td.activeMsn = o["activeMsn"] | 0;
+        strlcpy(td.faction, o["faction"] | "", sizeof(td.faction));
+        td.kid = o["kid"] | false;
+        td.xp = o["xp"] | 0;
+        td.missionsDone = o["msnDone"] | 0;
         td.lastHeard = 0;
         td.active    = false;
         deviceCount++;
@@ -407,8 +492,12 @@ void onMeshMsg(const swts::MeshHeader *hdr, const uint8_t *payload, int len) {
         const swts::MeshStatus *s = (const swts::MeshStatus *)payload;
         d->score = s->score;
         d->activeMsn = s->mission_active;
+        d->missionsDone = s->mission_complete;
         d->scans = s->scans;
         d->slicesWon = s->slices_won;
+        d->xp = s->xp;
+        strlcpy(d->faction, s->faction, sizeof(d->faction));
+        d->kid = (s->kid != 0);
         gmDirty = true;
     }
     else if (hdr->type == swts::MSG_SCORE && len >= (int)sizeof(swts::MeshScore)) {
@@ -416,18 +505,39 @@ void onMeshMsg(const swts::MeshHeader *hdr, const uint8_t *payload, int len) {
         d->score = s->new_score;
         snprintf(log, sizeof(log), "%s scored %+d (%s)", hdr->from_id, s->delta, s->reason);
         logActivity(log, 1);
+        snprintf(log, sizeof(log), "%+d  %s", s->delta, s->reason);
+        plogAdd(hdr->from_id, log);
         gmDirty = true;
     }
     else if (hdr->type == swts::MSG_NFC_SCAN && len >= (int)sizeof(swts::MeshNfcScan)) {
         const swts::MeshNfcScan *n = (const swts::MeshNfcScan *)payload;
         snprintf(log, sizeof(log), "%s scanned %s", hdr->from_id, n->tag_name);
         logActivity(log, 2);
+        // Terminals report scans too — log those under the terminal's id
+        snprintf(log, sizeof(log), "Scanned %s [%s]", n->tag_id, n->category);
+        plogAdd(hdr->from_id, log);
     }
     else if (hdr->type == swts::MSG_SLICE_RESULT && len >= (int)sizeof(swts::MeshSliceResult)) {
         const swts::MeshSliceResult *r = (const swts::MeshSliceResult *)payload;
         snprintf(log, sizeof(log), "%s %s slice on %s", hdr->from_id, r->won ? "WON" : "FAILED", r->panel_id);
         logActivity(log, 3);
+        snprintf(log, sizeof(log), "%s minigame @ %s", r->won ? "WON" : "LOST", r->panel_id);
+        plogAdd(hdr->from_id, log);
         if (r->won) { d->slicesWon++; gmDirty = true; }
+    }
+    else if (hdr->type == swts::MSG_EVENT && len >= (int)sizeof(swts::MeshEvent)) {
+        // Prop-originated game events (panel_sliced, droid_handoff, extraction,
+        // game_complete, ...) carry the acting player's callsign in payload.
+        const swts::MeshEvent *e = (const swts::MeshEvent *)payload;
+        snprintf(log, sizeof(log), "%s: %s", hdr->from_id, e->event_id);
+        logActivity(log, 0);
+        for (int i = 0; i < deviceCount; i++) {
+            if (trackedDevs[i].role != swts::ROLE_DATAPAD) continue;
+            if (strcmp(trackedDevs[i].id, e->payload) != 0) continue;
+            snprintf(log, sizeof(log), "%s @ %s", e->event_id, hdr->from_id);
+            plogAdd(e->payload, log);
+            break;
+        }
     }
 }
 
@@ -475,17 +585,22 @@ lv_obj_t *statusLabel = nullptr;
 
 static void ev_trigger_event(lv_event_t *e) {
     EventTemplate *t = (EventTemplate *)lv_event_get_user_data(e);
-    swts::gmTriggerEvent(t->id, t->name, t->severity, t->description);
-    char log[80]; snprintf(log, sizeof(log), "EVENT: %s broadcast", t->name);
+    swts::gmTriggerEvent(t->id, t->name, t->severity, t->description, t->faction);
+    char log[80];
+    snprintf(log, sizeof(log), "EVENT: %s -> %s", t->name, t->faction[0] ? t->faction : "ALL");
     logActivity(log, 0);
-    S.printf("[GM] Event: %s\n", t->name);
+    S.printf("[GM] Event: %s (faction=%s)\n", t->name, t->faction[0] ? t->faction : "ALL");
 }
 static void ev_push_comm(lv_event_t *e) {
     CommTemplate *t = (CommTemplate *)lv_event_get_user_data(e);
-    swts::gmPushComm(t->id, "", t->from, t->subject, t->body);
-    char log[80]; snprintf(log, sizeof(log), "COMM sent: %s", t->subject);
+    // Faction-tagged templates target "@FACTION"; untagged go to everyone
+    char target[16] = "";
+    if (t->faction[0]) snprintf(target, sizeof(target), "@%s", t->faction);
+    swts::gmPushComm(t->id, target, t->from, t->subject, t->body);
+    char log[80];
+    snprintf(log, sizeof(log), "COMM sent: %s -> %s", t->subject, t->faction[0] ? t->faction : "ALL");
     logActivity(log, 4);
-    S.printf("[GM] Comm: %s\n", t->subject);
+    S.printf("[GM] Comm: %s -> %s\n", t->subject, t->faction[0] ? t->faction : "ALL");
 }
 // Forward decls for bounty detail modal
 void openBountyDetail(BountyTemplate *t);
@@ -620,11 +735,13 @@ void refreshDashboard() {
              gmConfig.scenario, gmConfig.planet, onD, onP, up/3600, (up/60)%60, up%60);
     lv_label_set_text(dashStats, sb);
 
-    // Top 3 leaderboard
+    // Top 3 leaderboard — only devices heard this session (snapshot-restored
+    // entries stay hidden until they ping)
     lv_obj_clean(dashTop3);
     int idx[MAX_DEVICES]; int n = 0;
     for (int i = 0; i < deviceCount; i++)
-        if (trackedDevs[i].role == swts::ROLE_DATAPAD) idx[n++] = i;
+        if (trackedDevs[i].role == swts::ROLE_DATAPAD && trackedDevs[i].lastHeard != 0)
+            idx[n++] = i;
     for (int i = 0; i < n - 1; i++)
         for (int j = i + 1; j < n; j++)
             if (trackedDevs[idx[i]].score < trackedDevs[idx[j]].score) {
@@ -676,6 +793,7 @@ void refreshDashboard() {
     int pn = 0;
     for (int i = 0; i < deviceCount; i++) {
         if (trackedDevs[i].role != swts::ROLE_PANEL) continue;
+        if (trackedDevs[i].lastHeard == 0) continue;   // not heard this session
         TrackedDevice &d = trackedDevs[i];
         bool stale = (millis() - d.lastHeard > 30000);
         lv_obj_t *pill = lv_obj_create(dashPanelsRow);
@@ -1131,6 +1249,13 @@ void buildEventsTab(lv_obj_t *tab) {
         lv_obj_set_style_text_color(sev, accent, 0);
         lv_obj_set_style_text_font(sev, &lv_font_montserrat_12, 0);
         lv_obj_set_pos(sev, 10, 78);
+
+        // Faction scope chip (bottom-right): faction name, or ALL
+        lv_obj_t *fac = lv_label_create(btn);
+        lv_label_set_text(fac, t->faction[0] ? t->faction : "ALL");
+        lv_obj_set_style_text_color(fac, t->faction[0] ? C_GRN : C_DIM, 0);
+        lv_obj_set_style_text_font(fac, &lv_font_montserrat_12, 0);
+        lv_obj_align(fac, LV_ALIGN_BOTTOM_RIGHT, -10, -6);
     }
 }
 
@@ -1180,6 +1305,10 @@ static void refreshComposeTarget() {
     if (composeTargetId[0] == '\0') {
         lv_label_set_text(composeTargetLbl, "TO: ALL OPERATIVES");
         lv_obj_set_style_text_color(composeTargetLbl, C_CYN_BRT, 0);
+    } else if (composeTargetId[0] == '@') {
+        char b[40]; snprintf(b, sizeof(b), "TO: %s (FACTION)", composeTargetId + 1);
+        lv_label_set_text(composeTargetLbl, b);
+        lv_obj_set_style_text_color(composeTargetLbl, C_GRN, 0);
     } else {
         char b[40]; snprintf(b, sizeof(b), "TO: %s", composeTargetId);
         lv_label_set_text(composeTargetLbl, b);
@@ -1188,20 +1317,43 @@ static void refreshComposeTarget() {
 }
 
 static void ev_target_cycle(lv_event_t *e) {
-    // Cycle through: broadcast → each online datapad → back to broadcast
-    int cur = -1;   // -1 = broadcast
+    // Cycle: broadcast → each faction → each online datapad → back to broadcast
+    if (composeTargetId[0] == '\0') {
+        // Broadcast → first faction
+        if (gmConfig.factionCount > 0) {
+            snprintf(composeTargetId, sizeof(composeTargetId), "@%s", gmConfig.factions[0]);
+            refreshComposeTarget();
+            return;
+        }
+        // no factions configured — fall through to datapads below with cur = -1
+    }
+
+    if (composeTargetId[0] == '@') {
+        // Faction → next faction, or first datapad
+        int cf = -1;
+        for (int f = 0; f < gmConfig.factionCount; f++)
+            if (strcasecmp(composeTargetId + 1, gmConfig.factions[f]) == 0) { cf = f; break; }
+        if (cf >= 0 && cf + 1 < gmConfig.factionCount) {
+            snprintf(composeTargetId, sizeof(composeTargetId), "@%s", gmConfig.factions[cf + 1]);
+            refreshComposeTarget();
+            return;
+        }
+        composeTargetId[0] = '\0';   // fall through: first datapad (cur = -1)
+    }
+
+    int cur = -1;   // -1 = start of the datapad list
     if (composeTargetId[0] != '\0') {
         for (int i = 0; i < deviceCount; i++) {
             if (trackedDevs[i].role == swts::ROLE_DATAPAD &&
                 strcmp(trackedDevs[i].id, composeTargetId) == 0) { cur = i; break; }
         }
     }
-    // Find next datapad after cur
+    // Find next datapad heard this session after cur
     int next = -1;
     for (int i = cur + 1; i < deviceCount; i++) {
-        if (trackedDevs[i].role == swts::ROLE_DATAPAD) { next = i; break; }
+        if (trackedDevs[i].role == swts::ROLE_DATAPAD && trackedDevs[i].lastHeard != 0) { next = i; break; }
     }
-    if (next < 0) composeTargetId[0] = '\0';
+    if (next < 0) composeTargetId[0] = '\0';   // wrap to broadcast
     else strlcpy(composeTargetId, trackedDevs[next].id, sizeof(composeTargetId));
     refreshComposeTarget();
 }
@@ -1434,6 +1586,7 @@ static void ev_assign_send(lv_event_t *e) {
             break;
         }
     }
+    plogRename(assignTargetId, name);   // carry the interaction log over
     char log[80]; snprintf(log, sizeof(log), "ASSIGNED: %s -> %s", assignTargetId, name);
     logActivity(log, 5);
     gmDirty = true;
@@ -1606,6 +1759,13 @@ void buildCommsTab(lv_obj_t *tab) {
         lv_obj_set_style_text_font(body, &lv_font_montserrat_12, 0);
         lv_obj_set_width(body, lv_pct(90));
         lv_obj_set_pos(body, 10, 46);
+
+        // Faction scope chip (top-right): faction name, or ALL
+        lv_obj_t *fac = lv_label_create(btn);
+        lv_label_set_text(fac, t->faction[0] ? t->faction : "ALL");
+        lv_obj_set_style_text_color(fac, t->faction[0] ? C_GRN : C_DIM, 0);
+        lv_obj_set_style_text_font(fac, &lv_font_montserrat_12, 0);
+        lv_obj_align(fac, LV_ALIGN_TOP_RIGHT, -10, 4);
     }
 }
 
@@ -1730,6 +1890,12 @@ void buildPlayersTab(lv_obj_t *tab) {
     lv_obj_set_style_text_font(unassignedBtnLbl, &lv_font_montserrat_18, 0);
     lv_obj_center(unassignedBtnLbl);
 
+    lv_obj_t *modeHint = lv_label_create(tab);
+    lv_label_set_text(modeHint, "tap a player for full stats,\ninteraction log & difficulty");
+    lv_obj_set_style_text_color(modeHint, C_DIM, 0);
+    lv_obj_set_style_text_font(modeHint, &lv_font_montserrat_14, 0);
+    lv_obj_set_pos(modeHint, 490, 4);
+
     // ── Leaderboard list (visible by default) ──
     playerList = lv_obj_create(tab);
     lv_obj_set_size(playerList, lv_pct(100), 320);
@@ -1750,6 +1916,125 @@ void buildPlayersTab(lv_obj_t *tab) {
     lv_obj_add_flag(unassignedList, LV_OBJ_FLAG_HIDDEN);
 }
 
+// ═══════════════════════════════════════════════
+//  FACTIONS TAB — per-faction totals and progress
+// ═══════════════════════════════════════════════
+lv_obj_t *factionList = NULL;
+
+void buildFactionsTab(lv_obj_t *tab) {
+    lv_obj_set_style_bg_color(tab, C_BG, 0);
+    lv_obj_set_style_pad_all(tab, 16, 0);
+
+    lv_obj_t *title = lv_label_create(tab);
+    lv_label_set_text(title, "FACTION STANDINGS");
+    lv_obj_set_style_text_color(title, C_AMB_BRT, 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_28, 0);
+
+    factionList = lv_obj_create(tab);
+    lv_obj_set_size(factionList, lv_pct(100), 330);
+    lv_obj_set_pos(factionList, 0, 44);
+    lv_obj_set_flex_flow(factionList, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_bg_opa(factionList, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(factionList, 0, 0);
+    lv_obj_set_style_pad_all(factionList, 0, 0);
+    lv_obj_set_style_pad_row(factionList, 10, 0);
+}
+
+void refreshFactionsTab() {
+    if (!factionList) return;
+    lv_obj_clean(factionList);
+    lv_color_t facCols[] = {C_AMB_BRT, C_CYN_BRT, C_GRN, C_RED, C_PURPLE, C_WHITE};
+    int goal = gmConfig.max_score > 0 ? gmConfig.max_score : 1000;
+    int unaffiliated = 0;
+
+    for (int f = 0; f < gmConfig.factionCount; f++) {
+        int members = 0, online = 0, slices = 0, scans = 0, msns = 0;
+        long total = 0;
+        for (int i = 0; i < deviceCount; i++) {
+            TrackedDevice &d = trackedDevs[i];
+            if (d.role != swts::ROLE_DATAPAD || d.lastHeard == 0) continue;
+            if (strcasecmp(d.faction, gmConfig.factions[f]) != 0) continue;
+            members++;
+            total  += d.score;
+            slices += d.slicesWon;
+            scans  += d.scans;
+            msns   += d.activeMsn;
+            if (millis() - d.lastHeard < 30000) online++;
+        }
+
+        lv_color_t col = facCols[f % 6];
+        lv_obj_t *card = lv_obj_create(factionList);
+        lv_obj_set_size(card, lv_pct(100), 96);
+        lv_obj_set_style_bg_color(card, C_PNL, 0);
+        lv_obj_set_style_border_color(card, col, 0);
+        lv_obj_set_style_border_side(card, LV_BORDER_SIDE_LEFT, 0);
+        lv_obj_set_style_border_width(card, 4, 0);
+        lv_obj_set_style_radius(card, 2, 0);
+        lv_obj_set_style_pad_all(card, 10, 0);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *n = lv_label_create(card);
+        lv_label_set_text(n, gmConfig.factions[f]);
+        lv_obj_set_style_text_color(n, col, 0);
+        lv_obj_set_style_text_font(n, &lv_font_montserrat_24, 0);
+        lv_obj_set_pos(n, 4, 0);
+
+        char sb[24];
+        snprintf(sb, sizeof(sb), "%ld", total);
+        lv_obj_t *sc = lv_label_create(card);
+        lv_label_set_text(sc, sb);
+        lv_obj_set_style_text_color(sc, col, 0);
+        lv_obj_set_style_text_font(sc, &lv_font_montserrat_28, 0);
+        lv_obj_align(sc, LV_ALIGN_TOP_RIGHT, -6, 0);
+
+        char info[96];
+        snprintf(info, sizeof(info), "%d OPERATIVES (%d ONLINE)  /  MISSIONS %d  /  SLICES %d  /  SCANS %d",
+                 members, online, msns, slices, scans);
+        lv_obj_t *st = lv_label_create(card);
+        lv_label_set_text(st, info);
+        lv_obj_set_style_text_color(st, C_TXT, 0);
+        lv_obj_set_style_text_font(st, &lv_font_montserrat_14, 0);
+        lv_obj_set_pos(st, 4, 34);
+
+        // Progress toward the scenario's max_score goal
+        lv_obj_t *bar = lv_bar_create(card);
+        lv_obj_set_size(bar, lv_pct(96), 12);
+        lv_obj_set_pos(bar, 4, 60);
+        lv_obj_set_style_bg_color(bar, C_PNL2, 0);
+        lv_obj_set_style_bg_color(bar, col, LV_PART_INDICATOR);
+        int pct = (int)((total * 100) / goal);
+        if (pct > 100) pct = 100;
+        if (pct < 0) pct = 0;
+        lv_bar_set_value(bar, pct, LV_ANIM_OFF);
+
+        char pb[40];
+        snprintf(pb, sizeof(pb), "%d%% OF %d GOAL", pct, goal);
+        lv_obj_t *pl = lv_label_create(card);
+        lv_label_set_text(pl, pb);
+        lv_obj_set_style_text_color(pl, C_DIM, 0);
+        lv_obj_set_style_text_font(pl, &lv_font_montserrat_12, 0);
+        lv_obj_align(pl, LV_ALIGN_BOTTOM_RIGHT, -6, 0);
+    }
+
+    // Players who haven't declared yet
+    for (int i = 0; i < deviceCount; i++) {
+        TrackedDevice &d = trackedDevs[i];
+        if (d.role != swts::ROLE_DATAPAD || d.lastHeard == 0) continue;
+        bool known = false;
+        for (int f = 0; f < gmConfig.factionCount; f++)
+            if (strcasecmp(d.faction, gmConfig.factions[f]) == 0) { known = true; break; }
+        if (!known) unaffiliated++;
+    }
+    if (unaffiliated > 0) {
+        char ub[48];
+        snprintf(ub, sizeof(ub), "%d OPERATIVE(S) UNDECLARED", unaffiliated);
+        lv_obj_t *u = lv_label_create(factionList);
+        lv_label_set_text(u, ub);
+        lv_obj_set_style_text_color(u, C_DIM, 0);
+        lv_obj_set_style_text_font(u, &lv_font_montserrat_14, 0);
+    }
+}
+
 void buildPanelsTab(lv_obj_t *tab) {
     lv_obj_set_style_bg_color(tab, C_BG, 0);
     lv_obj_set_style_pad_all(tab, 16, 0);
@@ -1768,6 +2053,207 @@ void buildPanelsTab(lv_obj_t *tab) {
     lv_obj_set_style_pad_gap(panelList, 12, 0);
 }
 
+// Drop tracked datapads that still carry a placeholder name (OPERATIVE /
+// DATAPAD-xxxx) and have gone quiet — they are pre-rename identities or
+// stale snapshot entries, never real named players. Named players are kept
+// even when offline so a dead battery doesn't erase their score.
+void pruneStaleUnassigned() {
+    int w = 0;
+    bool removed = false;
+    for (int i = 0; i < deviceCount; i++) {
+        TrackedDevice &d = trackedDevs[i];
+        bool placeholder = (d.role == swts::ROLE_DATAPAD) && gmIsUnassignedCallsign(d.id);
+        bool quiet = (d.lastHeard == 0) || (millis() - d.lastHeard > 60000);
+        if (placeholder && quiet) {
+            S.printf("[GM] Pruned stale unassigned device: %s\n", d.id);
+            removed = true;
+            continue;
+        }
+        if (w != i) trackedDevs[w] = trackedDevs[i];
+        w++;
+    }
+    deviceCount = w;
+    if (removed) gmDirty = true;   // persist the cleaned roster
+}
+
+// ═══════════════════════════════════════════════
+//  PLAYER DETAIL MODAL — full stats + interaction log for one player
+//  Opened by tapping a player card. Refreshed by the 2s UI tick.
+// ═══════════════════════════════════════════════
+lv_obj_t *playerModal = nullptr;
+lv_obj_t *playerModalStats = nullptr;   // dynamic: stat lines
+lv_obj_t *playerModalLog = nullptr;     // dynamic: interaction list
+lv_obj_t *playerModalModeLbl = nullptr; // toggle button label
+char playerModalId[16] = "";
+
+TrackedDevice* findDeviceById(const char *id) {
+    for (int i = 0; i < deviceCount; i++)
+        if (strcmp(trackedDevs[i].id, id) == 0) return &trackedDevs[i];
+    return nullptr;
+}
+
+static void closePlayerModal(lv_event_t *e) {
+    if (playerModal) {
+        lv_obj_del(playerModal);
+        playerModal = nullptr;
+        playerModalStats = nullptr;
+        playerModalLog = nullptr;
+        playerModalModeLbl = nullptr;
+        playerModalId[0] = '\0';
+    }
+}
+
+// Flip ADULT/KID for the player shown in the modal. Optimistic — the
+// datapad echoes the mode back in its next status.
+static void ev_modal_toggle_mode(lv_event_t *e) {
+    TrackedDevice *d = findDeviceById(playerModalId);
+    if (!d || d->role != swts::ROLE_DATAPAD) return;
+    d->kid = !d->kid;
+    swts::gmSetPlayerMode(d->id, d->kid);
+    if (playerModalModeLbl)
+        lv_label_set_text(playerModalModeLbl, d->kid ? "SET ADULT" : "SET KID");
+    char log[80];
+    snprintf(log, sizeof(log), "%s difficulty -> %s", d->id, d->kid ? "KID" : "ADULT");
+    logActivity(log, 5);
+    plogAdd(d->id, d->kid ? "GM set KID mode" : "GM set ADULT mode");
+    gmDirty = true;
+}
+
+// Rebuild only the dynamic parts (stats + log) so the buttons stay put
+void refreshPlayerDetail() {
+    if (!playerModal || !playerModalStats || !playerModalLog) return;
+    TrackedDevice *d = findDeviceById(playerModalId);
+    if (!d) { closePlayerModal(nullptr); return; }
+
+    lv_obj_clean(playerModalStats);
+    lv_obj_clean(playerModalLog);
+
+    bool online = (millis() - d->lastHeard < 30000) && d->lastHeard != 0;
+    char ago[12];
+    if (d->lastHeard) fmtAgo(d->lastHeard, ago, sizeof(ago));
+    else strlcpy(ago, "never", sizeof(ago));
+
+    char line1[128], line2[128];
+    snprintf(line1, sizeof(line1), "%s   /   %s   /   %s   /   last seen %s ago",
+             d->faction[0] ? d->faction : "NO FACTION",
+             d->kid ? "KID" : "ADULT",
+             online ? "ONLINE" : "OFFLINE", ago);
+    lv_obj_t *l1 = lv_label_create(playerModalStats);
+    lv_label_set_text(l1, line1);
+    lv_obj_set_style_text_color(l1, online ? C_GRN : C_RED, 0);
+    lv_obj_set_style_text_font(l1, &lv_font_montserrat_14, 0);
+    lv_obj_set_pos(l1, 0, 0);
+
+    snprintf(line2, sizeof(line2),
+             "SCORE %d      XP %d      MISSIONS %d DONE / %d ACTIVE      SCANS %d      MINIGAMES WON %d",
+             d->score, d->xp, d->missionsDone, d->activeMsn, d->scans, d->slicesWon);
+    lv_obj_t *l2 = lv_label_create(playerModalStats);
+    lv_label_set_text(l2, line2);
+    lv_obj_set_style_text_color(l2, C_AMB_BRT, 0);
+    lv_obj_set_style_text_font(l2, &lv_font_montserrat_16, 0);
+    lv_obj_set_pos(l2, 0, 24);
+
+    // Interaction log — newest first
+    PlayerLog *p = plogFind(playerModalId, false);
+    if (!p || p->count == 0) {
+        lv_obj_t *empty = lv_label_create(playerModalLog);
+        lv_label_set_text(empty, "(no interactions logged yet this session)");
+        lv_obj_set_style_text_color(empty, C_DIM, 0);
+        lv_obj_set_style_text_font(empty, &lv_font_montserrat_14, 0);
+        return;
+    }
+    for (int k = 0; k < p->count; k++) {
+        int idx = (p->head - 1 - k + PLOG_ENTRIES * 2) % PLOG_ENTRIES;
+        PlayerLogEntry &en = p->e[idx];
+        char row[80], when[12];
+        fmtAgo(en.when, when, sizeof(when));
+        snprintf(row, sizeof(row), "%-6s %s", when, en.text);
+        lv_obj_t *r = lv_label_create(playerModalLog);
+        lv_label_set_text(r, row);
+        lv_obj_set_style_text_color(r, k == 0 ? C_WHITE : C_TXT, 0);
+        lv_obj_set_style_text_font(r, &lv_font_montserrat_14, 0);
+    }
+}
+
+static void ev_open_player_detail(lv_event_t *e) {
+    TrackedDevice *d = (TrackedDevice *)lv_event_get_user_data(e);
+    if (!d || d->role != swts::ROLE_DATAPAD || playerModal) return;
+    strlcpy(playerModalId, d->id, sizeof(playerModalId));
+
+    playerModal = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(playerModal, lv_pct(100), lv_pct(100));
+    lv_obj_set_pos(playerModal, 0, 0);
+    lv_obj_set_style_bg_color(playerModal, C_BG, 0);
+    lv_obj_set_style_bg_opa(playerModal, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(playerModal, 0, 0);
+    lv_obj_set_style_pad_all(playerModal, 16, 0);
+    lv_obj_clear_flag(playerModal, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_move_foreground(playerModal);
+
+    lv_obj_t *title = lv_label_create(playerModal);
+    lv_label_set_text(title, d->id);
+    lv_obj_set_style_text_color(title, C_AMB_BRT, 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_28, 0);
+    lv_obj_set_pos(title, 0, 0);
+
+    // CLOSE (top-right)
+    lv_obj_t *closeBtn = lv_btn_create(playerModal);
+    lv_obj_set_size(closeBtn, 90, 40);
+    lv_obj_align(closeBtn, LV_ALIGN_TOP_RIGHT, 0, 0);
+    lv_obj_set_style_bg_color(closeBtn, C_PNL2, 0);
+    lv_obj_set_style_border_color(closeBtn, C_DIM, 0);
+    lv_obj_set_style_border_width(closeBtn, 1, 0);
+    lv_obj_add_event_cb(closeBtn, closePlayerModal, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *cl = lv_label_create(closeBtn);
+    lv_label_set_text(cl, "CLOSE");
+    lv_obj_set_style_text_color(cl, C_TXT, 0);
+    lv_obj_set_style_text_font(cl, &lv_font_montserrat_14, 0);
+    lv_obj_center(cl);
+
+    // KID/ADULT toggle (next to close)
+    lv_obj_t *modeBtn = lv_btn_create(playerModal);
+    lv_obj_set_size(modeBtn, 140, 40);
+    lv_obj_align(modeBtn, LV_ALIGN_TOP_RIGHT, -100, 0);
+    lv_obj_set_style_bg_color(modeBtn, C_PNL, 0);
+    lv_obj_set_style_bg_color(modeBtn, C_PNL2, LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(modeBtn, C_GRN, 0);
+    lv_obj_set_style_border_width(modeBtn, 1, 0);
+    lv_obj_add_event_cb(modeBtn, ev_modal_toggle_mode, LV_EVENT_CLICKED, nullptr);
+    playerModalModeLbl = lv_label_create(modeBtn);
+    lv_label_set_text(playerModalModeLbl, d->kid ? "SET ADULT" : "SET KID");
+    lv_obj_set_style_text_color(playerModalModeLbl, C_GRN, 0);
+    lv_obj_set_style_text_font(playerModalModeLbl, &lv_font_montserrat_14, 0);
+    lv_obj_center(playerModalModeLbl);
+
+    // Dynamic stats block
+    playerModalStats = lv_obj_create(playerModal);
+    lv_obj_set_size(playerModalStats, lv_pct(100), 52);
+    lv_obj_set_pos(playerModalStats, 0, 46);
+    lv_obj_set_style_bg_opa(playerModalStats, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(playerModalStats, 0, 0);
+    lv_obj_set_style_pad_all(playerModalStats, 0, 0);
+    lv_obj_clear_flag(playerModalStats, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *lh = lv_label_create(playerModal);
+    lv_label_set_text(lh, "INTERACTION LOG");
+    lv_obj_set_style_text_color(lh, C_CYN_BRT, 0);
+    lv_obj_set_style_text_font(lh, &lv_font_montserrat_18, 0);
+    lv_obj_set_pos(lh, 0, 106);
+
+    playerModalLog = lv_obj_create(playerModal);
+    lv_obj_set_size(playerModalLog, lv_pct(100), 300);
+    lv_obj_set_pos(playerModalLog, 0, 132);
+    lv_obj_set_flex_flow(playerModalLog, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_bg_color(playerModalLog, C_PNL, 0);
+    lv_obj_set_style_bg_opa(playerModalLog, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(playerModalLog, C_FRM, 0);
+    lv_obj_set_style_border_width(playerModalLog, 1, 0);
+    lv_obj_set_style_pad_all(playerModalLog, 10, 0);
+    lv_obj_set_style_pad_row(playerModalLog, 4, 0);
+
+    refreshPlayerDetail();
+}
+
 void refreshLiveLists() {
     if (!playerList || !panelList || !unassignedList) return;
     lv_obj_clean(playerList);
@@ -1777,6 +2263,7 @@ void refreshLiveLists() {
     int idx[MAX_DEVICES], uidx[MAX_DEVICES], pidx[MAX_DEVICES];
     int playerN = 0, unN = 0, panelN = 0;
     for (int i = 0; i < deviceCount; i++) {
+        if (trackedDevs[i].lastHeard == 0) continue;   // not heard this session
         if (trackedDevs[i].role == swts::ROLE_DATAPAD) {
             if (gmIsUnassignedCallsign(trackedDevs[i].id)) uidx[unN++] = i;
             else                                            idx[playerN++] = i;
@@ -1818,19 +2305,31 @@ void refreshLiveLists() {
         lv_obj_set_style_text_font(r, &lv_font_montserrat_24, 0);
         lv_obj_set_pos(r, 10, 10);
 
+        // Tap card = open the player detail view (stats + interaction log)
+        lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(card, ev_open_player_detail, LV_EVENT_CLICKED, &trackedDevs[idx[rank]]);
+
         lv_obj_t *n = lv_label_create(card);
         lv_label_set_text(n, d.id);
         lv_obj_set_style_text_color(n, stale ? C_DIM : C_WHITE, 0);
         lv_obj_set_style_text_font(n, &lv_font_montserrat_20, 0);
         lv_obj_set_pos(n, 70, 4);
 
-        char info[64];
-        snprintf(info, sizeof(info), "Missions: %d  /  Scans: %d  /  Slices: %d", d.activeMsn, d.scans, d.slicesWon);
+        char info[96];
+        snprintf(info, sizeof(info), "%s  /  Missions: %d  /  Scans: %d  /  Slices: %d",
+                 d.faction[0] ? d.faction : "NO FACTION", d.activeMsn, d.scans, d.slicesWon);
         lv_obj_t *st = lv_label_create(card);
         lv_label_set_text(st, info);
         lv_obj_set_style_text_color(st, C_DIM, 0);
         lv_obj_set_style_text_font(st, &lv_font_montserrat_14, 0);
         lv_obj_set_pos(st, 70, 36);
+
+        // Difficulty badge — bright for KID so it's obvious at a glance
+        lv_obj_t *md = lv_label_create(card);
+        lv_label_set_text(md, d.kid ? "KID" : "ADULT");
+        lv_obj_set_style_text_color(md, d.kid ? C_GRN : C_DIM, 0);
+        lv_obj_set_style_text_font(md, &lv_font_montserrat_14, 0);
+        lv_obj_align(md, LV_ALIGN_RIGHT_MID, -110, 0);
 
         char sb[16]; snprintf(sb, sizeof(sb), "%d", d.score);
         lv_obj_t *sc = lv_label_create(card);
@@ -1932,21 +2431,24 @@ void buildUI() {
     lv_obj_t *scr = lv_scr_act();
     lv_obj_set_style_bg_color(scr, C_BG, 0);
 
-    // Header
+    // Slim header — just "GM" plus the live status line; the fat title bar
+    // is gone so the tabs get the vertical real estate.
+    const int HDR_H = 30;
     lv_obj_t *hdr = lv_obj_create(scr);
-    lv_obj_set_size(hdr, W, 56);
+    lv_obj_set_size(hdr, W, HDR_H);
     lv_obj_set_pos(hdr, 0, 0);
     lv_obj_set_style_bg_color(hdr, C_PNL, 0);
     lv_obj_set_style_border_color(hdr, C_AMB, 0);
     lv_obj_set_style_border_side(hdr, LV_BORDER_SIDE_BOTTOM, 0);
-    lv_obj_set_style_border_width(hdr, 2, 0);
+    lv_obj_set_style_border_width(hdr, 1, 0);
     lv_obj_set_style_radius(hdr, 0, 0);
+    lv_obj_set_style_pad_all(hdr, 0, 0);
     lv_obj_clear_flag(hdr, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *brand = lv_label_create(hdr);
-    lv_label_set_text(brand, "SWTS GM COMMAND");
+    lv_label_set_text(brand, "GM");
     lv_obj_set_style_text_color(brand, C_AMB_BRT, 0);
-    lv_obj_set_style_text_font(brand, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_font(brand, &lv_font_montserrat_18, 0);
     lv_obj_align(brand, LV_ALIGN_LEFT_MID, 16, 0);
 
     statusLabel = lv_label_create(hdr);
@@ -1957,24 +2459,25 @@ void buildUI() {
 
     // Tabs
     tabview = lv_tabview_create(scr, LV_DIR_TOP, 60);
-    lv_obj_set_size(tabview, W, H - 56);
-    lv_obj_set_pos(tabview, 0, 56);
+    lv_obj_set_size(tabview, W, H - HDR_H);
+    lv_obj_set_pos(tabview, 0, HDR_H);
     lv_obj_set_style_bg_color(tabview, C_BG, 0);
 
     lv_obj_t *btns = lv_tabview_get_tab_btns(tabview);
     lv_obj_set_style_bg_color(btns, C_PNL, 0);
     lv_obj_set_style_text_color(btns, C_TXT, 0);
-    lv_obj_set_style_text_font(btns, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_font(btns, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(btns, C_AMB_BRT, LV_PART_ITEMS | LV_STATE_CHECKED);
     lv_obj_set_style_border_color(btns, C_AMB, LV_PART_ITEMS | LV_STATE_CHECKED);
     lv_obj_set_style_border_side(btns, LV_BORDER_SIDE_BOTTOM, LV_PART_ITEMS | LV_STATE_CHECKED);
     lv_obj_set_style_border_width(btns, 3, LV_PART_ITEMS | LV_STATE_CHECKED);
 
-    buildDashboardTab(lv_tabview_add_tab(tabview, "DASHBOARD"));
+    buildDashboardTab(lv_tabview_add_tab(tabview, "HOME"));
     buildEventsTab(lv_tabview_add_tab(tabview, "EVENTS"));
     buildCommsTab(lv_tabview_add_tab(tabview, "COMMS"));
     buildBountiesTab(lv_tabview_add_tab(tabview, "BOUNTIES"));
     buildPlayersTab(lv_tabview_add_tab(tabview, "PLAYERS"));
+    buildFactionsTab(lv_tabview_add_tab(tabview, "FACTIONS"));
     buildPanelsTab(lv_tabview_add_tab(tabview, "PANELS"));
 }
 
@@ -2069,7 +2572,8 @@ void setup() {
     // up to 5 s for the natural heartbeat.
     delay(300);                  // give the mesh a moment to settle
     swts::gmSyncRequest();
-    S.println("[GM] Sync request broadcast");
+    swts::gmSendFactions(gmConfig.factions, gmConfig.factionCount);
+    S.println("[GM] Sync request + faction roster broadcast");
 
     S.println("[GM] Ready");
 }
@@ -2080,9 +2584,19 @@ void loop() {
     static unsigned long lastRefresh = 0;
     if (millis() - lastRefresh > 2000) {
         lastRefresh = millis();
+        pruneStaleUnassigned();
         refreshLiveLists();
         refreshDashboard();
+        refreshFactionsTab();
         if (bountyModal) refreshModalPlayers();
+        if (playerModal) refreshPlayerDetail();
+    }
+
+    // Faction roster broadcast — datapads use it for the allegiance screen
+    static unsigned long lastFacBcast = 0;
+    if (millis() - lastFacBcast > 10000) {
+        lastFacBcast = millis();
+        swts::gmSendFactions(gmConfig.factions, gmConfig.factionCount);
     }
 
     // Debounced GM state save

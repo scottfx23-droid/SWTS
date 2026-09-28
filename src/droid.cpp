@@ -144,12 +144,25 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
 
     if (strcmp(action, "start_purge") == 0) {
         // ── Core Purge minigame start — datapad runs the game on its screen ──
+        // Faction relation tunes it: this droid's own faction gets a gentler
+        // purge (his core trusts them), the enemy gets more corruption and
+        // less time.
+        const char *pfac = reqDoc["player"]["faction"] | "";
+        int targets = cfg.purge_targets;
+        int timeS   = cfg.purge_time_s;
+        if (pfac[0] && cfg.faction[0] && strcasecmp(cfg.faction, "neutral") != 0) {
+            if (strcasecmp(cfg.faction, pfac) == 0) { targets -= 4; timeS += 10; }
+            else                                    { targets += 4; timeS -= 5;  }
+        }
+        if (targets < 4)  targets = 4;
+        if (timeS < 10)   timeS = 10;
+
         astromechChirp();
         JsonDocument mg;
         mg["type"]       = "minigame_start";
         mg["game"]       = "purge";
-        mg["targets"]    = cfg.purge_targets;
-        mg["time_limit"] = cfg.purge_time_s;
+        mg["targets"]    = targets;
+        mg["time_limit"] = timeS;
         String out;
         serializeJson(mg, out);
         req->send(200, "application/json", out);

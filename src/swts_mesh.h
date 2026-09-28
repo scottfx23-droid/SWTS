@@ -50,6 +50,8 @@ enum MeshMsgType : uint8_t {
     MSG_BOUNTY_CANCEL=0x19,  // GM closes bounty with no winner
     MSG_SYNC_REQUEST= 0x1A,  // GM asks all devices to send MSG_STATUS now (post-boot resync)
     MSG_ASSIGN      = 0x1B,  // GM assigns a new callsign to a target datapad
+    MSG_FACTIONS    = 0x1C,  // GM broadcasts the scenario's faction roster
+    MSG_PLAYER_MODE = 0x1D,  // GM sets a player's difficulty mode (ADULT/KID)
 };
 
 // Device roles
@@ -84,6 +86,20 @@ struct __attribute__((packed)) MeshStatus {
     uint16_t mission_complete;
     uint16_t scans;
     uint16_t slices_won;
+    char     faction[14];   // player's chosen faction ("" = none yet)
+    uint8_t  kid;           // 1 = kid difficulty mode
+    uint16_t xp;            // experience points
+};
+
+struct __attribute__((packed)) MeshPlayerMode {
+    char     target[16];    // callsign of the datapad to change
+    uint8_t  kid;           // 1 = kid mode, 0 = adult (default)
+};
+
+#define MESH_MAX_FACTIONS 6
+struct __attribute__((packed)) MeshFactions {
+    uint8_t count;
+    char    names[MESH_MAX_FACTIONS][14];
 };
 
 struct __attribute__((packed)) MeshScore {
@@ -110,12 +126,16 @@ struct __attribute__((packed)) MeshEvent {
     char     event_id[32];
     char     event_name[40];
     uint8_t  severity;      // 0=info 1=warn 2=alert 3=critical
+    char     faction[14];   // "" = all players, else only this faction reacts
     char     payload[120];  // free-form context
 };
 
 struct __attribute__((packed)) MeshComm {
     char     comm_id[20];
-    char     target[16];    // empty = broadcast to all
+    char     target[16];    // "" = broadcast; "<callsign>" = one player;
+                            // "@<FACTION>" = every player of that faction
+                            // (prefix convention — the struct is at the
+                            //  ESPNOW size limit, no room for a new field)
     char     from[20];
     char     subject[36];
     char     body[120];
@@ -297,8 +317,18 @@ inline bool sendPing(uint32_t uptime) {
     return meshSend(MSG_PING, &p, sizeof(p));
 }
 
-inline bool sendStatus(uint32_t uptime, int score, int activeMsn, int completeMsn, int scans, int slicesWon) {
-    MeshStatus s = {uptime, score, (uint16_t)activeMsn, (uint16_t)completeMsn, (uint16_t)scans, (uint16_t)slicesWon};
+inline bool sendStatus(uint32_t uptime, int score, int activeMsn, int completeMsn, int scans, int slicesWon,
+                       const char *faction = "", bool kid = false, int xp = 0) {
+    MeshStatus s = {};
+    s.uptime_sec = uptime;
+    s.score = score;
+    s.mission_active = (uint16_t)activeMsn;
+    s.mission_complete = (uint16_t)completeMsn;
+    s.scans = (uint16_t)scans;
+    s.slices_won = (uint16_t)slicesWon;
+    if (faction) strlcpy(s.faction, faction, sizeof(s.faction));
+    s.kid = kid ? 1 : 0;
+    s.xp = (uint16_t)(xp < 0 ? 0 : xp);
     return meshSend(MSG_STATUS, &s, sizeof(s));
 }
 
@@ -329,11 +359,13 @@ inline bool sendSliceResult(const char *panelId, bool won, int rounds, int score
 }
 
 // GM-side senders
-inline bool gmTriggerEvent(const char *eventId, const char *eventName, uint8_t severity, const char *payload) {
+inline bool gmTriggerEvent(const char *eventId, const char *eventName, uint8_t severity, const char *payload,
+                           const char *faction = "") {
     MeshEvent e = {};
     strlcpy(e.event_id, eventId, sizeof(e.event_id));
     strlcpy(e.event_name, eventName, sizeof(e.event_name));
     e.severity = severity;
+    if (faction) strlcpy(e.faction, faction, sizeof(e.faction));
     if (payload) strlcpy(e.payload, payload, sizeof(e.payload));
     return meshSend(MSG_EVENT, &e, sizeof(e));
 }
@@ -381,6 +413,23 @@ inline bool gmAssignCallsign(const char *target, const char *newCallsign) {
     strlcpy(a.target, target, sizeof(a.target));
     strlcpy(a.new_callsign, newCallsign, sizeof(a.new_callsign));
     return meshSend(MSG_ASSIGN, &a, sizeof(a));
+}
+
+// Set one datapad's difficulty mode (targeted by its current callsign)
+inline bool gmSetPlayerMode(const char *target, bool kid) {
+    MeshPlayerMode m = {};
+    strlcpy(m.target, target, sizeof(m.target));
+    m.kid = kid ? 1 : 0;
+    return meshSend(MSG_PLAYER_MODE, &m, sizeof(m));
+}
+
+// Broadcast the scenario's faction roster (datapads use it for the pick screen)
+inline bool gmSendFactions(const char names[][14], uint8_t count) {
+    MeshFactions f = {};
+    if (count > MESH_MAX_FACTIONS) count = MESH_MAX_FACTIONS;
+    f.count = count;
+    for (uint8_t i = 0; i < count; i++) strlcpy(f.names[i], names[i], sizeof(f.names[i]));
+    return meshSend(MSG_FACTIONS, &f, sizeof(f));
 }
 
 // Empty-payload request to make every device re-send its current MSG_STATUS.

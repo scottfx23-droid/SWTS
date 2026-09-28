@@ -122,11 +122,42 @@ static const char T_MISSIONS[] = R"json({
           "xp": 120
         }
       ]
+    },
+    {
+      "id": "counter_slice",
+      "title": "COUNTER-SLICE",
+      "subtitle": "Trace the rebel slicer network and seize their dead drop",
+      "faction": "IMPERIAL",
+      "briefing": "ISB has flagged slicer traffic on the cantina's backroom comm board. The rebels are moving something through this outpost.\n\nBreach the board yourself and pull its private ledger, then locate the dead-dropped datacard before their courier collects it. Log it as evidence.\n\nThe Empire rewards efficiency.",
+      "difficulty": 2,
+      "reward_credits": 350,
+      "reward_xp": 250,
+      "reward_item": "IMPERIAL COMMENDATION",
+      "unlocks": "",
+      "starts_unlocked": true,
+      "endgame": true,
+      "steps": [
+        {
+          "title": "Breach the comm board",
+          "description": "Slice the Cantina Comm Board's pattern lock and recover its backroom ledger.",
+          "type": "event",
+          "target": "panel_sliced:PANEL_01",
+          "xp": 80
+        },
+        {
+          "title": "Seize the dead drop",
+          "description": "Locate the rebel datacard INTEL_01 and scan it to log it as evidence.",
+          "type": "scan_nfc",
+          "target": "INTEL_01",
+          "xp": 120
+        }
+      ]
     }
   ],
   "nfc_triggers": [
-    { "token": "INTEL_01",   "action": "step", "mission": "intel_run",  "step": 0 },
-    { "token": "EXTRACT_01", "action": "step", "mission": "extraction", "step": 1 }
+    { "token": "INTEL_01",   "action": "step", "mission": "intel_run",     "step": 0 },
+    { "token": "INTEL_01",   "action": "step", "mission": "counter_slice", "step": 1 },
+    { "token": "EXTRACT_01", "action": "step", "mission": "extraction",    "step": 1 }
   ]
 }
 )json";
@@ -139,56 +170,96 @@ static const char T_COMMS[] = R"json({
       "from": "ALLIANCE COMMAND",
       "subject": "WELCOME TO OUTPOST 77",
       "body": "Operative, you've been deployed to the Twin Suns Outpost. A rebel contact has left intel for us at the cantina. Find it, decrypt it at the Repair Shop Terminal, and get the coordinates to R5-D8 in the storage facility. Watch for Imperial patrols.",
-      "trigger": "boot"
+      "trigger": "boot",
+      "faction": "REBEL"
+    },
+    {
+      "id": "welcome_imp",
+      "from": "ISB COMMAND",
+      "subject": "WELCOME TO OUTPOST 77",
+      "body": "Agent, rebel activity is confirmed at the Twin Suns Outpost. They are moving intelligence through the cantina. Trace their slicer network, recover whatever they are hiding, and log it as evidence. The Empire is watching your performance.",
+      "trigger": "boot",
+      "faction": "IMPERIAL"
     },
     {
       "id": "assignment",
       "from": "ALLIANCE COMMAND",
       "subject": "ASSIGNMENT: INTEL RUN",
       "body": "Your first objective is live. A sympathizer dead-dropped a datacard marked INTEL_01 somewhere around the cantina. Find it and scan it on your datapad. The cantina's backroom comm board keeps records of everything that moves through here -- slice it if you need a lead.",
-      "trigger": "mission_start:intel_run"
+      "trigger": "mission_start:intel_run",
+      "faction": "REBEL"
+    },
+    {
+      "id": "counter_orders",
+      "from": "ISB COMMAND",
+      "subject": "ASSIGNMENT: COUNTER-SLICE",
+      "body": "The cantina's backroom comm board carries the rebels' private traffic. Breach its pattern lock and pull the ledger. Whatever they are hiding at this outpost, the ledger will point you to it.",
+      "trigger": "mission_start:counter_slice",
+      "faction": "IMPERIAL"
     },
     {
       "id": "intel_scanned",
       "from": "R5-D8",
       "subject": "SIGNAL ACQUIRED",
       "body": "BEEP BOOP. Translation: Datacard located. The encryption is heavy -- you'll need a friendly terminal to break it. The Repair Shop Decoder will do. Bring the vault key DT_VAULT with you.",
-      "trigger": "scan:INTEL_01"
+      "trigger": "scan:INTEL_01",
+      "faction": "REBEL"
+    },
+    {
+      "id": "evidence_logged",
+      "from": "ISB COMMAND",
+      "subject": "EVIDENCE SECURED",
+      "body": "Rebel datacard INTEL_01 logged and quarantined. Their courier network at this outpost is finished. Outstanding work, agent. Report for debrief.",
+      "trigger": "scan:INTEL_01",
+      "faction": "IMPERIAL"
+    },
+    {
+      "id": "ledger_recovered",
+      "from": "ISB COMMAND",
+      "subject": "LEDGER RECOVERED",
+      "body": "Good work on the breach. The ledger shows an off-world courier paid cash and taped something under the corner booth -- a datacard marked INTEL_01. Find it and scan it as evidence before their courier collects.",
+      "trigger": "event:panel_sliced:PANEL_01",
+      "faction": "IMPERIAL"
     },
     {
       "id": "terminal_directions",
       "from": "ALLIANCE COMMAND",
       "subject": "DECRYPTION ROUTE",
       "body": "Operative, the Repair Shop Terminal on the cantina is rebel-friendly. Carry the vault key DT_VAULT to it and present the card at its reader port. The terminal will broadcast confirmation when decryption is complete.",
-      "trigger": "event:nfc:TERM_01:INTEL_01"
+      "trigger": "event:nfc:TERM_01:INTEL_01",
+      "faction": "REBEL"
     },
     {
       "id": "decrypt_complete",
       "from": "REPAIR SHOP TERMINAL",
       "subject": "DECRYPTION COMPLETE",
       "body": "Vault key DT_VAULT verified. Coordinates extracted. Transmitting to R5-D8. Recommend handoff at the storage facility immediately. Warning: his memory core took a hit from Imperial ice -- you may need to purge it before he can accept the upload.",
-      "trigger": "event:nfc:TERM_01:DT_VAULT"
+      "trigger": "event:nfc:TERM_01:DT_VAULT",
+      "faction": "REBEL"
     },
     {
       "id": "handoff_confirmed",
       "from": "ALLIANCE COMMAND",
       "subject": "COORDINATES RECEIVED",
       "body": "R5-D8's transmission just reached the fleet. Outstanding work, operative. Stand by for extraction orders -- you're coming home.",
-      "trigger": "event:droid_handoff:DROID_R5D8"
+      "trigger": "event:droid_handoff:DROID_R5D8",
+      "faction": "REBEL"
     },
     {
       "id": "extraction_orders",
       "from": "ALLIANCE COMMAND",
       "subject": "EXTRACTION ORDERS",
       "body": "A Lambda shuttle is holding position off-world for you. The cantina comm board can reach it on the outpost's open channel -- slice through its security and broadcast the extraction signal. Then get to the landing zone. Don't keep the pilot waiting.",
-      "trigger": "mission_start:extraction"
+      "trigger": "mission_start:extraction",
+      "faction": "REBEL"
     },
     {
       "id": "shuttle_inbound",
       "from": "TWIN SUNS FLIGHT",
       "subject": "SHUTTLE INBOUND",
       "body": "Signal received, operative. Lambda shuttle on approach -- ETA ten minutes. Proceed to the landing zone and scan the extraction beacon EXTRACT_01 to confirm pickup. Clear skies.",
-      "trigger": "event:extraction:PANEL_01"
+      "trigger": "event:extraction:PANEL_01",
+      "faction": "REBEL"
     }
   ]
 }
@@ -271,6 +342,7 @@ static const char T_GM_CONFIG[] = R"json({
     "id": "GM-1",
     "role": "gamemaster"
   },
+  "factions": ["REBEL", "IMPERIAL"],
   "game": {
     "max_score": 1000,
     "event_duration_min": 30,
@@ -320,7 +392,15 @@ static const char T_GM_CONFIG[] = R"json({
       "id": "extraction_inbound",
       "name": "EXTRACTION INBOUND",
       "severity": 0,
-      "description": "Lambda shuttle inbound for pickup. All operatives complete current objectives and report in."
+      "description": "Lambda shuttle inbound for pickup. All operatives complete current objectives and report in.",
+      "faction": "REBEL"
+    },
+    {
+      "id": "isb_crackdown",
+      "name": "ISB CRACKDOWN",
+      "severity": 2,
+      "description": "ISB authorizes force. All Imperial agents move on known rebel positions immediately.",
+      "faction": "IMPERIAL"
     }
   ],
   "comms": [
@@ -340,13 +420,22 @@ static const char T_GM_CONFIG[] = R"json({
       "id": "gm_extraction_brief",
       "from": "ALLIANCE COMMAND",
       "subject": "EXTRACTION DETAILS",
-      "body": "Once R5 has the intel, regroup at the cafe for pickup. Lambda shuttle ETA 10 minutes."
+      "body": "Once R5 has the intel, regroup at the cafe for pickup. Lambda shuttle ETA 10 minutes.",
+      "faction": "REBEL"
     },
     {
       "id": "gm_well_done",
       "from": "ALLIANCE COMMAND",
       "subject": "FIELD COMMENDATION",
-      "body": "Outstanding work, operative. Mission objectives complete. Your service is logged."
+      "body": "Outstanding work, operative. Mission objectives complete. Your service is logged.",
+      "faction": "REBEL"
+    },
+    {
+      "id": "gm_imperial_orders",
+      "from": "ISB COMMAND",
+      "subject": "PRIORITY DIRECTIVE",
+      "body": "Agents: rebel sympathizers are operating inside the cantina. Increase surveillance and report all datacard traffic to ISB immediately.",
+      "faction": "IMPERIAL"
     }
   ],
   "bounties": [
