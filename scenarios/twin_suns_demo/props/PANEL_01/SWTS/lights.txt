@@ -1,0 +1,16 @@
+# PANEL_01 — Cantina Comm Board strip
+# chip: ws2812 | ws2811 | sk6812     order: RGB RBG GRB GBR BRG BGR
+chip=ws2812
+order=GRB
+pin=21
+# One line per LED: RRGGBB,on_ms,off_ms
+#   on_ms 0  = always on      on_ms -1 = random flicker
+# Warm cantina ambers with one faulty flickering cell
+FFAA00,0,0
+CC8800,0,0
+FFAA00,900,600
+CC8800,0,0
+FF6600,-1,0
+CC8800,0,0
+FFAA00,700,500
+CC8800,0,0

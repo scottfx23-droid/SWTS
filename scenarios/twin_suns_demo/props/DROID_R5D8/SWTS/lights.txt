@@ -1,0 +1,13 @@
+# DROID_R5D8 — astromech dome/body lights
+chip=ws2812
+order=GRB
+pin=21
+# One line per LED: RRGGBB,on_ms,off_ms
+#   on_ms 0  = always on      on_ms -1 = random flicker
+# Red processor flicker, blue status blinks, white running light
+FF2000,-1,0
+00AAFF,400,300
+FFFFFF,0,0
+00AAFF,650,450
+FF2000,300,900
+0055FF,0,0

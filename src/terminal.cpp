@@ -34,9 +34,14 @@
 #include <ArduinoJson.h>
 #include <ESPAsyncWebServer.h>
 #include "swts_mesh.h"
+#include "swts_lights.h"         // addressable RGB strip (/SWTS/lights.txt)
 #include "swts_test_configs.h"   // boot-time test provisioning (see header to disable)
 
 #define S Serial
+
+// Interaction feedback queued from async HTTP handlers, applied in loop()
+enum PropFx : uint8_t { FX_NONE = 0, FX_ACTIVITY };
+volatile uint8_t pendingFx = FX_NONE;
 
 // ═══════════════════════════════════════
 //  PINS
@@ -193,6 +198,7 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
     const char *callsign = reqDoc["player"]["callsign"]| "UNKNOWN";
     strlcpy(connectedCallsign, callsign, sizeof(connectedCallsign));
     S.printf("[HTTP] %s by %s\n", action, callsign);
+    pendingFx = FX_ACTIVITY;   // applied from loop()
 
     JsonDocument resp;
     resp["type"] = "dialogue";
@@ -266,6 +272,7 @@ void onCardScanned(uint8_t *uid, uint8_t len) {
     if (isCargoTag(ndefText)) {
         S.printf("[SCAN] cargo crate %s rejected (wrong reader)\n", ndefText);
         buzzDenied();
+        swts_lights::effectFail();
         return;
     }
 
@@ -277,6 +284,7 @@ void onCardScanned(uint8_t *uid, uint8_t len) {
     S.printf("[SCAN] accepted '%s' uid=%s\n", ndefText, uidStr);
 
     buzzGranted();
+    swts_lights::effectSuccess();
 
     // ── Broadcast to GM (NFC scan log) ──
     swts::sendNfcScan(uidStr, ndefText, "datacard");
@@ -325,6 +333,7 @@ void setup() {
         // SWTS_WRITE_TEST_CONFIGS is commented out in swts_test_configs.h)
         swts_test::writeTestConfigs(SD);
         loadConfig();
+        swts_lights::load(SD);   // RGB strip pattern (/SWTS/lights.txt)
     } else {
         S.println("[SD] Mount failed, using defaults");
     }
@@ -364,6 +373,14 @@ void setup() {
 //  LOOP
 // ═══════════════════════════════════════
 void loop() {
+    // Lights: idle pattern + any interaction effect queued by HTTP handlers
+    if (pendingFx != FX_NONE) {
+        pendingFx = FX_NONE;
+        swts_lights::effectActivity();
+        buzzScanIdle();
+    }
+    swts_lights::update();
+
     if (nfcOk) {
         uint8_t uid[7];
         uint8_t len;

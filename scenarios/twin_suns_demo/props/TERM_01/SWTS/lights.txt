@@ -1,0 +1,13 @@
+# TERM_01 — Repair Shop Decoder strip
+chip=ws2812
+order=GRB
+pin=21
+# One line per LED: RRGGBB,on_ms,off_ms
+#   on_ms 0  = always on      on_ms -1 = random flicker
+# Green ready lights with amber data-activity blinks
+00FF40,0,0
+FFAA00,800,400
+00FF40,-1,0
+FFAA00,500,900
+00FF40,0,0
+CC8800,1200,300

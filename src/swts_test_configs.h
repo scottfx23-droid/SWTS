@@ -533,10 +533,27 @@ people. Bring your own encryption key.
 END OF LEDGER
 )lore";
 
+// RGB strip pattern (see swts_lights.h for the format)
+static const char T_LIGHTS[] = R"txt(# PANEL_01 - Cantina Comm Board strip
+chip=ws2812
+order=GRB
+pin=21
+# RRGGBB,on_ms,off_ms  (on 0 = solid, on -1 = flicker)
+FFAA00,0,0
+CC8800,0,0
+FFAA00,900,600
+CC8800,0,0
+FF6600,-1,0
+CC8800,0,0
+FFAA00,700,500
+CC8800,0,0
+)txt";
+
 static const TestFile FILES[] = {
     { "/SWTS/config.json",            T_CONFIG,   true },
     { "/SWTS/dialogue/greeting.json", T_GREETING, true },
     { "/SWTS/lore/l001.txt",          T_LORE1,    true },
+    { "/SWTS/lights.txt",             T_LIGHTS,   true },
 };
 
 // ═══════════════════════════════════════
@@ -583,9 +600,24 @@ static const char T_GREETING[] = R"json({
 }
 )json";
 
+// RGB strip pattern (see swts_lights.h for the format)
+static const char T_LIGHTS[] = R"txt(# TERM_01 - Repair Shop Decoder strip
+chip=ws2812
+order=GRB
+pin=21
+# RRGGBB,on_ms,off_ms  (on 0 = solid, on -1 = flicker)
+00FF40,0,0
+FFAA00,800,400
+00FF40,-1,0
+FFAA00,500,900
+00FF40,0,0
+CC8800,1200,300
+)txt";
+
 static const TestFile FILES[] = {
     { "/SWTS/config.json",            T_CONFIG,   true },
     { "/SWTS/dialogue/greeting.json", T_GREETING, true },
+    { "/SWTS/lights.txt",             T_LIGHTS,   true },
 };
 
 // ═══════════════════════════════════════
@@ -637,9 +669,24 @@ static const char T_GREETING[] = R"json({
 }
 )json";
 
+// RGB strip pattern (see swts_lights.h for the format)
+static const char T_LIGHTS[] = R"txt(# DROID_R5D8 - astromech dome/body lights
+chip=ws2812
+order=GRB
+pin=21
+# RRGGBB,on_ms,off_ms  (on 0 = solid, on -1 = flicker)
+FF2000,-1,0
+00AAFF,400,300
+FFFFFF,0,0
+00AAFF,650,450
+FF2000,300,900
+0055FF,0,0
+)txt";
+
 static const TestFile FILES[] = {
     { "/SWTS/config.json",            T_CONFIG,   true },
     { "/SWTS/dialogue/greeting.json", T_GREETING, true },
+    { "/SWTS/lights.txt",             T_LIGHTS,   true },
 };
 
 #else

@@ -24,9 +24,15 @@
 #include <ArduinoJson.h>
 #include <ESPAsyncWebServer.h>
 #include "swts_mesh.h"
+#include "swts_lights.h"         // addressable RGB strip (/SWTS/lights.txt)
 #include "swts_test_configs.h"   // boot-time test provisioning (see header to disable)
 
 #define S Serial
+
+// Light feedback queued from async HTTP handlers, applied in loop().
+// (Sounds stay inline in the handlers — the astromech chirps predate this.)
+enum PropFx : uint8_t { FX_NONE = 0, FX_ACTIVITY, FX_SUCCESS, FX_FAIL, FX_SIGNAL };
+volatile uint8_t pendingFx = FX_NONE;
 
 // ═══════════════════════════════════════
 //  PINS
@@ -157,6 +163,7 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
         if (targets < 4)  targets = 4;
         if (timeS < 10)   timeS = 10;
 
+        pendingFx = FX_ACTIVITY;
         astromechChirp();
         JsonDocument mg;
         mg["type"]       = "minigame_start";
@@ -176,6 +183,7 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
         mr["accepted"] = true;
         if (won) {
             coreSliced = true;
+            pendingFx = FX_SUCCESS;
             buzzHandoff();
             mr["message"]  = "MEMORY CORE STABILIZED -- UPLOAD CHANNEL OPEN";
             mr["unlocked"] = true;
@@ -183,6 +191,7 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
             snprintf(eventId, sizeof(eventId), "droid_slice:%s", cfg.id);
             swts::gmTriggerEvent(eventId, "Memory core sliced on R5-D8", /*severity*/ 0, callsign);
         } else {
+            pendingFx = FX_FAIL;
             buzzerTone(300, 250);
             mr["message"] = "PURGE FAILED -- CORE STILL SCRAMBLED";
             mr["retry"]   = true;
@@ -222,6 +231,7 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
     if (strcmp(action, "deliver_intel") == 0) {
         // ── Player is handing off the decrypted intel — completes the mission ──
         intelDelivered = true;
+        pendingFx = FX_SIGNAL;
         astromechChirp();
         delay(120);
         buzzHandoff();
@@ -259,6 +269,7 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
     }
 
     // Default — greet
+    pendingFx = FX_ACTIVITY;
     astromechChirp();
 
     JsonObject l1 = lines.add<JsonObject>();
@@ -368,8 +379,9 @@ void setup() {
         // SWTS_WRITE_TEST_CONFIGS is commented out in swts_test_configs.h)
         swts_test::writeTestConfigs(SD);
         loadConfig();
+        swts_lights::load(SD);   // RGB strip pattern (/SWTS/lights.txt)
     } else {
-        S.println("[SD] No SD card / mount failed — using built-in defaults");
+        S.println("[SD] No SD card / mount failed — insert configured card");
         SD.end();
         sdSPI.end();
     }
@@ -391,6 +403,19 @@ void setup() {
 //  LOOP
 // ═══════════════════════════════════════
 void loop() {
+    // Lights: idle pattern + any interaction effect queued by HTTP handlers
+    if (pendingFx != FX_NONE) {
+        uint8_t fx = pendingFx;
+        pendingFx = FX_NONE;
+        switch (fx) {
+        case FX_ACTIVITY: swts_lights::effectActivity(); break;
+        case FX_SUCCESS:  swts_lights::effectSuccess();  break;
+        case FX_FAIL:     swts_lights::effectFail();     break;
+        case FX_SIGNAL:   swts_lights::effectSignal();   break;
+        }
+    }
+    swts_lights::update();
+
     // Random idle chatter every 30-60s
     static unsigned long nextChirp = 0;
     if (millis() > nextChirp) {

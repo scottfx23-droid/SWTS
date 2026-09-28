@@ -19,9 +19,48 @@
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
 #include "swts_mesh.h"
+#include "swts_lights.h"         // addressable RGB strip (/SWTS/lights.txt)
 #include "swts_test_configs.h"   // boot-time test provisioning (see header to disable)
 
 #define S Serial
+
+// ═══════════════════════════════════════
+//  BUZZER — passive piezo on GPIO 4
+// ═══════════════════════════════════════
+#define BUZZER_PIN 4
+inline void buzzerTone(int freq, int ms) { tone(BUZZER_PIN, freq, ms); }
+
+// ═══════════════════════════════════════
+//  INTERACTION FEEDBACK — lights + buzzer
+//  HTTP handlers run on the async task, so they only set pendingFx;
+//  loop() applies it (NeoPixel writes + tone stay on the main task).
+// ═══════════════════════════════════════
+enum PropFx : uint8_t { FX_NONE = 0, FX_ACTIVITY, FX_SUCCESS, FX_FAIL, FX_SIGNAL };
+volatile uint8_t pendingFx = FX_NONE;
+
+void applyPendingFx() {
+    uint8_t fx = pendingFx;
+    if (fx == FX_NONE) return;
+    pendingFx = FX_NONE;
+    switch (fx) {
+    case FX_ACTIVITY:
+        swts_lights::effectActivity();
+        buzzerTone(1200, 40);
+        break;
+    case FX_SUCCESS:
+        swts_lights::effectSuccess();
+        buzzerTone(523, 80); delay(90); buzzerTone(784, 80); delay(90); buzzerTone(1046, 140);
+        break;
+    case FX_FAIL:
+        swts_lights::effectFail();
+        buzzerTone(220, 250); delay(260); buzzerTone(160, 300);
+        break;
+    case FX_SIGNAL:
+        swts_lights::effectSignal();
+        buzzerTone(880, 60); delay(70); buzzerTone(1320, 60); delay(70); buzzerTone(1760, 120);
+        break;
+    }
+}
 
 // ═══════════════════════════════════════
 //  SD CARD PINS
@@ -313,6 +352,7 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
     }
 
     if (strcmp(action, "greet") == 0) {
+        pendingFx = FX_ACTIVITY;
         resp["type"] = "dialogue";
         JsonObject speaker = resp["speaker"].to<JsonObject>();
         speaker["name"] = cfg.name;
@@ -374,6 +414,7 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
     }
     else if (strcmp(action, "start_minigame") == 0) {
         panelState = STATE_MINIGAME;
+        pendingFx = FX_ACTIVITY;
         // Faction relation shifts the timing-bar difficulty (friendly -1, hostile +1)
         int diff = cfg.minigame_diff + facMod;
         if (diff < 1) diff = 1;
@@ -397,6 +438,7 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
         // Simon Says (pattern lock) — rounds from config, adjusted by the
         // player's faction relation (friendly -1, hostile +2)
         panelState = STATE_MINIGAME;
+        pendingFx = FX_ACTIVITY;
         int rounds = cfg.simon_rounds + (facMod < 0 ? -1 : facMod > 0 ? 2 : 0);
         if (rounds < 1) rounds = 1;
         resp["type"] = "minigame_start";
@@ -411,6 +453,7 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
         if (won) {
             panelState = STATE_HACKED;
             playerSliced = true;
+            pendingFx = FX_SUCCESS;
             // Announce the breach — missions can key off this event
             char eventId[40];
             snprintf(eventId, sizeof(eventId), "panel_sliced:%s", cfg.id);
@@ -426,6 +469,7 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
             items.add(itemId);
         } else {
             panelState = STATE_ACTIVE;
+            pendingFx = FX_FAIL;
             resp["message"] = "SLICE FAILED -- SECURITY HOLDING";
             resp["retry"] = true;
         }
@@ -451,6 +495,7 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
             snprintf(eventId, sizeof(eventId), "extraction:%s", cfg.id);
             swts::gmTriggerEvent(eventId, "Extraction signal broadcast", 0, callsign);
             resp["game_event"] = eventId;
+            pendingFx = FX_SIGNAL;
 
             JsonObject l1 = lines.add<JsonObject>();
             l1["text"] = "WIDEBAND BURST TRANSMITTED // ALLIANCE CODE 7-7";
@@ -620,6 +665,10 @@ void setup() {
     // Load config from flash
     loadConfig();
 
+    // Buzzer + RGB strip
+    pinMode(BUZZER_PIN, OUTPUT);
+    swts_lights::load(LittleFS);
+
     S.printf("Panel: %s (%s)\n", cfg.name, cfg.id);
 
     // NFC
@@ -655,6 +704,10 @@ void setup() {
 //  LOOP
 // ═══════════════════════════════════════
 void loop() {
+    // Lights: idle pattern + any interaction effect queued by HTTP handlers
+    applyPendingFx();
+    swts_lights::update();
+
     static unsigned long lastPoll = 0;
     if (nfcOk && millis() - lastPoll > 500) {
         lastPoll = millis();
