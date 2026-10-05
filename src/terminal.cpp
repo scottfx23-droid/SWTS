@@ -1,5 +1,5 @@
 /*
- * SWTS Terminal — Headless NFC interaction kiosk
+ * SFGE Terminal — Headless NFC interaction kiosk
  * ESP32-S3 (same hardware family as the datapad, no display)
  *
  * Hardware:
@@ -8,7 +8,7 @@
  *   Buzzer:     GPIO  4
  *
  * Boot flow:
- *   - Read /SWTS/config.json from SD (terminal id, name, accept/deny behavior)
+ *   - Read /SFGE/config.json from SD (terminal id, name, accept/deny behavior)
  *   - Start WiFi AP on the mesh channel so players can connect their datapad
  *   - Start ESPNOW mesh
  *   - Continuously scan for NFC datacards
@@ -33,10 +33,11 @@
 #include <Adafruit_PN532.h>
 #include <ArduinoJson.h>
 #include <ESPAsyncWebServer.h>
-#include "swts_mesh.h"
-#include "swts_lights.h"         // addressable RGB strip (/SWTS/lights.txt)
-#include "swts_proximity.h"      // RSSI gate for interactions
-#include "swts_test_configs.h"   // boot-time test provisioning (see header to disable)
+#include "sfge_mesh.h"
+#include "sfge_lights.h"         // addressable RGB strip (/SFGE/lights.txt)
+#include "sfge_proximity.h"      // RSSI gate for interactions
+#include "sfge_ota.h"            // firmware-from-SD updates
+#include "sfge_test_configs.h"   // boot-time test provisioning (see header to disable)
 
 #define S Serial
 
@@ -77,12 +78,12 @@ void buzzScanIdle() {
 }
 
 // ═══════════════════════════════════════
-//  TERMINAL CONFIG (loaded from /SWTS/config.json)
+//  TERMINAL CONFIG (loaded from /SFGE/config.json)
 // ═══════════════════════════════════════
 struct TerminalConfig {
     char id[16]            = "TERM_01";
     char name[40]          = "Imperial Terminal";
-    char ssid[24]          = "SWTS_TERM_01";
+    char ssid[24]          = "SFGE_TERM_01";
     char faction[12]       = "empire";   // "empire" or "rebel" — for display
     int  cooldown_ms       = 1500;        // ignore the same card within this window
     // Tap-to-use sessions (player card PLAYER:<callsign> opens one)
@@ -96,8 +97,8 @@ struct TerminalConfig {
 TerminalConfig cfg;
 
 bool loadConfig() {
-    File f = SD.open("/SWTS/config.json", FILE_READ);
-    if (!f) { S.println("[CFG] /SWTS/config.json not found, using defaults"); return false; }
+    File f = SD.open("/SFGE/config.json", FILE_READ);
+    if (!f) { S.println("[CFG] /SFGE/config.json not found, using defaults"); return false; }
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, f);
     f.close();
@@ -113,14 +114,14 @@ bool loadConfig() {
     cfg.decrypt_required  = doc["behavior"]["decrypt_required"]  | cfg.decrypt_required;
     cfg.decrypt_tries     = doc["behavior"]["decrypt_tries"]     | cfg.decrypt_tries;
     cfg.decrypt_glyphs    = doc["behavior"]["decrypt_glyphs"]    | cfg.decrypt_glyphs;
-    swts_prox::loadConfig(doc);
+    sfge_prox::loadConfig(doc);
     S.printf("[CFG] id=%s ssid=%s faction=%s tap=%d decrypt=%d\n",
              cfg.id, cfg.ssid, cfg.faction, cfg.require_tap, cfg.decrypt_required);
     return true;
 }
 
 // ═══════════════════════════════════════
-//  SHOP — /SWTS/shop.json
+//  SHOP — /SFGE/shop.json
 // ═══════════════════════════════════════
 struct ShopItem { char id[20]; char name[28]; int cost; };
 ShopItem shopItems[8];
@@ -128,7 +129,7 @@ int shopCount = 0;
 
 void loadShop() {
     shopCount = 0;
-    File f = SD.open("/SWTS/shop.json", FILE_READ);
+    File f = SD.open("/SFGE/shop.json", FILE_READ);
     if (!f) return;
     JsonDocument doc;
     if (!deserializeJson(doc, f)) {
@@ -172,7 +173,7 @@ char pendingCard[32] = "";   // datacard held for the Decrypt gate
 void broadcastSessionEvent(const char *what, const char *cs) {
     char eventId[40];
     snprintf(eventId, sizeof(eventId), "%s:%s:%s", what, cfg.id, cs);
-    swts::gmTriggerEvent(eventId, what, 0, cs);
+    sfge::gmTriggerEvent(eventId, what, 0, cs);
 }
 
 void sessionClose(const char *why) {
@@ -191,23 +192,29 @@ void sessionOpen(const char *cs) {
 }
 
 // ═══════════════════════════════════════
-//  NFC (PN532 on Wire1)
+//  NFC — primary reader (datacards / player cards) on I2C1 (SDA=14 SCL=13),
+//  optional secondary reader for CODE CYLINDERS on I2C0 (SDA=38 SCL=39).
+//  PN532s have a fixed I2C address, so one reader per bus = max two.
 // ═══════════════════════════════════════
 TwoWire nfcI2C = TwoWire(1);
 Adafruit_PN532 nfc(-1, -1, &nfcI2C);
 bool nfcOk = false;
 
+TwoWire nfc2I2C = TwoWire(0);
+Adafruit_PN532 nfc2(-1, -1, &nfc2I2C);
+bool nfc2Ok = false;
+
 // Read first NDEF text record off an NTAG into ndefText. Same algorithm as the datapad.
 char ndefText[128] = "";
 
-void readNdefText() {
+void readNdefTextFrom(Adafruit_PN532 &rdr) {
     ndefText[0] = 0;
     uint8_t buf[128];
     int pos = 0;
 
     for (int page = 4; page < 36 && pos < 120; page++) {
         uint8_t data[4];
-        if (!nfc.ntag2xx_ReadPage(page, data)) break;
+        if (!rdr.ntag2xx_ReadPage(page, data)) break;
         for (int i = 0; i < 4 && pos < 127; i++) buf[pos++] = data[i];
     }
 
@@ -242,6 +249,42 @@ void readNdefText() {
         }
         i = dataStart + tlvLen;
     }
+}
+
+void readNdefText() { readNdefTextFrom(nfc); }
+
+inline bool isCargoTag(const char *text);   // defined below
+
+// ── Code cylinder scans (secondary reader) ──
+// Cylinders are their own mechanic: they broadcast cyl:<TERM_ID>:<TOKEN>
+// events (mission step targets / comm triggers) and log as "cylinder"
+// scans, independent of sessions and the decrypt gate.
+char lastCylText[64] = "";
+unsigned long lastCylTime = 0;
+
+void onCylinderScanned() {
+    if (strcmp(lastCylText, ndefText) == 0 && millis() - lastCylTime < (unsigned long)cfg.cooldown_ms) return;
+    strlcpy(lastCylText, ndefText, sizeof(lastCylText));
+    lastCylTime = millis();
+
+    // The cylinder slot ONLY accepts code cylinders: tokens named CODE_*
+    // (CODE_RED, CODE_77, ...). Anything else is rejected.
+    if (strncasecmp(ndefText, "CODE_", 5) != 0) {
+        S.printf("[CYL] rejected '%s' (not a CODE_ cylinder)\n", ndefText);
+        buzzDenied();
+        sfge_lights::effectFail();
+        return;
+    }
+
+    S.printf("[CYL] code cylinder '%s'\n", ndefText);
+    buzzGranted();
+    sfge_lights::effectSignal();
+    sfge::sendNfcScan(ndefText, ndefText, "cylinder");
+
+    char eventId[40], eventName[40];
+    snprintf(eventId, sizeof(eventId), "cyl:%s:%s", cfg.id, ndefText);
+    snprintf(eventName, sizeof(eventName), "Code cylinder %s", ndefText);
+    sfge::gmTriggerEvent(eventId, eventName, 0, cfg.name);
 }
 
 inline bool isCargoTag(const char *text) {
@@ -288,7 +331,7 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
 
     // ── Proximity gate (optional on terminals — tap is the primary gate) ──
     int stationRssi = 0;
-    if (!swts_prox::check(&stationRssi)) {
+    if (!sfge_prox::check(&stationRssi)) {
         char body[64];
         snprintf(body, sizeof(body), "{\"error\":\"too_far\",\"rssi\":%d}", stationRssi);
         req->send(403, "application/json", body);
@@ -337,7 +380,7 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
             char eventId[40], eventName[40];
             snprintf(eventId, sizeof(eventId), "nfc:%s:%s", cfg.id, pendingCard);
             snprintf(eventName, sizeof(eventName), "%s decrypted", pendingCard);
-            swts::gmTriggerEvent(eventId, eventName, 0, callsign);
+            sfge::gmTriggerEvent(eventId, eventName, 0, callsign);
             char msg[80];
             snprintf(msg, sizeof(msg), "DECRYPTION COMPLETE -- %s EXTRACTED", pendingCard);
             resp["message"] = msg;
@@ -385,7 +428,7 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
                 resp["cost"] = found->cost;
                 char eventId[40];
                 snprintf(eventId, sizeof(eventId), "item_bought:%s", found->id);
-                swts::gmTriggerEvent(eventId, found->name, 0, callsign);
+                sfge::gmTriggerEvent(eventId, found->name, 0, callsign);
                 pendingFx = FX_ACTIVITY;
             }
         }
@@ -449,15 +492,15 @@ void startHttpServer() {
 // ═══════════════════════════════════════
 //  MESH HANDLER — listen for GM overrides + sync
 // ═══════════════════════════════════════
-void onMeshMsg(const swts::MeshHeader *hdr, const uint8_t *payload, int len) {
-    if (hdr->type == swts::MSG_SYNC_REQUEST) {
-        swts::sendPing(millis() / 1000);
+void onMeshMsg(const sfge::MeshHeader *hdr, const uint8_t *payload, int len) {
+    if (hdr->type == sfge::MSG_SYNC_REQUEST) {
+        sfge::sendPing(millis() / 1000);
         return;
     }
-    if (hdr->type == swts::MSG_STATUS && hdr->role == swts::ROLE_DATAPAD &&
-        len >= (int)sizeof(swts::MeshStatus)) {
+    if (hdr->type == sfge::MSG_STATUS && hdr->role == sfge::ROLE_DATAPAD &&
+        len >= (int)sizeof(sfge::MeshStatus)) {
         // Keep a last-known roster: validates tap-to-use + shop purchases
-        const swts::MeshStatus *s = (const swts::MeshStatus *)payload;
+        const sfge::MeshStatus *s = (const sfge::MeshStatus *)payload;
         RosterEntry *r = rosterFind(hdr->from_id, true);
         if (r) {
             r->score = s->score;
@@ -466,10 +509,27 @@ void onMeshMsg(const swts::MeshHeader *hdr, const uint8_t *payload, int len) {
         }
         return;
     }
-    if (hdr->type == swts::MSG_RESET) {
+    if (hdr->type == sfge::MSG_RESET) {
         S.println("[MESH] RESET — restarting");
         delay(300);
         ESP.restart();
+    }
+    if (hdr->type == sfge::MSG_NEW_GAME) {
+        // Session wipe: reboot clears sessions + the decrypt buffer
+        S.println("[MESH] NEW GAME — resetting");
+        delay(300 + (esp_random() % 400));
+        ESP.restart();
+    }
+    if (hdr->type == sfge::MSG_EVENT && len >= (int)sizeof(sfge::MeshEvent)) {
+        // Victory finale: every prop in the room strobes
+        const sfge::MeshEvent *e = (const sfge::MeshEvent *)payload;
+        extern volatile bool pendingCelebrate;
+        extern volatile uint32_t pendingCelebrateColor;
+        if (sfge::isCelebrationEvent(e->event_id)) {
+            pendingCelebrateColor = sfge::celebrationColor(e->payload);
+            pendingCelebrate = true;
+        }
+        return;
     }
     // Other types ignored; the terminal is mostly a sender.
 }
@@ -486,7 +546,7 @@ void onCardScanned(uint8_t *uid, uint8_t len) {
     if (isCargoTag(ndefText)) {
         S.printf("[SCAN] cargo crate %s rejected (wrong reader)\n", ndefText);
         buzzDenied();
-        swts_lights::effectFail();
+        sfge_lights::effectFail();
         return;
     }
 
@@ -498,20 +558,20 @@ void onCardScanned(uint8_t *uid, uint8_t len) {
             // Someone else's session is open — denied
             S.printf("[SESSION] %s denied — %s has the terminal\n", cs, sessionCs);
             buzzDenied();
-            swts_lights::effectFail();
+            sfge_lights::effectFail();
             return;
         }
         // Validate against the mesh roster (unknown callsigns are rejected)
         if (!rosterFind(cs, false)) {
             S.printf("[SESSION] %s not in roster — denied\n", cs);
             buzzDenied();
-            swts_lights::effectFail();
+            sfge_lights::effectFail();
             return;
         }
         if (!sessionCs[0]) sessionOpen(cs);
         sessionSince = millis();   // same player re-tapping refreshes the clock
         buzzGranted();
-        swts_lights::effectSuccess();
+        sfge_lights::effectSuccess();
         return;
     }
 
@@ -523,10 +583,10 @@ void onCardScanned(uint8_t *uid, uint8_t len) {
     S.printf("[SCAN] accepted '%s' uid=%s\n", ndefText, uidStr);
 
     buzzGranted();
-    swts_lights::effectSuccess();
+    sfge_lights::effectSuccess();
 
     // ── Broadcast to GM (NFC scan log) ──
-    swts::sendNfcScan(uidStr, ndefText, "datacard");
+    sfge::sendNfcScan(uidStr, ndefText, "datacard");
 
     // ── Decrypt gate: hold the card until the Decrypt minigame is won ──
     if (cfg.decrypt_required) {
@@ -537,7 +597,7 @@ void onCardScanned(uint8_t *uid, uint8_t len) {
         snprintf(body, sizeof(body),
                  "Datacard %s buffered by %s. ENCRYPTION ACTIVE -- connect and run DECRYPT to extract.",
                  ndefText, cfg.name);
-        swts::gmPushComm(commId, "", cfg.name, "DECRYPT REQUIRED", body);
+        sfge::gmPushComm(commId, "", cfg.name, "DECRYPT REQUIRED", body);
         return;   // the nfc:<id>:<card> event fires only after a successful decrypt
     }
 
@@ -548,7 +608,7 @@ void onCardScanned(uint8_t *uid, uint8_t len) {
     snprintf(eventId, sizeof(eventId), "nfc:%s:%s", cfg.id, ndefText);
     char eventName[40];
     snprintf(eventName, sizeof(eventName), "%s scanned", ndefText);
-    swts::gmTriggerEvent(eventId, eventName, /*severity*/ 0, cfg.name);
+    sfge::gmTriggerEvent(eventId, eventName, /*severity*/ 0, cfg.name);
 
     // ── Push a comm to whoever is connected to this AP ──
     //    We don't know which datapad is connected by mesh id; broadcast a targeted-by-text comm.
@@ -559,7 +619,7 @@ void onCardScanned(uint8_t *uid, uint8_t len) {
     snprintf(commId, sizeof(commId), "term_%s_%lu", cfg.id, millis() % 100000);
     char body[120];
     snprintf(body, sizeof(body), "Datacard %s accepted by %s. Action logged.", ndefText, cfg.name);
-    swts::gmPushComm(commId, "" /*broadcast*/, cfg.name, "ACCESS GRANTED", body);
+    sfge::gmPushComm(commId, "" /*broadcast*/, cfg.name, "ACCESS GRANTED", body);
 }
 
 // ═══════════════════════════════════════
@@ -571,7 +631,7 @@ void setup() {
     S.begin(115200);
     delay(200);
     S.println("\n================================");
-    S.println("  SWTS TERMINAL — starting");
+    S.println("  SFGE TERMINAL — starting");
     S.println("================================");
 
     pinMode(BUZZER_PIN, OUTPUT);
@@ -581,17 +641,19 @@ void setup() {
     bool sdOk = SD.begin(SD_CS, sdSPI, 4000000);
     if (sdOk) {
         S.printf("[SD] Mounted %lluMB\n", SD.cardSize() / (1024 * 1024));
+        // Firmware update staged on the card? Flash it before anything else.
+        sfge_ota::checkAndFlash(SD);
         // TESTING: write embedded gameplay configs to the card (no-op when
-        // SWTS_WRITE_TEST_CONFIGS is commented out in swts_test_configs.h)
-        swts_test::writeTestConfigs(SD);
+        // SFGE_WRITE_TEST_CONFIGS is commented out in sfge_test_configs.h)
+        sfge_test::writeTestConfigs(SD);
         loadConfig();
         loadShop();
-        swts_lights::load(SD);   // RGB strip pattern (/SWTS/lights.txt)
+        sfge_lights::load(SD);   // RGB strip pattern (/SFGE/lights.txt)
     } else {
         S.println("[SD] Mount failed, using defaults");
     }
 
-    // NFC
+    // NFC — primary reader (datacards / player cards)
     nfcI2C.begin(NFC_SDA, NFC_SCL, 100000);
     nfc.begin();
     uint32_t fw = nfc.getFirmwareVersion();
@@ -601,6 +663,19 @@ void setup() {
         S.printf("[NFC] PN532 ready (fw=0x%08X)\n", (unsigned)fw);
     } else {
         S.println("[NFC] PN532 NOT FOUND — check wiring (SDA=14, SCL=13, I2C mode)");
+    }
+
+    // NFC — optional secondary reader for code cylinders (SDA=38, SCL=39).
+    // Absent reader is fine; the terminal just runs single-slot.
+    nfc2I2C.begin(38, 39, 100000);
+    nfc2.begin();
+    uint32_t fw2 = nfc2.getFirmwareVersion();
+    if (fw2) {
+        nfc2Ok = true;
+        nfc2.SAMConfig();
+        S.printf("[NFC2] cylinder reader ready (fw=0x%08X)\n", (unsigned)fw2);
+    } else {
+        S.println("[NFC2] no cylinder reader (SDA=38, SCL=39) — single-slot mode");
     }
 
     // WiFi AP — players connect their datapad to this network to interact.
@@ -614,7 +689,7 @@ void setup() {
     startHttpServer();
 
     // Mesh
-    swts::meshInit(cfg.id, swts::ROLE_PANEL, onMeshMsg);
+    sfge::meshInit(cfg.id, sfge::ROLE_PANEL, onMeshMsg);
 
     // Boot tone — two quick beeps so you know the terminal is alive
     buzzerTone(800, 60); delay(80); buzzerTone(1200, 60);
@@ -625,14 +700,28 @@ void setup() {
 // ═══════════════════════════════════════
 //  LOOP
 // ═══════════════════════════════════════
+volatile bool pendingCelebrate = false;
+volatile uint32_t pendingCelebrateColor = 0;
+
 void loop() {
+    sfge::eventRetryService();   // re-fire gameplay events until datapads/GM confirm
+
+    // Victory celebration (game_complete / faction victory heard on the mesh)
+    if (pendingCelebrate) {
+        pendingCelebrate = false;
+        sfge_lights::celebrate(12000, pendingCelebrateColor);
+        buzzerTone(1047, 120); delay(140);   // C6-E6-G6 fanfare
+        buzzerTone(1319, 120); delay(140);
+        buzzerTone(1568, 350);
+    }
+
     // Lights: idle pattern + any interaction effect queued by HTTP handlers
     if (pendingFx != FX_NONE) {
         pendingFx = FX_NONE;
-        swts_lights::effectActivity();
+        sfge_lights::effectActivity();
         buzzScanIdle();
     }
-    swts_lights::update();
+    sfge_lights::update();
 
     // Session timeout
     if (sessionCs[0] && cfg.session_timeout_s > 0 &&
@@ -644,7 +733,7 @@ void loop() {
     static unsigned long lastPropStatus = 0;
     if (millis() - lastPropStatus > 10000) {
         lastPropStatus = millis();
-        swts::sendPropStatus(millis() / 1000, 0, false, sessionCs);
+        sfge::sendPropStatus(millis() / 1000, 0, false, sessionCs);
     }
 
     if (nfcOk) {
@@ -658,11 +747,26 @@ void loop() {
         }
     }
 
+    // Secondary reader: code cylinders (polled at a gentler cadence so the
+    // two blocking reads don't stack up every pass)
+    if (nfc2Ok) {
+        static unsigned long lastCylPoll = 0;
+        if (millis() - lastCylPoll > 250) {
+            lastCylPoll = millis();
+            uint8_t uid2[7];
+            uint8_t len2;
+            if (nfc2.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid2, &len2, 50)) {
+                readNdefTextFrom(nfc2);
+                if (ndefText[0]) onCylinderScanned();
+            }
+        }
+    }
+
     // Heartbeat to GM every 10 seconds
     static unsigned long lastBeat = 0;
     if (millis() - lastBeat > 10000) {
         lastBeat = millis();
-        swts::sendPing(millis() / 1000);
+        sfge::sendPing(millis() / 1000);
     }
 
     delay(10);

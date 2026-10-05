@@ -1,5 +1,5 @@
 /*
- * SWTS Droid — Headless astromech prop
+ * SFGE Droid — Headless astromech prop
  * ESP32-S3 (same hardware family as the datapad, no display, no NFC)
  *
  * Hardware:
@@ -8,7 +8,7 @@
  *   (Optional) Eye LED on GPIO 5 — driven HIGH = on
  *
  * Behavior:
- *   - WiFi AP "SWTS_DROID_<ID>" on the mesh channel
+ *   - WiFi AP "SFGE_DROID_<ID>" on the mesh channel
  *   - HTTP /api/info  → identity for the datapad's prop screen
  *   - HTTP /api/interact → R5 dialogue with a "deliver_intel" action
  *   - Periodic R5 chatter (random astromech beeps) every 30-60 s
@@ -23,10 +23,11 @@
 #include <WiFi.h>
 #include <ArduinoJson.h>
 #include <ESPAsyncWebServer.h>
-#include "swts_mesh.h"
-#include "swts_lights.h"         // addressable RGB strip (/SWTS/lights.txt)
-#include "swts_proximity.h"      // RSSI gate for interactions
-#include "swts_test_configs.h"   // boot-time test provisioning (see header to disable)
+#include "sfge_mesh.h"
+#include "sfge_lights.h"         // addressable RGB strip (/SFGE/lights.txt)
+#include "sfge_proximity.h"      // RSSI gate for interactions
+#include "sfge_ota.h"            // firmware-from-SD updates
+#include "sfge_test_configs.h"   // boot-time test provisioning (see header to disable)
 
 #define S Serial
 
@@ -43,7 +44,8 @@ volatile uint8_t pendingFx = FX_NONE;
 #define SD_CLK     17
 #define SD_MISO    18
 #define BUZZER_PIN  4
-#define EYE_LED    5     // optional indicator; harmless if no LED wired
+#define SERVO_PIN   5    // head servo signal (the old eye-LED pin; the eye
+                         // is now an addressable pixel on the RGB strip)
 
 // ═══════════════════════════════════════
 //  BUZZER — R5-style chatter
@@ -75,12 +77,12 @@ void buzzHandoff() {
 }
 
 // ═══════════════════════════════════════
-//  DROID CONFIG (loaded from /SWTS/config.json)
+//  DROID CONFIG (loaded from /SFGE/config.json)
 // ═══════════════════════════════════════
 struct DroidConfig {
     char id[16]         = "DROID_R5D8";
     char name[40]       = "R5-D8";
-    char ssid[24]       = "SWTS_DROID_R5";
+    char ssid[24]       = "SFGE_DROID_R5";
     char faction[12]    = "rebel";
     bool has_minigame   = true;    // card-less default: core must be purged
     char minigame_type[16] = "purge";
@@ -92,11 +94,95 @@ struct DroidConfig {
     uint32_t mood_hostile  = 0xFF2000;
     uint32_t mood_neutral  = 0xFFAA00;
     uint32_t mood_friendly = 0x2060FF;
+    int  eye_pixel      = 0;    // which strip pixel is the eye (-1 = none)
+    // Head servo
+    bool servo_enabled  = false;
+    int  servo_pin      = SERVO_PIN;
+    int  servo_min_us   = 600;
+    int  servo_max_us   = 2400;
+    int  servo_min_deg  = 25;   // travel limits so the head can't overrotate
+    int  servo_max_deg  = 155;
+    int  servo_idle_s   = 8;    // average seconds between idle head turns
 };
 DroidConfig cfg;
 
 // ═══════════════════════════════════════
-//  MOOD — one signed int, persisted to /SWTS/droid_state.json
+//  HEAD SERVO — LEDC PWM, 50 Hz. Idle wander plus reaction moves:
+//  a look-at-you on greet, a happy wiggle on wins, a slow shake on fails.
+// ═══════════════════════════════════════
+#define SERVO_LEDC_CH 2
+float headDeg = 90, headTarget = 90;
+unsigned long nextHeadMove = 0;
+int   headWiggles = 0;         // remaining wiggle half-cycles
+float headWiggleBase = 90;
+bool  headShake = false;       // wiggle style: fast happy vs slow shake
+
+void servoWriteDeg(float deg) {
+    if (deg < cfg.servo_min_deg) deg = cfg.servo_min_deg;
+    if (deg > cfg.servo_max_deg) deg = cfg.servo_max_deg;
+    uint32_t us = cfg.servo_min_us +
+                  (uint32_t)((deg / 180.0f) * (cfg.servo_max_us - cfg.servo_min_us));
+    ledcWrite(SERVO_LEDC_CH, (uint32_t)((uint64_t)us * 65536 / 20000));   // 20 ms frame
+}
+
+void servoInit() {
+    if (!cfg.servo_enabled) return;
+    ledcSetup(SERVO_LEDC_CH, 50, 16);
+    ledcAttachPin(cfg.servo_pin, SERVO_LEDC_CH);
+    headDeg = headTarget = 90;
+    servoWriteDeg(headDeg);
+    S.printf("[SERVO] head on GPIO %d (%d-%d deg)\n",
+             cfg.servo_pin, cfg.servo_min_deg, cfg.servo_max_deg);
+}
+
+// Queue a reaction: happy wiggle (fast) or disapproving shake (slow)
+void headReact(bool happy) {
+    if (!cfg.servo_enabled) return;
+    headWiggleBase = 90;
+    headTarget = 90;
+    headWiggles = happy ? 6 : 4;
+    headShake = !happy;
+}
+
+void servoService() {
+    if (!cfg.servo_enabled) return;
+    static unsigned long lastStep = 0;
+    unsigned long now = millis();
+    if (now - lastStep < 20) return;   // 50 Hz update
+    lastStep = now;
+
+    if (headWiggles > 0) {
+        // Reaction wiggle: snap between offsets around center
+        static unsigned long lastWiggle = 0;
+        int period = headShake ? 420 : 160;
+        if (now - lastWiggle > (unsigned long)period) {
+            lastWiggle = now;
+            int amp = headShake ? 22 : 14;
+            headTarget = headWiggleBase + ((headWiggles % 2) ? amp : -amp);
+            headWiggles--;
+            if (headWiggles == 0) headTarget = headWiggleBase;
+        }
+    } else if (now > nextHeadMove) {
+        // Idle wander: occasional slow look-around
+        nextHeadMove = now + (unsigned long)cfg.servo_idle_s * 500UL +
+                       esp_random() % ((unsigned long)cfg.servo_idle_s * 1000UL);
+        headTarget = cfg.servo_min_deg +
+                     (esp_random() % (cfg.servo_max_deg - cfg.servo_min_deg));
+    }
+
+    // Ease toward the target (speed scales with distance, capped)
+    float d = headTarget - headDeg;
+    float step = d * 0.12f;
+    if (step > 3.0f) step = 3.0f;
+    if (step < -3.0f) step = -3.0f;
+    if (fabsf(d) > 0.5f) {
+        headDeg += step;
+        servoWriteDeg(headDeg);
+    }
+}
+
+// ═══════════════════════════════════════
+//  MOOD — one signed int, persisted to /SFGE/droid_state.json
 //  Interactions move it; it decays toward 0. Drives the eye color
 //  (strip pixel 0), the greeting tone, and Core Purge difficulty.
 // ═══════════════════════════════════════
@@ -112,10 +198,10 @@ int moodBand() {   // -1 hostile, 0 neutral, +1 friendly
 }
 
 void moodApplyEye() {
-    if (!cfg.mood_enabled) return;
+    if (!cfg.mood_enabled || cfg.eye_pixel < 0) return;
     uint32_t c = (moodBand() < 0) ? cfg.mood_hostile
                : (moodBand() > 0) ? cfg.mood_friendly : cfg.mood_neutral;
-    swts_lights::setPixelOverride(0, c);
+    sfge_lights::setPixelOverride(cfg.eye_pixel, c);
 }
 
 void moodAdd(int delta) {
@@ -129,7 +215,7 @@ void moodAdd(int delta) {
 
 void moodSave() {
     if (!sdMounted) return;
-    File f = SD.open("/SWTS/droid_state.json", FILE_WRITE);
+    File f = SD.open("/SFGE/droid_state.json", FILE_WRITE);
     if (!f) return;
     JsonDocument doc;
     doc["mood"] = mood;
@@ -138,7 +224,7 @@ void moodSave() {
 }
 
 void moodLoad() {
-    File f = SD.open("/SWTS/droid_state.json", FILE_READ);
+    File f = SD.open("/SFGE/droid_state.json", FILE_READ);
     if (!f) return;
     JsonDocument doc;
     if (!deserializeJson(doc, f)) mood = doc["mood"] | 0;
@@ -148,8 +234,8 @@ void moodLoad() {
 }
 
 bool loadConfig() {
-    File f = SD.open("/SWTS/config.json", FILE_READ);
-    if (!f) { S.println("[CFG] no /SWTS/config.json, using defaults"); return false; }
+    File f = SD.open("/SFGE/config.json", FILE_READ);
+    if (!f) { S.println("[CFG] no /SFGE/config.json, using defaults"); return false; }
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, f);
     f.close();
@@ -176,8 +262,17 @@ bool loadConfig() {
     if (mc) cfg.mood_neutral = (uint32_t)strtoul(mc, nullptr, 16);
     mc = doc["behavior"]["mood_colors"]["friendly"].as<const char*>();
     if (mc) cfg.mood_friendly = (uint32_t)strtoul(mc, nullptr, 16);
+    cfg.eye_pixel = doc["behavior"]["eye_pixel"] | cfg.eye_pixel;
 
-    swts_prox::loadConfig(doc);
+    cfg.servo_enabled = doc["behavior"]["servo"]["enabled"]  | cfg.servo_enabled;
+    cfg.servo_pin     = doc["behavior"]["servo"]["pin"]      | cfg.servo_pin;
+    cfg.servo_min_us  = doc["behavior"]["servo"]["min_us"]   | cfg.servo_min_us;
+    cfg.servo_max_us  = doc["behavior"]["servo"]["max_us"]   | cfg.servo_max_us;
+    cfg.servo_min_deg = doc["behavior"]["servo"]["min_deg"]  | cfg.servo_min_deg;
+    cfg.servo_max_deg = doc["behavior"]["servo"]["max_deg"]  | cfg.servo_max_deg;
+    cfg.servo_idle_s  = doc["behavior"]["servo"]["idle_s"]   | cfg.servo_idle_s;
+
+    sfge_prox::loadConfig(doc);
 
     S.printf("[CFG] %s id=%s ssid=%s faction=%s minigame=%s\n",
              cfg.name, cfg.id, cfg.ssid, cfg.faction,
@@ -222,7 +317,7 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
 
     // ── Proximity gate ──
     int stationRssi = 0;
-    if (!swts_prox::check(&stationRssi)) {
+    if (!sfge_prox::check(&stationRssi)) {
         char body[64];
         snprintf(body, sizeof(body), "{\"error\":\"too_far\",\"rssi\":%d}", stationRssi);
         req->send(403, "application/json", body);
@@ -329,7 +424,7 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
             mr["unlocked"] = true;
             char eventId[40];
             snprintf(eventId, sizeof(eventId), "droid_slice:%s", cfg.id);
-            swts::gmTriggerEvent(eventId, "Memory core sliced on R5-D8", /*severity*/ 0, callsign);
+            sfge::gmTriggerEvent(eventId, "Memory core sliced on R5-D8", /*severity*/ 0, callsign);
         } else {
             pendingFx = FX_FAIL;
             buzzerTone(300, 250);
@@ -381,7 +476,7 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
         // Broadcast to GM dashboard + any subscribed comms triggers
         char eventId[40];
         snprintf(eventId, sizeof(eventId), "droid_handoff:%s", cfg.id);
-        swts::gmTriggerEvent(eventId, "Intel delivered to R5-D8", /*severity*/ 0, callsign);
+        sfge::gmTriggerEvent(eventId, "Intel delivered to R5-D8", /*severity*/ 0, callsign);
         // Mission hook — carried in the HTTP response so the delivering
         // datapad advances even if it misses the mesh broadcast
         resp["game_event"] = eventId;
@@ -389,7 +484,7 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
         // Push a comm to the player so they get visual confirmation
         char commId[20];
         snprintf(commId, sizeof(commId), "r5_thanks_%lu", millis() % 100000);
-        swts::gmPushComm(commId, callsign, cfg.name, "INTEL RECEIVED",
+        sfge::gmPushComm(commId, callsign, cfg.name, "INTEL RECEIVED",
                          "Coordinates logged. Transmitting to Alliance Command. Excellent work, operative.");
 
         JsonObject l1 = lines.add<JsonObject>();
@@ -426,9 +521,9 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
     // card, else use the built-in line for that band
     {
         const char *fn = !cfg.mood_enabled ? nullptr
-                       : moodBand() < 0 ? "/SWTS/dialogue/greet_hostile.json"
-                       : moodBand() > 0 ? "/SWTS/dialogue/greet_friendly.json"
-                                        : "/SWTS/dialogue/greet_neutral.json";
+                       : moodBand() < 0 ? "/SFGE/dialogue/greet_hostile.json"
+                       : moodBand() > 0 ? "/SFGE/dialogue/greet_friendly.json"
+                                        : "/SFGE/dialogue/greet_neutral.json";
         bool fromFile = false;
         if (fn && sdMounted) {
             File gf = SD.open(fn, FILE_READ);
@@ -503,15 +598,32 @@ void startHttpServer() {
 // ═══════════════════════════════════════
 //  MESH HANDLER
 // ═══════════════════════════════════════
-void onMeshMsg(const swts::MeshHeader *hdr, const uint8_t *payload, int len) {
-    if (hdr->type == swts::MSG_SYNC_REQUEST) {
-        swts::sendPing(millis() / 1000);
+void onMeshMsg(const sfge::MeshHeader *hdr, const uint8_t *payload, int len) {
+    if (hdr->type == sfge::MSG_SYNC_REQUEST) {
+        sfge::sendPing(millis() / 1000);
         return;
     }
-    if (hdr->type == swts::MSG_RESET) {
+    if (hdr->type == sfge::MSG_RESET) {
         S.println("[MESH] RESET — restarting");
         delay(300);
         ESP.restart();
+    }
+    if (hdr->type == sfge::MSG_NEW_GAME) {
+        // Session wipe: forget the mood and reboot fresh
+        S.println("[MESH] NEW GAME — resetting");
+        if (sdMounted) SD.remove("/SFGE/droid_state.json");
+        delay(300 + (esp_random() % 400));
+        ESP.restart();
+    }
+    if (hdr->type == sfge::MSG_EVENT && len >= (int)sizeof(sfge::MeshEvent)) {
+        // Victory finale: every prop in the room strobes
+        const sfge::MeshEvent *e = (const sfge::MeshEvent *)payload;
+        extern volatile bool pendingCelebrate;
+        extern volatile uint32_t pendingCelebrateColor;
+        if (sfge::isCelebrationEvent(e->event_id)) {
+            pendingCelebrateColor = sfge::celebrationColor(e->payload);
+            pendingCelebrate = true;
+        }
     }
 }
 
@@ -524,14 +636,12 @@ void setup() {
     S.begin(115200);
     delay(200);
     S.println("\n================================");
-    S.println("  SWTS DROID — starting");
+    S.println("  SFGE DROID — starting");
     S.println("================================");
 
     randomSeed(esp_random());
 
     pinMode(BUZZER_PIN, OUTPUT);
-    pinMode(EYE_LED, OUTPUT);
-    digitalWrite(EYE_LED, HIGH);   // proof of life
 
     // Boot beep — two rising tones (only audible if buzzer is wired on GPIO 4)
     buzzerTone(1800, 80);
@@ -559,15 +669,18 @@ void setup() {
     bool sdOk = SD.begin(SD_CS, sdSPI, 4000000);
     if (sdOk) {
         S.printf("[SD] Mounted %lluMB\n", SD.cardSize() / (1024 * 1024));
+        // Firmware update staged on the card? Flash it before anything else.
+        sfge_ota::checkAndFlash(SD);
         // TESTING: write embedded gameplay configs to the card (no-op when
-        // SWTS_WRITE_TEST_CONFIGS is commented out in swts_test_configs.h)
-        swts_test::writeTestConfigs(SD);
+        // SFGE_WRITE_TEST_CONFIGS is commented out in sfge_test_configs.h)
+        sfge_test::writeTestConfigs(SD);
         loadConfig();
-        swts_lights::load(SD);   // RGB strip pattern (/SWTS/lights.txt)
+        sfge_lights::load(SD);   // RGB strip pattern (/SFGE/lights.txt)
         sdMounted = true;
         moodLoad();
         moodApplyEye();
         S.printf("[MOOD] enabled=%d mood=%d\n", cfg.mood_enabled, mood);
+        servoInit();
     } else {
         S.println("[SD] No SD card / mount failed — insert configured card");
         SD.end();
@@ -577,12 +690,11 @@ void setup() {
     startHttpServer();
 
     S.println("[BOOT] mesh init...");
-    swts::meshInit(cfg.id, swts::ROLE_PANEL, onMeshMsg);
+    sfge::meshInit(cfg.id, sfge::ROLE_PANEL, onMeshMsg);
     S.println("[DROID] Ready — waiting for operatives");
 
     // Boot chirp — three quick rising tones
     buzzGreeting();
-    digitalWrite(EYE_LED, HIGH);
 
     S.println("[DROID] Ready — waiting for operatives");
 }
@@ -590,19 +702,35 @@ void setup() {
 // ═══════════════════════════════════════
 //  LOOP
 // ═══════════════════════════════════════
+volatile bool pendingCelebrate = false;
+volatile uint32_t pendingCelebrateColor = 0;
+
 void loop() {
+    sfge::eventRetryService();   // re-fire gameplay events until datapads/GM confirm
+
+    // Victory celebration (game_complete / faction victory heard on the mesh)
+    if (pendingCelebrate) {
+        pendingCelebrate = false;
+        sfge_lights::celebrate(12000, pendingCelebrateColor);
+        headReact(true);                     // happy wiggle
+        buzzerTone(1047, 120); delay(140);   // C6-E6-G6 fanfare
+        buzzerTone(1319, 120); delay(140);
+        buzzerTone(1568, 350);
+    }
+
     // Lights: idle pattern + any interaction effect queued by HTTP handlers
     if (pendingFx != FX_NONE) {
         uint8_t fx = pendingFx;
         pendingFx = FX_NONE;
         switch (fx) {
-        case FX_ACTIVITY: swts_lights::effectActivity(); break;
-        case FX_SUCCESS:  swts_lights::effectSuccess();  break;
-        case FX_FAIL:     swts_lights::effectFail();     break;
-        case FX_SIGNAL:   swts_lights::effectSignal();   break;
+        case FX_ACTIVITY: sfge_lights::effectActivity(); headReact(true);  break;
+        case FX_SUCCESS:  sfge_lights::effectSuccess();  headReact(true);  break;
+        case FX_FAIL:     sfge_lights::effectFail();     headReact(false); break;
+        case FX_SIGNAL:   sfge_lights::effectSignal();   headReact(true);  break;
         }
     }
-    swts_lights::update();
+    sfge_lights::update();
+    servoService();
 
     // Random idle chatter every 30-60s
     static unsigned long nextChirp = 0;
@@ -615,8 +743,8 @@ void loop() {
     static unsigned long lastBeat = 0;
     if (millis() - lastBeat > 5000) {
         lastBeat = millis();
-        swts::sendPing(millis() / 1000);
-        swts::sendPropStatus(millis() / 1000, cfg.mood_enabled ? mood : 0, false, "");
+        sfge::sendPing(millis() / 1000);
+        sfge::sendPropStatus(millis() / 1000, cfg.mood_enabled ? mood : 0, false, "");
         S.printf("[MESH] ping seq sent (uptime %lus, mood %d)\n", millis() / 1000, mood);
     }
 

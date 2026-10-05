@@ -1,0 +1,17 @@
+{
+  "$schema": "sfge-actor-v1",
+  "device": { "id": "ACTOR_01" },
+  "credits": [
+    { "label": "REWARD +100",  "delta": 100 },
+    { "label": "REWARD +250",  "delta": 250 },
+    { "label": "FINE -100",    "delta": -100 }
+  ],
+  "items": [
+    { "id": "JAMMER",        "label": "GIVE: SIGNAL JAMMER" },
+    { "id": "INFORMANT_TIP", "label": "GIVE: INFORMANT TIP" }
+  ],
+  "events": [
+    { "id": "actor_datacard_received", "label": "FIRE: DATACARD RECEIVED", "severity": 0 },
+    { "id": "imperial_patrol",         "label": "FIRE: IMPERIAL PATROL",   "severity": 2 }
+  ]
+}

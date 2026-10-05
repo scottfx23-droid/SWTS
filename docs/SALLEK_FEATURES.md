@@ -1,4 +1,4 @@
-# SWTS — Sallek demo feature additions
+# SFGE — Sallek demo feature additions
 
 Companion to the root `README.md`. This is the feature spec for the Sallek
 demo wave, with implementation status. Everything is additive; existing
@@ -8,7 +8,7 @@ config files keep working unchanged (unknown keys are ignored).
 
 | Feature | Status | Notes / deviations from the original spec |
 |---|---|---|
-| RSSI proximity gate (panel, droid, terminal) | **done** | `swts_proximity.h`; server-side 403 `too_far` with hysteresis; datapad mirrors it (aborts minigames as `lost_signal` after a 2.5 s grace below −78 dBm) |
+| RSSI proximity gate (panel, droid, terminal) | **done** | `sfge_proximity.h`; server-side 403 `too_far` with hysteresis; datapad mirrors it (aborts minigames as `lost_signal` after a 2.5 s grace below −78 dBm) |
 | Tap-to-use sessions (terminal) | **done** | `PLAYER:<callsign>` card opens a session validated against the mesh roster; `session_open/close:<ID>:<cs>` events; second player denied (`allow_queue` not implemented yet) |
 | Decrypt gate on terminal scans | **done** | `decrypt_required` holds the scanned card; the `nfc:<TERM>:<CARD>` event fires only after the Decrypt minigame is won |
 | Decrypt minigame (Mastermind) | **done** | 4-glyph code (KID: 3 glyphs from 4, 10 tries); prop mode + encrypted-comm mode |

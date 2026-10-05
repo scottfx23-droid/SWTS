@@ -1,13 +1,13 @@
 /*
- * SWTS Panel — Headless hackable wall terminal
+ * SFGE Panel — Headless hackable wall terminal
  * ESP32-S3-WROOM-1 N8R8
  *
- * Boot: Check SD card → copy /SWTS/ to LittleFS → run from flash
- * Config: /SWTS/config.json on LittleFS
+ * Boot: Check SD card → copy /SFGE/ to LittleFS → run from flash
+ * Config: /SFGE/config.json on LittleFS
  * WiFi AP + HTTP API + NFC card slot
  *
  * SD Card: GPIO15=CS, GPIO16=MOSI, GPIO17=CLK, GPIO18=MISO
- * NFC:     GPIO38=SDA, GPIO39=SCL (I2C bus 1)
+ * NFC:     GPIO14=SDA, GPIO13=SCL (I2C bus 1 — same as the terminal)
  */
 
 #include <WiFi.h>
@@ -18,10 +18,11 @@
 #include <Adafruit_PN532.h>
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
-#include "swts_mesh.h"
-#include "swts_lights.h"         // addressable RGB strip (/SWTS/lights.txt)
-#include "swts_proximity.h"      // RSSI gate for interactions
-#include "swts_test_configs.h"   // boot-time test provisioning (see header to disable)
+#include "sfge_mesh.h"
+#include "sfge_lights.h"         // addressable RGB strip (/SFGE/lights.txt)
+#include "sfge_proximity.h"      // RSSI gate for interactions
+#include "sfge_ota.h"            // firmware-from-SD updates
+#include "sfge_test_configs.h"   // boot-time test provisioning (see header to disable)
 
 #define S Serial
 
@@ -45,19 +46,19 @@ void applyPendingFx() {
     pendingFx = FX_NONE;
     switch (fx) {
     case FX_ACTIVITY:
-        swts_lights::effectActivity();
+        sfge_lights::effectActivity();
         buzzerTone(1200, 40);
         break;
     case FX_SUCCESS:
-        swts_lights::effectSuccess();
+        sfge_lights::effectSuccess();
         buzzerTone(523, 80); delay(90); buzzerTone(784, 80); delay(90); buzzerTone(1046, 140);
         break;
     case FX_FAIL:
-        swts_lights::effectFail();
+        sfge_lights::effectFail();
         buzzerTone(220, 250); delay(260); buzzerTone(160, 300);
         break;
     case FX_SIGNAL:
-        swts_lights::effectSignal();
+        sfge_lights::effectSignal();
         buzzerTone(880, 60); delay(70); buzzerTone(1320, 60); delay(70); buzzerTone(1760, 120);
         break;
     }
@@ -75,7 +76,7 @@ SPIClass sdSPI(HSPI);
 // ═══════════════════════════════════════
 //  SD → LittleFS PROVISIONING
 //  On boot: if SD present, wipe flash
-//  and copy all /SWTS/ files to LittleFS.
+//  and copy all /SFGE/ files to LittleFS.
 //  Then run entirely from flash.
 // ═══════════════════════════════════════
 
@@ -146,25 +147,28 @@ bool provisionFromSD() {
         return false;
     }
 
-    // Check if /SWTS/ exists on SD
-    if (!SD.exists("/SWTS/config.json")) {
-        S.println("[SD] No /SWTS/config.json on SD — skipping");
+    // Firmware update staged on the card? Flash it before provisioning.
+    sfge_ota::checkAndFlash(SD);
+
+    // Check if /SFGE/ exists on SD
+    if (!SD.exists("/SFGE/config.json")) {
+        S.println("[SD] No /SFGE/config.json on SD — skipping");
         SD.end();
         return false;
     }
 
     S.println("[SD] SD card detected — provisioning to flash...");
 
-    // Wipe existing /SWTS/ on flash
-    if (LittleFS.exists("/SWTS")) {
+    // Wipe existing /SFGE/ on flash
+    if (LittleFS.exists("/SFGE")) {
         S.println("[SD] Erasing old flash data...");
-        deleteRecursive(LittleFS, "/SWTS");
-        LittleFS.rmdir("/SWTS");
+        deleteRecursive(LittleFS, "/SFGE");
+        LittleFS.rmdir("/SFGE");
     }
 
-    // Copy /SWTS/ from SD to LittleFS
+    // Copy /SFGE/ from SD to LittleFS
     S.println("[SD] Copying files:");
-    copyDir(SD, "/SWTS", LittleFS, "/SWTS");
+    copyDir(SD, "/SFGE", LittleFS, "/SFGE");
 
     SD.end();
     S.println("[SD] Provisioning complete — SD card can be removed");
@@ -178,7 +182,7 @@ bool provisionFromSD() {
 // ═══════════════════════════════════════
 struct PanelConfig {
     char id[16]            = "PANEL_01";
-    char ssid[33]          = "SWTS_PANEL_01";
+    char ssid[33]          = "SFGE_PANEL_01";
     char name[32]          = "Outpost Data Terminal";
     char faction[12]       = "NEUTRAL";
     int  wifi_channel      = 6;
@@ -203,7 +207,7 @@ PanelConfig cfg;
 bool playerSliced = false;
 
 bool loadConfig() {
-    File f = LittleFS.open("/SWTS/config.json", "r");
+    File f = LittleFS.open("/SFGE/config.json", "r");
     if (!f) {
         S.println("[CFG] No config on flash — using defaults");
         return false;
@@ -240,7 +244,7 @@ bool loadConfig() {
     cfg.alarm_timeout_s   = doc["behavior"]["alarm_timeout_s"]       | cfg.alarm_timeout_s;
     cfg.alarm_siren_ms    = doc["behavior"]["alarm_siren_period_ms"] | cfg.alarm_siren_ms;
     cfg.timer_visual      = doc["behavior"]["timer_visual"]          | cfg.timer_visual;
-    swts_prox::loadConfig(doc);
+    sfge_prox::loadConfig(doc);
 
     JsonArray auth = doc["behavior"]["auth_card_ids"].as<JsonArray>();
     cfg.num_auth_cards = 0;
@@ -257,11 +261,11 @@ bool loadConfig() {
 
 // Load a lore file from flash
 String loadLoreFile(const char* filename) {
-    String path = String("/SWTS/") + filename;
+    String path = String("/SFGE/") + filename;
     File f = LittleFS.open(path, "r");
     if (!f) {
         // Try the lore directory
-        File dir = LittleFS.open("/SWTS/lore");
+        File dir = LittleFS.open("/SFGE/lore");
         if (dir && dir.isDirectory()) {
             f = dir.openNextFile();
             if (!f) { dir.close(); return "No data available."; }
@@ -330,13 +334,13 @@ void setAlarm(bool on, const char *byFaction, const char *byCallsign) {
     if (on) {
         hostileFails = 0;
         snprintf(eventId, sizeof(eventId), "alarm:%s", cfg.id);
-        swts::gmTriggerEvent(eventId, "Security alarm tripped", 2,
+        sfge::gmTriggerEvent(eventId, "Security alarm tripped", 2,
                              byCallsign ? byCallsign : "", byFaction ? byFaction : "");
         S.println("[ALARM] TRIPPED");
     } else {
         alarmBypass = false;
         snprintf(eventId, sizeof(eventId), "alarm_clear:%s", cfg.id);
-        swts::gmTriggerEvent(eventId, "Alarm cleared", 0, byCallsign ? byCallsign : "");
+        sfge::gmTriggerEvent(eventId, "Alarm cleared", 0, byCallsign ? byCallsign : "");
         S.println("[ALARM] cleared");
     }
 }
@@ -389,7 +393,7 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
 
     // ── Proximity gate: reject when the datapad's signal is too weak ──
     int stationRssi = 0;
-    if (!swts_prox::check(&stationRssi)) {
+    if (!sfge_prox::check(&stationRssi)) {
         char body[64];
         snprintf(body, sizeof(body), "{\"error\":\"too_far\",\"rssi\":%d}", stationRssi);
         req->send(403, "application/json", body);
@@ -591,7 +595,7 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
             // Announce the breach — missions can key off this event
             char eventId[40];
             snprintf(eventId, sizeof(eventId), "panel_sliced:%s", cfg.id);
-            swts::gmTriggerEvent(eventId, "Panel security breached", 0, callsign);
+            sfge::gmTriggerEvent(eventId, "Panel security breached", 0, callsign);
             resp["game_event"] = eventId;
             resp["message"] = "SYSTEM BREACHED -- ACCESS GRANTED";
             resp["unlocked"] = true;
@@ -666,7 +670,7 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
             // Broadcast the extraction signal — advances the EXTRACTION mission
             char eventId[40];
             snprintf(eventId, sizeof(eventId), "extraction:%s", cfg.id);
-            swts::gmTriggerEvent(eventId, "Extraction signal broadcast", 0, callsign);
+            sfge::gmTriggerEvent(eventId, "Extraction signal broadcast", 0, callsign);
             resp["game_event"] = eventId;
             pendingFx = FX_SIGNAL;
 
@@ -760,11 +764,11 @@ void handleNfc(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_t, si
 bool panelDisabled = false;
 int  diffOverride = -1;  // -1 = use config, else override
 
-void onMeshMsg(const swts::MeshHeader *hdr, const uint8_t *payload, int len) {
+void onMeshMsg(const sfge::MeshHeader *hdr, const uint8_t *payload, int len) {
     switch (hdr->type) {
-        case swts::MSG_OVERRIDE: {
-            if (len < (int)sizeof(swts::MeshOverride)) return;
-            const swts::MeshOverride *o = (const swts::MeshOverride *)payload;
+        case sfge::MSG_OVERRIDE: {
+            if (len < (int)sizeof(sfge::MeshOverride)) return;
+            const sfge::MeshOverride *o = (const sfge::MeshOverride *)payload;
             // Check if it's for us
             if (strcmp(o->target_prop, cfg.id) != 0 && strcmp(o->target_prop, "ALL") != 0) return;
             S.printf("[MESH] Override: %s %s = %s\n", o->target_prop, o->command, o->value);
@@ -774,22 +778,41 @@ void onMeshMsg(const swts::MeshHeader *hdr, const uint8_t *payload, int len) {
             else if (strcmp(o->command, "reset") == 0) { delay(200); ESP.restart(); }
             break;
         }
-        case swts::MSG_RESET: {
+        case sfge::MSG_RESET: {
             S.println("[MESH] Reset received");
             delay(200);
             ESP.restart();
             break;
         }
-        case swts::MSG_ALARM_CLEAR: {
-            if (len < (int)sizeof(swts::MeshAlarmClear)) return;
-            const swts::MeshAlarmClear *a = (const swts::MeshAlarmClear *)payload;
+        case sfge::MSG_NEW_GAME: {
+            // Session wipe: reboot clears slice/alarm/session state
+            S.println("[MESH] NEW GAME — resetting");
+            delay(300 + (esp_random() % 400));   // stagger fleet reboots
+            ESP.restart();
+            break;
+        }
+        case sfge::MSG_EVENT: {
+            // Victory finale: every prop in the room strobes
+            if (len < (int)sizeof(sfge::MeshEvent)) return;
+            const sfge::MeshEvent *e = (const sfge::MeshEvent *)payload;
+            extern volatile bool pendingCelebrate;
+            extern volatile uint32_t pendingCelebrateColor;
+            if (sfge::isCelebrationEvent(e->event_id)) {
+                pendingCelebrateColor = sfge::celebrationColor(e->payload);
+                pendingCelebrate = true;
+            }
+            break;
+        }
+        case sfge::MSG_ALARM_CLEAR: {
+            if (len < (int)sizeof(sfge::MeshAlarmClear)) return;
+            const sfge::MeshAlarmClear *a = (const sfge::MeshAlarmClear *)payload;
             if (strcmp(a->target_prop, cfg.id) != 0 && strcmp(a->target_prop, "ALL") != 0) return;
             if (alarmActive) setAlarm(false, "", "GM");
             break;
         }
-        case swts::MSG_TIMER: {
-            if (len < (int)sizeof(swts::MeshTimer)) return;
-            const swts::MeshTimer *t = (const swts::MeshTimer *)payload;
+        case sfge::MSG_TIMER: {
+            if (len < (int)sizeof(sfge::MeshTimer)) return;
+            const sfge::MeshTimer *t = (const sfge::MeshTimer *)payload;
             extern volatile unsigned long timerEndsAt;
             extern volatile uint32_t timerTotalS;
             if (!t->active) { timerEndsAt = 0; }
@@ -838,7 +861,7 @@ void onWiFiEvent(WiFiEvent_t event) {
 void setup() {
     S.begin(115200);
     delay(500);
-    S.println("\n=== SWTS PANEL ===");
+    S.println("\n=== SFGE PANEL ===");
 
     // Init flash filesystem
     if (!LittleFS.begin(true)) {
@@ -851,20 +874,21 @@ void setup() {
     provisionFromSD();
 
     // TESTING: overwrite flash with embedded gameplay configs (no-op when
-    // SWTS_WRITE_TEST_CONFIGS is commented out in swts_test_configs.h)
-    swts_test::writeTestConfigs(LittleFS);
+    // SFGE_WRITE_TEST_CONFIGS is commented out in sfge_test_configs.h)
+    sfge_test::writeTestConfigs(LittleFS);
 
     // Load config from flash
     loadConfig();
 
     // Buzzer + RGB strip
     pinMode(BUZZER_PIN, OUTPUT);
-    swts_lights::load(LittleFS);
+    sfge_lights::load(LittleFS);
 
     S.printf("Panel: %s (%s)\n", cfg.name, cfg.id);
 
-    // NFC
-    I2C_NFC.begin(38, 39, 100000);
+    // NFC — same pins as the terminal's primary reader (SDA=14, SCL=13)
+    // so one wiring harness fits every prop
+    I2C_NFC.begin(14, 13, 100000);
     delay(50);
     for (uint8_t a = 1; a < 127; a++) {
         I2C_NFC.beginTransmission(a);
@@ -887,7 +911,7 @@ void setup() {
     setupServer();
 
     // ── ESPNOW Mesh ──
-    swts::meshInit(cfg.id, swts::ROLE_PANEL, onMeshMsg);
+    sfge::meshInit(cfg.id, sfge::ROLE_PANEL, onMeshMsg);
 
     S.println("Ready.");
 }
@@ -895,14 +919,30 @@ void setup() {
 // ═══════════════════════════════════════
 //  LOOP
 // ═══════════════════════════════════════
+volatile bool pendingCelebrate = false;
+volatile uint32_t pendingCelebrateColor = 0;
+
 void loop() {
+    sfge::eventRetryService();   // re-fire gameplay events until datapads/GM confirm
+
     // Lights: idle pattern + any interaction effect queued by HTTP handlers
     applyPendingFx();
+
+    // Victory celebration (game_complete / faction victory heard on the mesh)
+    if (pendingCelebrate) {
+        pendingCelebrate = false;
+        if (!alarmActive) {
+            sfge_lights::celebrate(12000, pendingCelebrateColor);
+            buzzerTone(1047, 120); delay(140);   // C6-E6-G6 fanfare
+            buzzerTone(1319, 120); delay(140);
+            buzzerTone(1568, 350);
+        }
+    }
 
     // ── Alarm: strobe + siren while tripped; auto-clear on timeout ──
     if (alarmDirty) {
         alarmDirty = false;
-        swts_lights::setAlarm(alarmActive, cfg.alarm_siren_ms);
+        sfge_lights::setAlarm(alarmActive, cfg.alarm_siren_ms);
     }
     if (alarmActive) {
         static unsigned long lastSiren = 0;
@@ -914,7 +954,7 @@ void loop() {
             millis() - alarmSince > (unsigned long)cfg.alarm_timeout_s * 1000UL) {
             setAlarm(false, "", "timeout");
             alarmDirty = false;
-            swts_lights::setAlarm(false);
+            sfge_lights::setAlarm(false);
         }
     }
 
@@ -929,11 +969,11 @@ void loop() {
                 if (remainMs < 0) remainMs = 0;
                 pct = (uint8_t)(70 - (70 * (remainMs / 1000UL)) / timerTotalS);
             }
-            swts_lights::setTint(pct);
+            sfge_lights::setTint(pct);
         }
     }
 
-    swts_lights::update();
+    sfge_lights::update();
 
     static unsigned long lastPoll = 0;
     if (nfcOk && millis() - lastPoll > 500) {
@@ -956,8 +996,8 @@ void loop() {
         S.printf("[%s] %s | sliced=%d | alarm=%d | nfc=%s | card=%s\n",
                  cfg.id, st[panelState], playerSliced, alarmActive,
                  nfcOk ? "ok" : "--", cardPresent ? lastNfcUid : "--");
-        swts::sendPing(millis() / 1000);
-        swts::sendPropStatus(millis() / 1000, 0, alarmActive, "");
+        sfge::sendPing(millis() / 1000);
+        sfge::sendPropStatus(millis() / 1000, 0, alarmActive, "");
     }
 
     delay(10);

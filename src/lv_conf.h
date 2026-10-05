@@ -1,5 +1,5 @@
 /*
- * LVGL Configuration for SWTS Datapad
+ * LVGL Configuration for SFGE Datapad
  * ESP32-S3 + ST7796 320x480
  */
 #ifndef LV_CONF_H

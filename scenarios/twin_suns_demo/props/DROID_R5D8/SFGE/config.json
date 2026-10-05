@@ -1,0 +1,45 @@
+{
+  "$schema": "sfge-config-v1",
+  "scenario": {"name": "Tatooine Run", "version": "0.1-demo"},
+  "prop": {
+    "type": "droid",
+    "id": "DROID_R5D8",
+    "ssid": "SFGE_DROID_R5",
+    "wifi_channel": 1,
+    "name": "R5-D8",
+    "faction": "rebel",
+    "location_hint": "Storage facility (the generic building)"
+  },
+  "hardware": {
+    "has_nfc_reader": false,
+    "has_leds": true,
+    "has_buzzer": true,
+    "buzzer_pin": 4
+  },
+  "behavior": {
+    "idle_animation": "astromech_idle",
+    "accepts_intel": true,
+    "completes_mission": "intel_run",
+    "minigame_default": "purge",
+    "purge_targets": 12,
+    "purge_time_s": 35,
+    "proximity_enabled": true,
+    "proximity_rssi_start": -60,
+    "proximity_rssi_drop": -72,
+    "proximity_grace_ms": 2000,
+    "mood_enabled": true,
+    "mood_decay_s": 120,
+    "mood_colors": { "hostile": "FF2000", "neutral": "FFAA00", "friendly": "2060FF" },
+    "eye_pixel": 0,
+    "servo": {
+      "enabled": true,
+      "pin": 5,
+      "min_us": 600,
+      "max_us": 2400,
+      "min_deg": 25,
+      "max_deg": 155,
+      "idle_s": 8
+    },
+    "dialogue_greeting": "dialogue/greeting.json"
+  }
+}

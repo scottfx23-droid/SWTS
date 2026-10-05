@@ -1,0 +1,22 @@
+{
+  "$schema": "sfge-config-v1",
+  "scenario": {"name": "Tatooine Run", "version": "0.1-demo"},
+  "prop": {
+    "type": "guild",
+    "id": "GUILD_01",
+    "ssid": "SFGE_GUILD_01",
+    "wifi_channel": 1,
+    "name": "Guild Master Vex",
+    "faction": "neutral",
+    "location_hint": "Bounty Hunters' Guild table, cantina back room"
+  },
+  "hardware": {
+    "has_nfc_reader": false,
+    "has_speaker": true,
+    "has_eyes": true
+  },
+  "behavior": {
+    "proximity_enabled": false,
+    "volume": 18
+  }
+}

@@ -1,5 +1,5 @@
 /*
- * SWTS GM Datapad — Game Master command terminal
+ * SFGE GM Datapad — Game Master command terminal
  * Target: Waveshare ESP32-S3-Touch-LCD-7 (800x480, GT911 touch, TCA9554 IO expander)
  *
  * Pinout:
@@ -25,8 +25,9 @@
 #include <SPI.h>
 #include <SD_MMC.h>
 #include <ArduinoJson.h>
-#include "swts_mesh.h"
-#include "swts_test_configs.h"   // boot-time test provisioning (see header to disable)
+#include "sfge_mesh.h"
+#include "sfge_ota.h"            // firmware-from-SD updates
+#include "sfge_test_configs.h"   // boot-time test provisioning (see header to disable)
 
 #define S Serial
 #define W 800
@@ -172,6 +173,8 @@ struct TrackedDevice {
     int  mood;          // droid mood -5..+5
     bool alarm;         // prop alarm state
     char sessionCs[16]; // terminal: open session's callsign
+    uint32_t uptimeS;   // device uptime (drives the battery estimate)
+    bool lowPowerFlagged;
 };
 
 #define MAX_DEVICES 32
@@ -265,17 +268,25 @@ TrackedDevice* findOrAddDevice(const char *id, uint8_t role) {
 }
 
 // ═══════════════════════════════════════════════
-//  GM CONFIG (from /SWTS/gm_config.json)
+//  GM CONFIG (from /SFGE/gm_config.json)
 // ═══════════════════════════════════════════════
 struct GmConfig {
     char scenario[32] = "Rebel Extraction";
     char planet[24]   = "Tatooine";
     char gm_id[16]    = "GM-1";
     int  max_score    = 1000;
+    // USB power banks expose no charge curve, so datapad battery is
+    // ESTIMATED from uptime against this runtime budget (minutes).
+    int  battery_budget_min = 300;
+    // Reward for a GM-posted manhunt (bounty on a player). game.manhunt_reward
+    int  manhunt_reward = 250;
     // Faction roster — broadcast to datapads for the allegiance pick screen.
     // Overridden by gm_config.json "factions"; defaults for testing.
     char factions[MESH_MAX_FACTIONS][14] = { "REBEL", "IMPERIAL" };
     int  factionCount = 2;
+    // Per-faction celebration color (victory strobe). Overridden by the
+    // optional "faction_colors" array (hex strings, parallel to "factions").
+    uint32_t factionColors[MESH_MAX_FACTIONS] = { 0xFF4400, 0x3388FF, 0x00CC44, 0xAA44FF };
 };
 GmConfig gmConfig;
 
@@ -308,6 +319,7 @@ struct GmTimer {
     int  seconds;
     char on_expire[32];   // event id fired automatically at zero
     char faction[14];     // scope ("" = everyone)
+    bool declare_victory; // at zero: compare faction scores, broadcast victory
 };
 GmTimer gmTimers[MAX_TIMERS];
 int gmTimerCount = 0;
@@ -318,7 +330,7 @@ unsigned long timerLastBcast = 0;
 lv_obj_t *timerBtnLbl[MAX_TIMERS] = {};
 
 bool loadGmConfig() {
-    File f = SD_MMC.open("/SWTS/gm_config.json", FILE_READ);
+    File f = SD_MMC.open("/SFGE/gm_config.json", FILE_READ);
     if (!f) {
         S.println("[GM] gm_config.json not found on SD");
         return false;
@@ -333,6 +345,17 @@ bool loadGmConfig() {
     strlcpy(gmConfig.planet,   doc["scenario"]["planet"] | "Unknown", sizeof(gmConfig.planet));
     strlcpy(gmConfig.gm_id,    doc["device"]["id"] | "GM-1", sizeof(gmConfig.gm_id));
     gmConfig.max_score = doc["game"]["max_score"] | 1000;
+    gmConfig.battery_budget_min = doc["game"]["battery_budget_min"] | gmConfig.battery_budget_min;
+    gmConfig.manhunt_reward = doc["game"]["manhunt_reward"] | gmConfig.manhunt_reward;
+
+    // Optional per-faction victory colors, parallel to "factions"
+    JsonArray fcol = doc["faction_colors"].as<JsonArray>();
+    if (!fcol.isNull()) {
+        for (int i = 0; i < (int)fcol.size() && i < MESH_MAX_FACTIONS; i++) {
+            const char *h = fcol[i].as<const char*>();
+            if (h) gmConfig.factionColors[i] = (uint32_t)strtoul(h, nullptr, 16);
+        }
+    }
 
     // Faction roster (keeps REBEL/IMPERIAL defaults when absent)
     JsonArray fac = doc["factions"].as<JsonArray>();
@@ -390,6 +413,7 @@ bool loadGmConfig() {
         gt.seconds = t["seconds"] | 300;
         strlcpy(gt.on_expire, t["on_expire"] | "", sizeof(gt.on_expire));
         strlcpy(gt.faction, t["faction"] | "", sizeof(gt.faction));
+        gt.declare_victory = t["declare_victory"] | false;
     }
 
     S.printf("[GM] Config: %d events, %d comms, %d bounties, %d timers\n",
@@ -421,7 +445,7 @@ static void ev_timer_btn(lv_event_t *e) {
     char log[80];
     if (activeTimerIdx == i) {
         // Cancel
-        swts::gmSendTimer(gmTimers[i].id, gmTimers[i].label, gmTimers[i].seconds, 0,
+        sfge::gmSendTimer(gmTimers[i].id, gmTimers[i].label, gmTimers[i].seconds, 0,
                           gmTimers[i].faction, false);
         snprintf(log, sizeof(log), "TIMER CANCELLED: %s", gmTimers[i].label);
         logActivity(log, 5);
@@ -437,6 +461,64 @@ static void ev_timer_btn(lv_event_t *e) {
     refreshTimerButtons();
 }
 
+// At countdown zero (declare_victory timers): compare faction score totals
+// and broadcast the ending — a victory event every prop celebrates in the
+// winner's color, plus triumph/defeat comms to each faction's datapads.
+void declareFactionVictory() {
+    extern void recordRecentEvent(const char *, const char *, uint8_t,
+                                  const char *, const char *, const char *);
+    long totals[MESH_MAX_FACTIONS] = {};
+    for (int i = 0; i < deviceCount; i++) {
+        TrackedDevice &d = trackedDevs[i];
+        if (d.role != sfge::ROLE_DATAPAD || d.lastHeard == 0) continue;
+        for (int f = 0; f < gmConfig.factionCount; f++)
+            if (strcasecmp(d.faction, gmConfig.factions[f]) == 0) { totals[f] += d.score; break; }
+    }
+    int win = 0;
+    bool tie = false;
+    for (int f = 1; f < gmConfig.factionCount; f++) {
+        if (totals[f] > totals[win]) { win = f; tie = false; }
+        else if (totals[f] == totals[win]) tie = true;
+    }
+
+    char evId[32], evName[40], payload[64], log[96];
+    if (tie) {
+        strlcpy(evId, "victory_draw", sizeof(evId));
+        strlcpy(evName, "STALEMATE", sizeof(evName));
+        strlcpy(payload, "color=FFFFFF", sizeof(payload));
+        snprintf(log, sizeof(log), "TIME'S UP: DRAW at %ld", totals[0]);
+    } else {
+        char lower[14];
+        strlcpy(lower, gmConfig.factions[win], sizeof(lower));
+        for (char *c = lower; *c; c++) *c = tolower(*c);
+        snprintf(evId, sizeof(evId), "victory_%s", lower);
+        snprintf(evName, sizeof(evName), "%s VICTORY", gmConfig.factions[win]);
+        snprintf(payload, sizeof(payload), "color=%06X", (unsigned)gmConfig.factionColors[win]);
+        snprintf(log, sizeof(log), "TIME'S UP: %s WINS (%ld)", gmConfig.factions[win], totals[win]);
+    }
+    sfge::gmTriggerEvent(evId, evName, 0, payload, "");   // everyone celebrates
+    recordRecentEvent(evId, evName, 0, "", payload, "GM");
+    logActivity(log, 4);
+
+    // Triumph / defeat comms, faction-scoped
+    for (int f = 0; f < gmConfig.factionCount; f++) {
+        char target[16], body[120];
+        snprintf(target, sizeof(target), "@%s", gmConfig.factions[f]);
+        if (tie)
+            snprintf(body, sizeof(body), "Time has run out with the factions dead even at %ld. "
+                     "Nobody holds the outpost tonight.", totals[f]);
+        else if (f == win)
+            snprintf(body, sizeof(body), "VICTORY. %s takes the outpost with %ld points. "
+                     "Outstanding work, operative.", gmConfig.factions[win], totals[win]);
+        else
+            snprintf(body, sizeof(body), "The window has closed. %s holds the outpost with %ld "
+                     "against our %ld. Regroup — this isn't over.",
+                     gmConfig.factions[win], totals[win], totals[f]);
+        sfge::gmPushComm(tie ? "victory_draw_comm" : (f == win ? "victory_win_comm" : "victory_loss_comm"),
+                         target, "COMMAND", tie ? "STALEMATE" : (f == win ? "VICTORY" : "DEFEAT"), body);
+    }
+}
+
 // Called from loop(): rebroadcast every 5 s, fire on_expire at zero
 void tickCountdown() {
     if (activeTimerIdx < 0) return;
@@ -446,9 +528,14 @@ void tickCountdown() {
         char log[80];
         snprintf(log, sizeof(log), "TIMER EXPIRED: %s -> %s", t.label, t.on_expire);
         logActivity(log, 4);
-        swts::gmSendTimer(t.id, t.label, t.seconds, 0, t.faction, false);
-        if (t.on_expire[0])
-            swts::gmTriggerEvent(t.on_expire, t.label, 1, "timer", t.faction);
+        sfge::gmSendTimer(t.id, t.label, t.seconds, 0, t.faction, false);
+        if (t.on_expire[0]) {
+            sfge::gmTriggerEvent(t.on_expire, t.label, 1, "timer", t.faction);
+            extern void recordRecentEvent(const char *, const char *, uint8_t,
+                                          const char *, const char *, const char *);
+            recordRecentEvent(t.on_expire, t.label, 1, t.faction, "timer", "GM");
+        }
+        if (t.declare_victory) declareFactionVictory();
         activeTimerIdx = -1;
         timerEndsAt = 0;
         refreshTimerButtons();
@@ -456,12 +543,12 @@ void tickCountdown() {
     }
     if (millis() - timerLastBcast > 5000) {
         timerLastBcast = millis();
-        swts::gmSendTimer(t.id, t.label, t.seconds, (uint32_t)(rem / 1000), t.faction, true);
+        sfge::gmSendTimer(t.id, t.label, t.seconds, (uint32_t)(rem / 1000), t.faction, true);
     }
 }
 
 // ═══════════════════════════════════════════════
-//  GM STATE PERSISTENCE — /SWTS/gm_state.json
+//  GM STATE PERSISTENCE — /SFGE/gm_state.json
 //  Bounty posting/clue/closed status + last-known leaderboard.
 //  Survives reboot; supports swapping SD into a spare GM mid-event.
 // ═══════════════════════════════════════════════
@@ -472,7 +559,7 @@ unsigned long gmLastSave = 0;
 extern bool sdOk;    // defined later, near setup()
 bool saveGmState() {
     if (!sdOk) return false;
-    File f = SD_MMC.open("/SWTS/gm_state.json", FILE_WRITE);
+    File f = SD_MMC.open("/SFGE/gm_state.json", FILE_WRITE);
     if (!f) { S.println("[GM] save_state: open failed"); return false; }
 
     JsonDocument doc;
@@ -516,7 +603,7 @@ bool saveGmState() {
 }
 
 bool loadGmState() {
-    File f = SD_MMC.open("/SWTS/gm_state.json", FILE_READ);
+    File f = SD_MMC.open("/SFGE/gm_state.json", FILE_READ);
     if (!f) { S.println("[GM] No gm_state.json yet (first boot or fresh card)"); return false; }
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, f);
@@ -569,9 +656,51 @@ bool loadGmState() {
 }
 
 // ═══════════════════════════════════════════════
+//  RECENT GAMEPLAY EVENTS — fuel for the RE-FIRE picker
+// ═══════════════════════════════════════════════
+// Every gameplay event the GM hears (or fires itself) lands in this ring so
+// an operator can manually re-fire any of them from the GM MENU — the
+// "unstick a player" backstop when even the retry window wasn't enough.
+#define RECENT_EVENTS 8
+struct RecentEvent {
+    char event_id[32];
+    char event_name[40];
+    uint8_t severity;
+    char faction[14];
+    char payload[120];
+    char source[16];
+    unsigned long at;
+    bool used;
+};
+RecentEvent recentEvents[RECENT_EVENTS] = {};
+int recentEvHead = 0;
+
+void recordRecentEvent(const char *id, const char *name, uint8_t sev,
+                       const char *faction, const char *payload, const char *source) {
+    // Collapse repeats of the same event id into the newest entry
+    for (int i = 0; i < RECENT_EVENTS; i++) {
+        if (recentEvents[i].used && strcmp(recentEvents[i].event_id, id) == 0) {
+            recentEvents[i].at = millis();
+            return;
+        }
+    }
+    RecentEvent &r = recentEvents[recentEvHead];
+    recentEvHead = (recentEvHead + 1) % RECENT_EVENTS;
+    memset(&r, 0, sizeof(r));
+    strlcpy(r.event_id, id, sizeof(r.event_id));
+    strlcpy(r.event_name, name ? name : "", sizeof(r.event_name));
+    r.severity = sev;
+    if (faction) strlcpy(r.faction, faction, sizeof(r.faction));
+    if (payload) strlcpy(r.payload, payload, sizeof(r.payload));
+    strlcpy(r.source, source ? source : "", sizeof(r.source));
+    r.at = millis();
+    r.used = true;
+}
+
+// ═══════════════════════════════════════════════
 //  MESH HANDLER
 // ═══════════════════════════════════════════════
-void onMeshMsg(const swts::MeshHeader *hdr, const uint8_t *payload, int len) {
+void onMeshMsg(const sfge::MeshHeader *hdr, const uint8_t *payload, int len) {
     TrackedDevice *d = findOrAddDevice(hdr->from_id, hdr->role);
     if (!d) return;
     bool wasInactive = !d->active || (millis() - d->lastHeard > 30000);
@@ -585,8 +714,19 @@ void onMeshMsg(const swts::MeshHeader *hdr, const uint8_t *payload, int len) {
         logActivity(log, 5);
     }
 
-    if (hdr->type == swts::MSG_STATUS && len >= (int)sizeof(swts::MeshStatus)) {
-        const swts::MeshStatus *s = (const swts::MeshStatus *)payload;
+    if (hdr->type == sfge::MSG_STATUS && len >= (int)sizeof(sfge::MeshStatus)) {
+        const sfge::MeshStatus *s = (const sfge::MeshStatus *)payload;
+        d->uptimeS = s->uptime_sec;
+        // Low-battery estimate (uptime vs runtime budget) — flag once at <20%
+        if (d->role == sfge::ROLE_DATAPAD && gmConfig.battery_budget_min > 0) {
+            long pct = 100 - (long)(d->uptimeS * 100 / ((uint32_t)gmConfig.battery_budget_min * 60));
+            if (pct < 20 && !d->lowPowerFlagged) {
+                d->lowPowerFlagged = true;
+                snprintf(log, sizeof(log), "LOW POWER: %s (~%ld%% est)", hdr->from_id, pct < 0 ? 0 : pct);
+                logActivity(log, 4);
+                plogAdd(hdr->from_id, "Low power — swap the bank");
+            }
+        }
         d->score = s->score;
         d->activeMsn = s->mission_active;
         d->missionsDone = s->mission_complete;
@@ -605,8 +745,8 @@ void onMeshMsg(const swts::MeshHeader *hdr, const uint8_t *payload, int len) {
         }
         gmDirty = true;
     }
-    else if (hdr->type == swts::MSG_SCORE && len >= (int)sizeof(swts::MeshScore)) {
-        const swts::MeshScore *s = (const swts::MeshScore *)payload;
+    else if (hdr->type == sfge::MSG_SCORE && len >= (int)sizeof(sfge::MeshScore)) {
+        const sfge::MeshScore *s = (const sfge::MeshScore *)payload;
         d->score = s->new_score;
         snprintf(log, sizeof(log), "%s scored %+d (%s)", hdr->from_id, s->delta, s->reason);
         logActivity(log, 1);
@@ -614,24 +754,40 @@ void onMeshMsg(const swts::MeshHeader *hdr, const uint8_t *payload, int len) {
         plogAdd(hdr->from_id, log);
         gmDirty = true;
     }
-    else if (hdr->type == swts::MSG_NFC_SCAN && len >= (int)sizeof(swts::MeshNfcScan)) {
-        const swts::MeshNfcScan *n = (const swts::MeshNfcScan *)payload;
+    else if (hdr->type == sfge::MSG_NFC_SCAN && len >= (int)sizeof(sfge::MeshNfcScan)) {
+        const sfge::MeshNfcScan *n = (const sfge::MeshNfcScan *)payload;
         snprintf(log, sizeof(log), "%s scanned %s", hdr->from_id, n->tag_name);
         logActivity(log, 2);
         // Terminals report scans too — log those under the terminal's id
         snprintf(log, sizeof(log), "Scanned %s [%s]", n->tag_id, n->category);
         plogAdd(hdr->from_id, log);
     }
-    else if (hdr->type == swts::MSG_SLICE_RESULT && len >= (int)sizeof(swts::MeshSliceResult)) {
-        const swts::MeshSliceResult *r = (const swts::MeshSliceResult *)payload;
+    else if (hdr->type == sfge::MSG_SLICE_RESULT && len >= (int)sizeof(sfge::MeshSliceResult)) {
+        const sfge::MeshSliceResult *r = (const sfge::MeshSliceResult *)payload;
         snprintf(log, sizeof(log), "%s %s slice on %s", hdr->from_id, r->won ? "WON" : "FAILED", r->panel_id);
         logActivity(log, 3);
         snprintf(log, sizeof(log), "%s minigame @ %s", r->won ? "WON" : "LOST", r->panel_id);
         plogAdd(hdr->from_id, log);
         if (r->won) { d->slicesWon++; gmDirty = true; }
     }
-    else if (hdr->type == swts::MSG_DUEL_RESULT && len >= (int)sizeof(swts::MeshDuelResult)) {
-        const swts::MeshDuelResult *r = (const swts::MeshDuelResult *)payload;
+    else if (hdr->type == sfge::MSG_BOUNTY_CLAIM && len >= (int)sizeof(sfge::MeshBountyClaim)) {
+        // Claim issued by the Guild Master prop — settle it on our side too
+        const sfge::MeshBountyClaim *c = (const sfge::MeshBountyClaim *)payload;
+        for (int i = 0; i < bountyCount; i++) {
+            if (strcmp(bountyTemplates[i].id, c->bounty_id) == 0 && !bountyTemplates[i].closed) {
+                bountyTemplates[i].closed = true;
+                gmDirty = true;
+                snprintf(log, sizeof(log), "BOUNTY %s turned in by %s at the Guild (+%d)",
+                         c->bounty_id, c->claimer_id, (int)c->reward);
+                logActivity(log, 1);
+                snprintf(log, sizeof(log), "Guild turn-in: %s (+%d)", c->bounty_id, (int)c->reward);
+                plogAdd(c->claimer_id, log);
+                break;
+            }
+        }
+    }
+    else if (hdr->type == sfge::MSG_DUEL_RESULT && len >= (int)sizeof(sfge::MeshDuelResult)) {
+        const sfge::MeshDuelResult *r = (const sfge::MeshDuelResult *)payload;
         snprintf(log, sizeof(log), "DUEL: %s finished in %lu.%03lus",
                  r->callsign, (unsigned long)r->time_ms / 1000, (unsigned long)r->time_ms % 1000);
         logActivity(log, 3);
@@ -639,14 +795,31 @@ void onMeshMsg(const swts::MeshHeader *hdr, const uint8_t *payload, int len) {
                  (unsigned long)r->time_ms / 1000, (unsigned long)r->time_ms % 1000);
         plogAdd(r->callsign, log);
     }
-    else if (hdr->type == swts::MSG_EVENT && len >= (int)sizeof(swts::MeshEvent)) {
+    else if (hdr->type == sfge::MSG_AWARD && len >= (int)sizeof(sfge::MeshAward)) {
+        // Actor-tool awards — logged for analytics (sender repeats 3x, dedupe)
+        const sfge::MeshAward *a = (const sfge::MeshAward *)payload;
+        static uint32_t seenAwards[8] = {};
+        static int seenAwardIdx = 0;
+        for (int i = 0; i < 8; i++) if (seenAwards[i] == a->code) return;
+        seenAwards[seenAwardIdx] = a->code;
+        seenAwardIdx = (seenAwardIdx + 1) % 8;
+        snprintf(log, sizeof(log), "%s -> %s: %+d%s%s", hdr->from_id, a->target,
+                 (int)a->delta, a->item[0] ? " + " : "", a->item);
+        logActivity(log, 1);
+        snprintf(log, sizeof(log), "%s from %s: %+d%s%s (%s)", a->item[0] ? "Item" : "Credits",
+                 hdr->from_id, (int)a->delta, a->item[0] ? " " : "", a->item, a->reason);
+        plogAdd(a->target, log);
+    }
+    else if (hdr->type == sfge::MSG_EVENT && len >= (int)sizeof(sfge::MeshEvent)) {
         // Prop-originated game events (panel_sliced, droid_handoff, extraction,
         // game_complete, ...) carry the acting player's callsign in payload.
-        const swts::MeshEvent *e = (const swts::MeshEvent *)payload;
+        const sfge::MeshEvent *e = (const sfge::MeshEvent *)payload;
+        recordRecentEvent(e->event_id, e->event_name, e->severity, e->faction,
+                          e->payload, hdr->from_id);
         snprintf(log, sizeof(log), "%s: %s", hdr->from_id, e->event_id);
         logActivity(log, 0);
         for (int i = 0; i < deviceCount; i++) {
-            if (trackedDevs[i].role != swts::ROLE_DATAPAD) continue;
+            if (trackedDevs[i].role != sfge::ROLE_DATAPAD) continue;
             if (strcmp(trackedDevs[i].id, e->payload) != 0) continue;
             snprintf(log, sizeof(log), "%s @ %s", e->event_id, hdr->from_id);
             plogAdd(e->payload, log);
@@ -699,7 +872,8 @@ lv_obj_t *statusLabel = nullptr;
 
 static void ev_trigger_event(lv_event_t *e) {
     EventTemplate *t = (EventTemplate *)lv_event_get_user_data(e);
-    swts::gmTriggerEvent(t->id, t->name, t->severity, t->description, t->faction);
+    sfge::gmTriggerEvent(t->id, t->name, t->severity, t->description, t->faction);
+    recordRecentEvent(t->id, t->name, t->severity, t->faction, t->description, "GM");
     char log[80];
     snprintf(log, sizeof(log), "EVENT: %s -> %s", t->name, t->faction[0] ? t->faction : "ALL");
     logActivity(log, 0);
@@ -710,7 +884,7 @@ static void ev_push_comm(lv_event_t *e) {
     // Faction-tagged templates target "@FACTION"; untagged go to everyone
     char target[16] = "";
     if (t->faction[0]) snprintf(target, sizeof(target), "@%s", t->faction);
-    swts::gmPushComm(t->id, target, t->from, t->subject, t->body);
+    sfge::gmPushComm(t->id, target, t->from, t->subject, t->body);
     char log[80];
     snprintf(log, sizeof(log), "COMM sent: %s -> %s", t->subject, t->faction[0] ? t->faction : "ALL");
     logActivity(log, 4);
@@ -840,8 +1014,8 @@ void refreshDashboard() {
     int onP = 0, onD = 0;
     for (int i = 0; i < deviceCount; i++) {
         bool live = (millis() - trackedDevs[i].lastHeard < 30000);
-        if (live && trackedDevs[i].role == swts::ROLE_PANEL) onP++;
-        if (live && trackedDevs[i].role == swts::ROLE_DATAPAD) onD++;
+        if (live && trackedDevs[i].role == sfge::ROLE_PANEL) onP++;
+        if (live && trackedDevs[i].role == sfge::ROLE_DATAPAD) onD++;
     }
     unsigned long up = millis() / 1000;
     char sb[120];
@@ -854,7 +1028,7 @@ void refreshDashboard() {
     lv_obj_clean(dashTop3);
     int idx[MAX_DEVICES]; int n = 0;
     for (int i = 0; i < deviceCount; i++)
-        if (trackedDevs[i].role == swts::ROLE_DATAPAD && trackedDevs[i].lastHeard != 0)
+        if (trackedDevs[i].role == sfge::ROLE_DATAPAD && trackedDevs[i].lastHeard != 0)
             idx[n++] = i;
     for (int i = 0; i < n - 1; i++)
         for (int j = i + 1; j < n; j++)
@@ -906,7 +1080,7 @@ void refreshDashboard() {
     lv_obj_clean(dashPanelsRow);
     int pn = 0;
     for (int i = 0; i < deviceCount; i++) {
-        if (trackedDevs[i].role != swts::ROLE_PANEL) continue;
+        if (trackedDevs[i].role != sfge::ROLE_PANEL) continue;
         if (trackedDevs[i].lastHeard == 0) continue;   // not heard this session
         TrackedDevice &d = trackedDevs[i];
         bool stale = (millis() - d.lastHeard > 30000);
@@ -1014,7 +1188,7 @@ static void refreshModalPlayers();
 static void ev_post_bounty(lv_event_t *e) {
     if (!modalBounty || modalBounty->posted) return;
     BountyTemplate *t = modalBounty;
-    swts::gmPushBounty(t->id, "", t->target_name, t->description, t->reward);
+    sfge::gmPushBounty(t->id, "", t->target_name, t->description, t->reward);
     t->posted = true;
     t->cluesSent = 0;
     t->closed = false;
@@ -1032,7 +1206,7 @@ static void ev_send_clue(lv_event_t *e) {
     int clueIdx = (int)(intptr_t)lv_event_get_user_data(e);
     if (clueIdx < 0 || clueIdx >= modalBounty->clueCount) return;
     BountyTemplate *t = modalBounty;
-    swts::gmPushBountyClue(t->id, clueIdx + 1, t->clues[clueIdx]);
+    sfge::gmPushBountyClue(t->id, clueIdx + 1, t->clues[clueIdx]);
     if (clueIdx + 1 > t->cluesSent) { t->cluesSent = clueIdx + 1; gmDirty = true; }
     char log[80]; snprintf(log, sizeof(log), "CLUE %d pushed: %s", clueIdx + 1, t->target_name);
     logActivity(log, 4);
@@ -1045,7 +1219,7 @@ static void ev_award_to(lv_event_t *e) {
     TrackedDevice *d = (TrackedDevice *)lv_event_get_user_data(e);
     if (!d) return;
     BountyTemplate *t = modalBounty;
-    swts::gmClaimBounty(t->id, d->id, d->id, t->reward);
+    sfge::gmClaimBounty(t->id, d->id, d->id, t->reward);
     d->score += t->reward;   // GM keeps live mirror
     t->closed = true;
     gmDirty = true;
@@ -1059,7 +1233,7 @@ static void ev_award_to(lv_event_t *e) {
 static void ev_cancel_bounty(lv_event_t *e) {
     if (!modalBounty || modalBounty->closed) return;
     BountyTemplate *t = modalBounty;
-    if (t->posted) swts::gmCancelBounty(t->id, "expired");
+    if (t->posted) sfge::gmCancelBounty(t->id, "expired");
     t->closed = true;
     gmDirty = true;
     char log[80]; snprintf(log, sizeof(log), "BOUNTY %s closed (no winner)", t->target_name);
@@ -1148,7 +1322,7 @@ static void refreshModalPlayers() {
     BountyTemplate *t = modalBounty;
     int shown = 0;
     for (int i = 0; i < deviceCount; i++) {
-        if (trackedDevs[i].role != swts::ROLE_DATAPAD) continue;
+        if (trackedDevs[i].role != sfge::ROLE_DATAPAD) continue;
         TrackedDevice *d = &trackedDevs[i];
         bool stale = (millis() - d->lastHeard > 60000);
         bool canAward = t->posted && !t->closed;
@@ -1492,14 +1666,14 @@ static void ev_target_cycle(lv_event_t *e) {
     int cur = -1;   // -1 = start of the datapad list
     if (composeTargetId[0] != '\0') {
         for (int i = 0; i < deviceCount; i++) {
-            if (trackedDevs[i].role == swts::ROLE_DATAPAD &&
+            if (trackedDevs[i].role == sfge::ROLE_DATAPAD &&
                 strcmp(trackedDevs[i].id, composeTargetId) == 0) { cur = i; break; }
         }
     }
     // Find next datapad heard this session after cur
     int next = -1;
     for (int i = cur + 1; i < deviceCount; i++) {
-        if (trackedDevs[i].role == swts::ROLE_DATAPAD && trackedDevs[i].lastHeard != 0) { next = i; break; }
+        if (trackedDevs[i].role == sfge::ROLE_DATAPAD && trackedDevs[i].lastHeard != 0) { next = i; break; }
     }
     if (next < 0) composeTargetId[0] = '\0';   // wrap to broadcast
     else strlcpy(composeTargetId, trackedDevs[next].id, sizeof(composeTargetId));
@@ -1517,7 +1691,7 @@ static void ev_send_custom_comm(lv_event_t *e) {
     }
     char commId[24];
     snprintf(commId, sizeof(commId), "gm_custom_%lu", millis());
-    swts::gmPushComm(commId, composeTargetId, fromTxt, subjTxt, bodyTxt);
+    sfge::gmPushComm(commId, composeTargetId, fromTxt, subjTxt, bodyTxt);
     char log[80];
     snprintf(log, sizeof(log), "CUSTOM COMM: %s%s%s", subjTxt,
              composeTargetId[0] ? " -> " : "", composeTargetId);
@@ -1726,7 +1900,7 @@ static void ev_assign_send(lv_event_t *e) {
         return;
     }
     S.printf("[GM] Assigning callsign: %s -> %s\n", assignTargetId, name);
-    swts::gmAssignCallsign(assignTargetId, name);
+    sfge::gmAssignCallsign(assignTargetId, name);
     // Also locally rename the tracked device so the UI reflects immediately
     for (int i = 0; i < deviceCount; i++) {
         if (strcmp(trackedDevs[i].id, assignTargetId) == 0) {
@@ -2100,7 +2274,7 @@ void refreshFactionsTab() {
         long total = 0;
         for (int i = 0; i < deviceCount; i++) {
             TrackedDevice &d = trackedDevs[i];
-            if (d.role != swts::ROLE_DATAPAD || d.lastHeard == 0) continue;
+            if (d.role != sfge::ROLE_DATAPAD || d.lastHeard == 0) continue;
             if (strcasecmp(d.faction, gmConfig.factions[f]) != 0) continue;
             members++;
             total  += d.score;
@@ -2167,7 +2341,7 @@ void refreshFactionsTab() {
     // Players who haven't declared yet
     for (int i = 0; i < deviceCount; i++) {
         TrackedDevice &d = trackedDevs[i];
-        if (d.role != swts::ROLE_DATAPAD || d.lastHeard == 0) continue;
+        if (d.role != sfge::ROLE_DATAPAD || d.lastHeard == 0) continue;
         bool known = false;
         for (int f = 0; f < gmConfig.factionCount; f++)
             if (strcasecmp(d.faction, gmConfig.factions[f]) == 0) { known = true; break; }
@@ -2210,7 +2384,7 @@ void pruneStaleUnassigned() {
     bool removed = false;
     for (int i = 0; i < deviceCount; i++) {
         TrackedDevice &d = trackedDevs[i];
-        bool placeholder = (d.role == swts::ROLE_DATAPAD) && gmIsUnassignedCallsign(d.id);
+        bool placeholder = (d.role == sfge::ROLE_DATAPAD) && gmIsUnassignedCallsign(d.id);
         bool quiet = (d.lastHeard == 0) || (millis() - d.lastHeard > 60000);
         if (placeholder && quiet) {
             S.printf("[GM] Pruned stale unassigned device: %s\n", d.id);
@@ -2228,6 +2402,8 @@ void pruneStaleUnassigned() {
 //  PLAYER DETAIL MODAL — full stats + interaction log for one player
 //  Opened by tapping a player card. Refreshed by the 2s UI tick.
 // ═══════════════════════════════════════════════
+int battEstimate(TrackedDevice &d);   // forward decl (defined with the lists)
+
 lv_obj_t *playerModal = nullptr;
 lv_obj_t *playerModalStats = nullptr;   // dynamic: stat lines
 lv_obj_t *playerModalLog = nullptr;     // dynamic: interaction list
@@ -2255,9 +2431,9 @@ static void closePlayerModal(lv_event_t *e) {
 // datapad echoes the mode back in its next status.
 static void ev_modal_toggle_mode(lv_event_t *e) {
     TrackedDevice *d = findDeviceById(playerModalId);
-    if (!d || d->role != swts::ROLE_DATAPAD) return;
+    if (!d || d->role != sfge::ROLE_DATAPAD) return;
     d->kid = !d->kid;
-    swts::gmSetPlayerMode(d->id, d->kid);
+    sfge::gmSetPlayerMode(d->id, d->kid);
     if (playerModalModeLbl)
         lv_label_set_text(playerModalModeLbl, d->kid ? "SET ADULT" : "SET KID");
     char log[80];
@@ -2265,6 +2441,28 @@ static void ev_modal_toggle_mode(lv_event_t *e) {
     logActivity(log, 5);
     plogAdd(d->id, d->kid ? "GM set KID mode" : "GM set ADULT mode");
     gmDirty = true;
+}
+
+// Post a MANHUNT bounty on the player shown in the modal. Claiming it =
+// another player scanning this player's operative card, then Guild turn-in.
+static void ev_modal_manhunt(lv_event_t *e) {
+    TrackedDevice *d = findDeviceById(playerModalId);
+    if (!d || d->role != sfge::ROLE_DATAPAD) return;
+    static uint16_t manhuntSeq = 0;
+    manhuntSeq++;
+    char bid[24];
+    snprintf(bid, sizeof(bid), "mh%u_%s", (unsigned)manhuntSeq, d->id);
+    char desc[60];
+    snprintf(desc, sizeof(desc), "WANTED: operative %s. Scan their card.", d->id);
+    for (int i = 0; i < 2; i++) {   // datapads dedupe by bounty id
+        sfge::gmPushBounty(bid, "", d->id, desc, gmConfig.manhunt_reward, d->id);
+        delay(60);
+    }
+    char log[80];
+    snprintf(log, sizeof(log), "MANHUNT posted on %s (%d)", d->id, gmConfig.manhunt_reward);
+    logActivity(log, 4);
+    plogAdd(d->id, "GM posted a manhunt on this player");
+    closePlayerModal(nullptr);
 }
 
 // Rebuild only the dynamic parts (stats + log) so the buttons stay put
@@ -2292,9 +2490,11 @@ void refreshPlayerDetail() {
     lv_obj_set_style_text_font(l1, &lv_font_montserrat_14, 0);
     lv_obj_set_pos(l1, 0, 0);
 
+    int bp = battEstimate(*d);
     snprintf(line2, sizeof(line2),
-             "SCORE %d      XP %d      MISSIONS %d DONE / %d ACTIVE      SCANS %d      MINIGAMES WON %d",
-             d->score, d->xp, d->missionsDone, d->activeMsn, d->scans, d->slicesWon);
+             "SCORE %d    XP %d    MISSIONS %d DONE / %d ACTIVE    SCANS %d    MINIGAMES WON %d    PWR ~%d%%",
+             d->score, d->xp, d->missionsDone, d->activeMsn, d->scans, d->slicesWon,
+             bp < 0 ? 100 : bp);
     lv_obj_t *l2 = lv_label_create(playerModalStats);
     lv_label_set_text(l2, line2);
     lv_obj_set_style_text_color(l2, C_AMB_BRT, 0);
@@ -2325,7 +2525,7 @@ void refreshPlayerDetail() {
 
 static void ev_open_player_detail(lv_event_t *e) {
     TrackedDevice *d = (TrackedDevice *)lv_event_get_user_data(e);
-    if (!d || d->role != swts::ROLE_DATAPAD || playerModal) return;
+    if (!d || d->role != sfge::ROLE_DATAPAD || playerModal) return;
     strlcpy(playerModalId, d->id, sizeof(playerModalId));
 
     playerModal = lv_obj_create(lv_scr_act());
@@ -2373,6 +2573,21 @@ static void ev_open_player_detail(lv_event_t *e) {
     lv_obj_set_style_text_font(playerModalModeLbl, &lv_font_montserrat_14, 0);
     lv_obj_center(playerModalModeLbl);
 
+    // POST MANHUNT (next to the mode toggle)
+    lv_obj_t *mhBtn = lv_btn_create(playerModal);
+    lv_obj_set_size(mhBtn, 170, 40);
+    lv_obj_align(mhBtn, LV_ALIGN_TOP_RIGHT, -250, 0);
+    lv_obj_set_style_bg_color(mhBtn, C_PNL, 0);
+    lv_obj_set_style_bg_color(mhBtn, C_PNL2, LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(mhBtn, C_RED, 0);
+    lv_obj_set_style_border_width(mhBtn, 1, 0);
+    lv_obj_add_event_cb(mhBtn, ev_modal_manhunt, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *mhl = lv_label_create(mhBtn);
+    lv_label_set_text(mhl, "POST MANHUNT");
+    lv_obj_set_style_text_color(mhl, C_RED, 0);
+    lv_obj_set_style_text_font(mhl, &lv_font_montserrat_14, 0);
+    lv_obj_center(mhl);
+
     // Dynamic stats block
     playerModalStats = lv_obj_create(playerModal);
     lv_obj_set_size(playerModalStats, lv_pct(100), 52);
@@ -2402,6 +2617,16 @@ static void ev_open_player_detail(lv_event_t *e) {
     refreshPlayerDetail();
 }
 
+// Estimated battery % for a datapad on a USB power bank: pure uptime math
+// against the configured runtime budget. -1 = not applicable.
+int battEstimate(TrackedDevice &d) {
+    if (gmConfig.battery_budget_min <= 0 || d.role != sfge::ROLE_DATAPAD) return -1;
+    long pct = 100 - (long)(d.uptimeS * 100 / ((uint32_t)gmConfig.battery_budget_min * 60));
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    return (int)pct;
+}
+
 void refreshLiveLists() {
     if (!playerList || !panelList || !unassignedList) return;
     lv_obj_clean(playerList);
@@ -2412,10 +2637,10 @@ void refreshLiveLists() {
     int playerN = 0, unN = 0, panelN = 0;
     for (int i = 0; i < deviceCount; i++) {
         if (trackedDevs[i].lastHeard == 0) continue;   // not heard this session
-        if (trackedDevs[i].role == swts::ROLE_DATAPAD) {
+        if (trackedDevs[i].role == sfge::ROLE_DATAPAD) {
             if (gmIsUnassignedCallsign(trackedDevs[i].id)) uidx[unN++] = i;
             else                                            idx[playerN++] = i;
-        } else if (trackedDevs[i].role == swts::ROLE_PANEL) {
+        } else if (trackedDevs[i].role == sfge::ROLE_PANEL) {
             pidx[panelN++] = i;
         }
     }
@@ -2463,9 +2688,14 @@ void refreshLiveLists() {
         lv_obj_set_style_text_font(n, &lv_font_montserrat_20, 0);
         lv_obj_set_pos(n, 70, 4);
 
-        char info[96];
-        snprintf(info, sizeof(info), "%s  /  Missions: %d  /  Scans: %d  /  Slices: %d",
-                 d.faction[0] ? d.faction : "NO FACTION", d.activeMsn, d.scans, d.slicesWon);
+        char info[112];
+        int bp = battEstimate(d);
+        if (bp >= 0)
+            snprintf(info, sizeof(info), "%s  /  Missions: %d  /  Scans: %d  /  Slices: %d  /  PWR ~%d%%",
+                     d.faction[0] ? d.faction : "NO FACTION", d.activeMsn, d.scans, d.slicesWon, bp);
+        else
+            snprintf(info, sizeof(info), "%s  /  Missions: %d  /  Scans: %d  /  Slices: %d",
+                     d.faction[0] ? d.faction : "NO FACTION", d.activeMsn, d.scans, d.slicesWon);
         lv_obj_t *st = lv_label_create(card);
         lv_label_set_text(st, info);
         lv_obj_set_style_text_color(st, C_DIM, 0);
@@ -2575,7 +2805,7 @@ void refreshLiveLists() {
             lv_obj_add_event_cb(cb, [](lv_event_t *e) {
                 TrackedDevice *td = (TrackedDevice *)lv_event_get_user_data(e);
                 if (!td) return;
-                swts::gmAlarmClear(td->id);
+                sfge::gmAlarmClear(td->id);
                 td->alarm = false;   // optimistic; next status confirms
                 char log[64];
                 snprintf(log, sizeof(log), "GM cleared alarm on %s", td->id);
@@ -2593,13 +2823,253 @@ void refreshLiveLists() {
         int onP = 0, onD = 0;
         for (int i = 0; i < deviceCount; i++) {
             bool live = (millis() - trackedDevs[i].lastHeard < 30000);
-            if (live && trackedDevs[i].role == swts::ROLE_PANEL) onP++;
-            if (live && trackedDevs[i].role == swts::ROLE_DATAPAD) onD++;
+            if (live && trackedDevs[i].role == sfge::ROLE_PANEL) onP++;
+            if (live && trackedDevs[i].role == sfge::ROLE_DATAPAD) onD++;
         }
         char sb[100];
         snprintf(sb, sizeof(sb), "GM ONLINE  //  %s  //  %s  //  %d PLAYERS  //  %d PANELS",
                  gmConfig.scenario, gmConfig.planet, onD, onP);
         lv_label_set_text(statusLabel, sb);
+    }
+}
+
+// ═══════════════════════════════════════════════
+//  GM MENU — session controls (NEW GAME needs two confirmations)
+// ═══════════════════════════════════════════════
+lv_obj_t *gmMenuModal = nullptr;
+lv_obj_t *gmConfirmModal = nullptr;
+
+static void closeGmMenus() {
+    if (gmConfirmModal) { lv_obj_del(gmConfirmModal); gmConfirmModal = nullptr; }
+    if (gmMenuModal)    { lv_obj_del(gmMenuModal);    gmMenuModal = nullptr; }
+}
+static void ev_gm_menu_close(lv_event_t *e) { closeGmMenus(); }
+
+// Wipe the session: broadcast NEW GAME and clear every local trace
+void doNewGame() {
+    closeGmMenus();
+    logActivity("NEW GAME — session wiped", 4);
+    S.println("[GM] NEW GAME — broadcasting session wipe");
+    for (int i = 0; i < 3; i++) { sfge::gmNewGame(); delay(80); }
+
+    // Local reset: roster, analytics, bounty state, timers
+    deviceCount = 0;
+    playerLogCount = 0;
+    memset(playerLogs, 0, sizeof(playerLogs));
+    for (int i = 0; i < bountyCount; i++) {
+        bountyTemplates[i].posted = false;
+        bountyTemplates[i].cluesSent = 0;
+        bountyTemplates[i].closed = false;
+    }
+    activityHead = 0;
+    activityCount = 0;
+    logActivity("NEW GAME — fresh session", 5);
+    if (activeTimerIdx >= 0) {
+        sfge::gmSendTimer(gmTimers[activeTimerIdx].id, gmTimers[activeTimerIdx].label,
+                          gmTimers[activeTimerIdx].seconds, 0,
+                          gmTimers[activeTimerIdx].faction, false);
+        activeTimerIdx = -1;
+        timerEndsAt = 0;
+    }
+    closePlayerModal(nullptr);
+    gmDirty = true;   // persist the clean slate
+    refreshTimerButtons();
+    refreshLiveLists();
+    refreshDashboard();
+    refreshFactionsTab();
+    refreshBountyCards();
+}
+
+// Generic confirm dialog (title, body, danger button label, action)
+void showGmConfirm(const char *title, const char *body, const char *okLabel,
+                   lv_event_cb_t onOk) {
+    if (gmConfirmModal) { lv_obj_del(gmConfirmModal); gmConfirmModal = nullptr; }
+    gmConfirmModal = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(gmConfirmModal, 520, 230);
+    lv_obj_center(gmConfirmModal);
+    lv_obj_set_style_bg_color(gmConfirmModal, C_PNL, 0);
+    lv_obj_set_style_border_color(gmConfirmModal, C_RED, 0);
+    lv_obj_set_style_border_width(gmConfirmModal, 2, 0);
+    lv_obj_clear_flag(gmConfirmModal, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *t = lv_label_create(gmConfirmModal);
+    lv_label_set_text(t, title);
+    lv_obj_set_style_text_color(t, C_RED, 0);
+    lv_obj_set_style_text_font(t, &lv_font_montserrat_24, 0);
+    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 4);
+
+    lv_obj_t *b = lv_label_create(gmConfirmModal);
+    lv_label_set_text(b, body);
+    lv_obj_set_style_text_color(b, C_TXT, 0);
+    lv_obj_set_style_text_font(b, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_align(b, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(b, 480);
+    lv_obj_align(b, LV_ALIGN_TOP_MID, 0, 46);
+
+    lv_obj_t *ok = lv_btn_create(gmConfirmModal);
+    lv_obj_set_size(ok, 230, 48);
+    lv_obj_align(ok, LV_ALIGN_BOTTOM_LEFT, 10, -10);
+    lv_obj_set_style_bg_color(ok, C_RED, 0);
+    lv_obj_add_event_cb(ok, onOk, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *okl = lv_label_create(ok);
+    lv_label_set_text(okl, okLabel);
+    lv_obj_set_style_text_color(okl, C_WHITE, 0);
+    lv_obj_set_style_text_font(okl, &lv_font_montserrat_16, 0);
+    lv_obj_center(okl);
+
+    lv_obj_t *cc = lv_btn_create(gmConfirmModal);
+    lv_obj_set_size(cc, 160, 48);
+    lv_obj_align(cc, LV_ALIGN_BOTTOM_RIGHT, -10, -10);
+    lv_obj_set_style_bg_color(cc, C_PNL2, 0);
+    lv_obj_set_style_border_color(cc, C_DIM, 0);
+    lv_obj_set_style_border_width(cc, 1, 0);
+    lv_obj_add_event_cb(cc, ev_gm_menu_close, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *ccl = lv_label_create(cc);
+    lv_label_set_text(ccl, "CANCEL");
+    lv_obj_set_style_text_color(ccl, C_TXT, 0);
+    lv_obj_set_style_text_font(ccl, &lv_font_montserrat_16, 0);
+    lv_obj_center(ccl);
+}
+
+static void ev_newgame_confirm2(lv_event_t *e) { doNewGame(); }
+static void ev_newgame_confirm1(lv_event_t *e) {
+    showGmConfirm("ARE YOU SURE?",
+                  "This cannot be undone.\nEvery datapad reboots to registration and\nall scores, missions and analytics are erased.",
+                  "WIPE EVERYTHING", ev_newgame_confirm2);
+}
+static void ev_menu_newgame(lv_event_t *e) {
+    showGmConfirm("NEW GAME",
+                  "End this session for the next group?\nWipes all player progress and resets every prop.",
+                  "CONTINUE", ev_newgame_confirm1);
+}
+static void ev_menu_resync(lv_event_t *e) {
+    sfge::gmSyncRequest();
+    sfge::gmSendFactions(gmConfig.factions, gmConfig.factionCount);
+    logActivity("Manual resync broadcast", 5);
+    closeGmMenus();
+}
+
+// ── RE-FIRE EVENT picker — manually unstick a player whose datapad missed
+//    an event even after the automatic ack/retry window ──
+static void ev_refire_pick(lv_event_t *e) {
+    RecentEvent *r = (RecentEvent *)lv_event_get_user_data(e);
+    if (!r || !r->used) return;
+    sfge::gmTriggerEvent(r->event_id, r->event_name, r->severity, r->payload, r->faction);
+    r->at = millis();
+    char log[80];
+    snprintf(log, sizeof(log), "RE-FIRED: %s (orig %s)", r->event_id, r->source);
+    logActivity(log, 4);
+    closeGmMenus();
+}
+
+static void ev_menu_refire(lv_event_t *e) {
+    closeGmMenus();
+    gmMenuModal = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(gmMenuModal, 560, 420);
+    lv_obj_center(gmMenuModal);
+    lv_obj_set_style_bg_color(gmMenuModal, C_PNL, 0);
+    lv_obj_set_style_border_color(gmMenuModal, C_AMB, 0);
+    lv_obj_set_style_border_width(gmMenuModal, 2, 0);
+    lv_obj_clear_flag(gmMenuModal, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *t = lv_label_create(gmMenuModal);
+    lv_label_set_text(t, "RE-FIRE EVENT");
+    lv_obj_set_style_text_color(t, C_AMB_BRT, 0);
+    lv_obj_set_style_text_font(t, &lv_font_montserrat_20, 0);
+    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 2);
+
+    lv_obj_t *list = lv_obj_create(gmMenuModal);
+    lv_obj_set_size(list, 530, 300);
+    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 36);
+    lv_obj_set_style_bg_opa(list, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(list, 0, 0);
+    lv_obj_set_style_pad_all(list, 2, 0);
+    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(list, 6, 0);
+
+    // Newest first: walk the ring backwards from the head
+    int shown = 0;
+    for (int k = 1; k <= RECENT_EVENTS; k++) {
+        int i = (recentEvHead - k + RECENT_EVENTS) % RECENT_EVENTS;
+        RecentEvent &r = recentEvents[i];
+        if (!r.used) continue;
+        lv_obj_t *btn = lv_btn_create(list);
+        lv_obj_set_size(btn, 516, 52);
+        lv_obj_set_style_bg_color(btn, C_PNL2, 0);
+        lv_obj_set_style_border_color(btn, r.severity >= 2 ? C_RED : C_AMB_DIM, 0);
+        lv_obj_set_style_border_width(btn, 1, 0);
+        lv_obj_add_event_cb(btn, ev_refire_pick, LV_EVENT_CLICKED, &r);
+
+        unsigned long ageS = (millis() - r.at) / 1000;
+        char line[120];
+        snprintf(line, sizeof(line), "%s\n%s  ·  from %s  ·  %lum %lus ago%s%s",
+                 r.event_id, r.event_name[0] ? r.event_name : "(no name)",
+                 r.source, ageS / 60, ageS % 60,
+                 r.faction[0] ? "  ·  " : "", r.faction);
+        lv_obj_t *bl = lv_label_create(btn);
+        lv_label_set_text(bl, line);
+        lv_obj_set_style_text_color(bl, C_TXT, 0);
+        lv_obj_set_style_text_font(bl, &lv_font_montserrat_14, 0);
+        lv_obj_align(bl, LV_ALIGN_LEFT_MID, 4, 0);
+        shown++;
+    }
+    if (shown == 0) {
+        lv_obj_t *none = lv_label_create(list);
+        lv_label_set_text(none, "No gameplay events heard yet this session.");
+        lv_obj_set_style_text_color(none, C_DIM, 0);
+        lv_obj_set_style_text_font(none, &lv_font_montserrat_16, 0);
+    }
+
+    lv_obj_t *cc = lv_btn_create(gmMenuModal);
+    lv_obj_set_size(cc, 160, 48);
+    lv_obj_align(cc, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_set_style_bg_color(cc, C_PNL2, 0);
+    lv_obj_set_style_border_color(cc, C_DIM, 0);
+    lv_obj_set_style_border_width(cc, 1, 0);
+    lv_obj_add_event_cb(cc, ev_gm_menu_close, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *ccl = lv_label_create(cc);
+    lv_label_set_text(ccl, "CLOSE");
+    lv_obj_set_style_text_color(ccl, C_TXT, 0);
+    lv_obj_set_style_text_font(ccl, &lv_font_montserrat_16, 0);
+    lv_obj_center(ccl);
+}
+
+static void ev_gm_menu_open(lv_event_t *e) {
+    if (gmMenuModal) return;
+    gmMenuModal = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(gmMenuModal, 360, 310);
+    lv_obj_center(gmMenuModal);
+    lv_obj_set_style_bg_color(gmMenuModal, C_PNL, 0);
+    lv_obj_set_style_border_color(gmMenuModal, C_AMB, 0);
+    lv_obj_set_style_border_width(gmMenuModal, 2, 0);
+    lv_obj_clear_flag(gmMenuModal, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *t = lv_label_create(gmMenuModal);
+    lv_label_set_text(t, "GM MENU");
+    lv_obj_set_style_text_color(t, C_AMB_BRT, 0);
+    lv_obj_set_style_text_font(t, &lv_font_montserrat_20, 0);
+    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 2);
+
+    struct MenuDef { const char *label; lv_event_cb_t cb; lv_color_t col; };
+    MenuDef items[] = {
+        { "NEW GAME (wipe session)", ev_menu_newgame, C_RED },
+        { "RE-FIRE EVENT",           ev_menu_refire,  C_AMB },
+        { "RESYNC DEVICES",          ev_menu_resync,  C_CYN },
+        { "CLOSE",                   ev_gm_menu_close, C_DIM },
+    };
+    for (int i = 0; i < 4; i++) {
+        lv_obj_t *btn = lv_btn_create(gmMenuModal);
+        lv_obj_set_size(btn, 320, 50);
+        lv_obj_align(btn, LV_ALIGN_TOP_MID, 0, 38 + i * 60);
+        lv_obj_set_style_bg_color(btn, C_PNL2, 0);
+        lv_obj_set_style_border_color(btn, items[i].col, 0);
+        lv_obj_set_style_border_width(btn, 2, 0);
+        lv_obj_add_event_cb(btn, items[i].cb, LV_EVENT_CLICKED, nullptr);
+        lv_obj_t *bl = lv_label_create(btn);
+        lv_label_set_text(bl, items[i].label);
+        lv_obj_set_style_text_color(bl, items[i].col, 0);
+        lv_obj_set_style_text_font(bl, &lv_font_montserrat_16, 0);
+        lv_obj_center(bl);
     }
 }
 
@@ -2626,6 +3096,19 @@ void buildUI() {
     lv_obj_set_style_text_color(brand, C_AMB_BRT, 0);
     lv_obj_set_style_text_font(brand, &lv_font_montserrat_18, 0);
     lv_obj_align(brand, LV_ALIGN_LEFT_MID, 16, 0);
+
+    lv_obj_t *menuBtn = lv_btn_create(hdr);
+    lv_obj_set_size(menuBtn, 76, 24);
+    lv_obj_align(menuBtn, LV_ALIGN_LEFT_MID, 54, 0);
+    lv_obj_set_style_bg_color(menuBtn, C_PNL2, 0);
+    lv_obj_set_style_border_color(menuBtn, C_AMB_DIM, 0);
+    lv_obj_set_style_border_width(menuBtn, 1, 0);
+    lv_obj_add_event_cb(menuBtn, ev_gm_menu_open, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *mbl = lv_label_create(menuBtn);
+    lv_label_set_text(mbl, "MENU");
+    lv_obj_set_style_text_color(mbl, C_AMB, 0);
+    lv_obj_set_style_text_font(mbl, &lv_font_montserrat_14, 0);
+    lv_obj_center(mbl);
 
     statusLabel = lv_label_create(hdr);
     lv_label_set_text(statusLabel, "INITIALIZING...");
@@ -2691,7 +3174,7 @@ void initIoExpander() {
 void setup() {
     S.begin(115200);
     delay(2000);
-    S.println("\n=== SWTS GM (Waveshare 7\" 800x480) ===");
+    S.println("\n=== SFGE GM (Waveshare 7\" 800x480) ===");
 
     // Init IO expander FIRST — turns on backlight, releases LCD/touch reset
     initIoExpander();
@@ -2708,9 +3191,10 @@ void setup() {
     if (SD_MMC.begin("/sdcard", true, false, BOARD_MAX_SDMMC_FREQ, 5)) {
         sdOk = true;
         S.printf("[SD] Mounted %lluMB\n", SD_MMC.cardSize() / (1024*1024));
+        sfge_ota::checkAndFlash(SD_MMC);
         // TESTING: write embedded gameplay configs to the card (no-op when
-        // SWTS_WRITE_TEST_CONFIGS is commented out in swts_test_configs.h)
-        swts_test::writeTestConfigs(SD_MMC);
+        // SFGE_WRITE_TEST_CONFIGS is commented out in sfge_test_configs.h)
+        sfge_test::writeTestConfigs(SD_MMC);
         loadGmConfig();
         loadGmState();   // restore bounty/device state from previous session
     } else {
@@ -2741,14 +3225,14 @@ void setup() {
 
     // Mesh
     WiFi.mode(WIFI_STA);
-    swts::meshInit(gmConfig.gm_id, swts::ROLE_GM, onMeshMsg);
+    sfge::meshInit(gmConfig.gm_id, sfge::ROLE_GM, onMeshMsg);
 
     // Resync after boot — every device replies with its current MSG_STATUS,
     // so tracked-device scores/scans refresh immediately rather than waiting
     // up to 5 s for the natural heartbeat.
     delay(300);                  // give the mesh a moment to settle
-    swts::gmSyncRequest();
-    swts::gmSendFactions(gmConfig.factions, gmConfig.factionCount);
+    sfge::gmSyncRequest();
+    sfge::gmSendFactions(gmConfig.factions, gmConfig.factionCount);
     S.println("[GM] Sync request + faction roster broadcast");
 
     S.println("[GM] Ready");
@@ -2756,6 +3240,7 @@ void setup() {
 
 void loop() {
     lv_timer_handler();
+    sfge::eventRetryService();   // event acks out + re-fire unconfirmed events
 
     static unsigned long lastRefresh = 0;
     if (millis() - lastRefresh > 2000) {
@@ -2772,7 +3257,7 @@ void loop() {
     static unsigned long lastFacBcast = 0;
     if (millis() - lastFacBcast > 10000) {
         lastFacBcast = millis();
-        swts::gmSendFactions(gmConfig.factions, gmConfig.factionCount);
+        sfge::gmSendFactions(gmConfig.factions, gmConfig.factionCount);
     }
 
     // Countdown: rebroadcast + expiry, and keep the button labels ticking

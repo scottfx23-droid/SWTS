@@ -1,6 +1,6 @@
 /*
- * SWTS Datapad — Mission system (SD-driven)
- * Mission and NFC trigger data are loaded from /SWTS/missions.json and /SWTS/nfc_map.json on boot.
+ * SFGE Datapad — Mission system (SD-driven)
+ * Mission and NFC trigger data are loaded from /SFGE/missions.json and /SFGE/nfc_map.json on boot.
  * No game content is baked into firmware.
  */
 #pragma once

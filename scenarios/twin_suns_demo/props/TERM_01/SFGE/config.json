@@ -1,0 +1,30 @@
+{
+  "$schema": "sfge-config-v1",
+  "scenario": {"name": "Tatooine Run", "version": "0.1-demo"},
+  "prop": {
+    "type": "terminal",
+    "id": "TERM_01",
+    "ssid": "SFGE_TERM_01",
+    "wifi_channel": 1,
+    "name": "Repair Shop Decoder",
+    "faction": "rebel",
+    "location_hint": "Speeder repair shop, attached to cantina"
+  },
+  "hardware": {
+    "has_nfc_reader": true,
+    "has_buzzer": true,
+    "buzzer_pin": 4
+  },
+  "behavior": {
+    "scan_cooldown_ms": 1500,
+    "accepts_datatapes": true,
+    "datatape_action": "decrypt",
+    "require_tap_to_use": true,
+    "session_timeout_s": 60,
+    "allow_queue": false,
+    "decrypt_required": true,
+    "decrypt_tries": 6,
+    "decrypt_glyphs": 6,
+    "dialogue_greeting": "dialogue/greeting.json"
+  }
+}

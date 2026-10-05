@@ -1,5 +1,5 @@
 /*
- * SWTS Datapad — Czerka Arms DP-47
+ * SFGE Datapad — Czerka Arms DP-47
  * LVGL + LovyanGFX on ESP32-S3
  */
 #include <LovyanGFX.hpp>
@@ -16,13 +16,14 @@
 
 #include "icons.h"
 #include "missions.h"
-#include "swts_provision.h"
-#include "swts_test_configs.h"   // boot-time test provisioning (see header to disable)
-#include "swts_config.h"
-#include "swts_nfc_map.h"
-#include "swts_missions.h"
-#include "swts_comms.h"
-#include "swts_mesh.h"
+#include "sfge_provision.h"
+#include "sfge_ota.h"            // firmware-from-SD updates
+#include "sfge_test_configs.h"   // boot-time test provisioning (see header to disable)
+#include "sfge_config.h"
+#include "sfge_nfc_map.h"
+#include "sfge_missions.h"
+#include "sfge_comms.h"
+#include "sfge_mesh.h"
 #define S Serial
 
 // ═══════════════════════════════════════
@@ -377,7 +378,7 @@ void initStyles() {
 // ═══════════════════════════════════════
 //  GAME STATE
 // ═══════════════════════════════════════
-char callsign[16] = "OPERATIVE";   // overridden by /SWTS/player.json
+char callsign[16] = "OPERATIVE";   // overridden by /SFGE/player.json
 
 // Derive a unique default callsign from the device's MAC. Format: "DATAPAD-XXXX"
 // where XXXX is the last 4 hex chars of the WiFi MAC. Lets GM distinguish
@@ -438,6 +439,32 @@ void inventoryRemove(const char *id) {
     }
 }
 
+// ── Captured bounties ── chain codes scanned, awaiting Guild turn-in
+#define MAX_CAPTURED 4
+char capturedBounties[MAX_CAPTURED][24];
+int  capturedCount = 0;
+
+bool capturedHas(const char *id) {
+    for (int i = 0; i < capturedCount; i++)
+        if (strcmp(capturedBounties[i], id) == 0) return true;
+    return false;
+}
+bool capturedAdd(const char *id) {
+    if (!id || !id[0] || capturedCount >= MAX_CAPTURED || capturedHas(id)) return false;
+    strlcpy(capturedBounties[capturedCount++], id, sizeof(capturedBounties[0]));
+    return true;
+}
+void capturedRemove(const char *id) {
+    for (int i = 0; i < capturedCount; i++) {
+        if (strcmp(capturedBounties[i], id) == 0) {
+            for (int j = i; j < capturedCount - 1; j++)
+                strlcpy(capturedBounties[j], capturedBounties[j + 1], sizeof(capturedBounties[0]));
+            capturedCount--;
+            return;
+        }
+    }
+}
+
 // ── Duel (PvP reaction game) config — datapad config.json "duel" ──
 bool duelEnabled = true;
 int  duelTargets = 5, duelStake = 100, duelCooldownS = 120;
@@ -485,6 +512,7 @@ int activeBountyCount();    // forward decl, defined alongside the bounty pool
 int xp = 0;
 int activeMissions = 0, inventoryItems = 0, unreadComms = 0, totalScans = 0;
 int slicesWonCount = 0;   // minigames won (any type) — reported to the GM
+volatile bool newGameRequested = false;   // GM NEW GAME broadcast received
 
 // ── Player state forward decls (full impl lives near the SD loaders) ──
 extern volatile bool playerDirty;
@@ -494,7 +522,7 @@ void playerMarkBountyWon(const char *id);
 bool playerHasReadComm(const char *id);
 bool playerHasWonBounty(const char *id);
 
-// ── Mission catalog (loaded from /SWTS/missions.json on boot) ──
+// ── Mission catalog (loaded from /SFGE/missions.json on boot) ──
 MissionDef ALL_MISSIONS[MAX_MISSIONS];
 int NUM_MISSIONS = 0;
 NfcTrigger NFC_TRIGGERS[MAX_TRIGGERS];
@@ -534,6 +562,11 @@ void triggerCommsPrefix(const char *prefix, const char *value);  // forward decl
 void showObjectiveToast(const char *title, const char *body);    // forward decl
 void duelChallenge(const char *target);                          // forward decl
 bool handlePropCommon(JsonDocument &doc);                        // forward decl
+// Bounty pool accessor (pool lives later in the file):
+// returns 0 = no such bounty, 1 = open, 2 = closed
+int bountyLookup(const char *id, char *nameOut, size_t nameSz, int *rewardOut);
+// Manhunt accessor: open bounty on player `cs`? 0 = none, 1 = open, 2 = settled
+int manhuntLookup(const char *cs, char *idOut, size_t idSz, int *rewardOut);
 void renderPropDialogue(JsonDocument &doc);                      // forward decl
 extern lv_obj_t *scrRadar;                                       // radar screen
 void refreshRadarList();                                         // forward decl
@@ -589,7 +622,7 @@ bool advanceStep(uint8_t defIdx, uint8_t stepIdx) {
     // Report progress to the GM for the per-player activity log
     char reason[40];
     snprintf(reason, sizeof(reason), "STEP %d/%d %s", stepIdx + 1, m.num_steps, m.id);
-    swts::sendScore(score, m.steps[stepIdx].xp_reward, reason);
+    sfge::sendScore(score, m.steps[stepIdx].xp_reward, reason);
     // Check if mission complete
     if (msnSlots[slot].current_step >= m.num_steps) {
         msnSlots[slot].complete = true;
@@ -612,7 +645,7 @@ bool advanceStep(uint8_t defIdx, uint8_t stepIdx) {
         }
         S.printf("Mission COMPLETE: %s (+%d cr, +%d xp)\n", m.title, m.reward_credits, m.reward_xp);
         snprintf(reason, sizeof(reason), "MISSION DONE %s", m.id);
-        swts::sendScore(score, m.reward_credits, reason);
+        sfge::sendScore(score, m.reward_credits, reason);
         if (m.is_endgame) debriefPending = true;   // loop() shows the debrief screen
         return true;
     }
@@ -1156,15 +1189,99 @@ void showCardResult(uint8_t *uid, uint8_t len) {
         lv_obj_set_style_text_color(bd, C_AMB, 0);
         lv_obj_set_width(bd, W - 40);
         lv_obj_set_pos(bd, 10, 44);
+        char mhId[24];
+        int  mhReward = 0;
+        int  mhState = (strcmp(who, callsign) == 0) ? 0
+                       : manhuntLookup(who, mhId, sizeof(mhId), &mhReward);
         if (strcmp(who, callsign) == 0) {
             lv_label_set_text(hd, "OPERATIVE CARD");
             lv_label_set_text(bd, "This is your own registry card.");
+        } else if (mhState == 1 && capturedHas(mhId)) {
+            lv_label_set_text(hd, "ALREADY IN CUSTODY");
+            char b[96];
+            snprintf(b, sizeof(b), "%s is already your prisoner.\nReturn to the Guild Master.", who);
+            lv_label_set_text(bd, b);
+            buzzerClick();
+        } else if (mhState == 1) {
+            // MANHUNT: this operative has a price on their head — capture
+            // beats dueling. Same flow as a chain code: captured[] + Guild.
+            capturedAdd(mhId);
+            playerDirty = true; playerLastSave = 0;
+            char eb[40];
+            snprintf(eb, sizeof(eb), "manhunt_capture:%s", who);
+            sfge::gmTriggerEvent(eb, "Operative captured", 1, callsign);
+            queueGameEvent(eb);
+            lv_label_set_text(hd, "TARGET ACQUIRED");
+            char b[112];
+            snprintf(b, sizeof(b), "%s is WANTED — and you just\nbrought them in.\n\nReturn to the GUILD MASTER\nto collect %d %s.",
+                     who, mhReward, scoreSuffix);
+            lv_label_set_text(bd, b);
+            buzzerSuccess();
         } else {
             lv_label_set_text(hd, "OPERATIVE DETECTED");
             char b[96];
             snprintf(b, sizeof(b), "Card belongs to %s.\n\nSending duel challenge...", who);
             lv_label_set_text(bd, b);
             duelChallenge(who);
+        }
+        dcScanning = false;
+        return;
+    }
+
+    // ── Chain code: capturing a bounty target ──
+    if (strncasecmp(token, "CHAIN:", 6) == 0) {
+        const char *bid = token + 6;
+        char bname[24];
+        int breward = 0;
+        int bstate = bountyLookup(bid, bname, sizeof(bname), &breward);
+
+        lv_obj_add_flag(dcSpinner, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(dcPrompt, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(dcResult, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clean(dcResult);
+
+        lv_obj_t *hd = lv_label_create(dcResult);
+        lv_obj_set_style_text_font(hd, &lv_font_montserrat_18, 0);
+        lv_obj_set_pos(hd, 10, 8);
+        lv_obj_t *nm = lv_label_create(dcResult);
+        lv_obj_set_style_text_font(nm, &lv_font_montserrat_24, 0);
+        lv_obj_set_style_text_color(nm, C_AMB, 0);
+        lv_obj_set_pos(nm, 10, 40);
+        lv_obj_t *bd = lv_label_create(dcResult);
+        lv_obj_set_style_text_font(bd, &lv_font_montserrat_14, 0);
+        lv_obj_set_width(bd, W - 40);
+        lv_obj_set_pos(bd, 10, 84);
+
+        if (bstate != 1) {
+            lv_label_set_text(hd, "CHAIN CODE SCANNED");
+            lv_obj_set_style_text_color(hd, C_AMB_DIM, 0);
+            lv_label_set_text(nm, bstate == 2 ? bname : bid);
+            lv_label_set_text(bd, bstate == 2 ? "This contract is already settled."
+                                              : "No active Guild contract\non this target.");
+            lv_obj_set_style_text_color(bd, C_DIM, 0);
+            buzzerScanFail();
+        } else if (capturedHas(bid)) {
+            lv_label_set_text(hd, "ALREADY IN CUSTODY");
+            lv_obj_set_style_text_color(hd, C_AMB_DIM, 0);
+            lv_label_set_text(nm, bname);
+            lv_label_set_text(bd, "Chain code already verified.\nReturn to the Guild Master.");
+            lv_obj_set_style_text_color(bd, C_AMB, 0);
+            buzzerClick();
+        } else {
+            capturedAdd(bid);
+            playerDirty = true; playerLastSave = 0;
+            char eb[40];
+            snprintf(eb, sizeof(eb), "chain_scan:%s", bid);
+            sfge::gmTriggerEvent(eb, "Chain code scanned", 0, callsign);
+            queueGameEvent(eb);
+            lv_label_set_text(hd, "TARGET ACQUIRED");
+            lv_obj_set_style_text_color(hd, C_AMB_BRT, 0);
+            lv_label_set_text(nm, bname);
+            char tb[96];
+            snprintf(tb, sizeof(tb), "Chain code verified.\n\nReturn to the GUILD MASTER\nto collect %d %s.", breward, scoreSuffix);
+            lv_label_set_text(bd, tb);
+            lv_obj_set_style_text_color(bd, C_AMB, 0);
+            buzzerSuccess();
         }
         dcScanning = false;
         return;
@@ -1178,7 +1295,7 @@ void showCardResult(uint8_t *uid, uint8_t len) {
             playerDirty = true; playerLastSave = 0;
             char eb[40];
             snprintf(eb, sizeof(eb), "item_pickup:%s", itemId);
-            swts::gmTriggerEvent(eb, "Item picked up", 0, callsign);
+            sfge::gmTriggerEvent(eb, "Item picked up", 0, callsign);
             queueGameEvent(eb);
             buzzerScanOk();
         } else {
@@ -1211,7 +1328,7 @@ void showCardResult(uint8_t *uid, uint8_t len) {
     triggerCommsPrefix("scan", token);
 
     // Report the scan to the GM (per-player activity log)
-    if (token[0]) swts::sendNfcScan(token, token, "datacard");
+    if (token[0]) sfge::sendNfcScan(token, token, "datacard");
 
     lv_obj_add_flag(dcSpinner, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(dcPrompt, LV_OBJ_FLAG_HIDDEN);
@@ -1359,6 +1476,71 @@ void showCardResult(uint8_t *uid, uint8_t len) {
                 lv_obj_set_pos(nx, 14, 110);
             }
         }
+
+        dcScanning = false;
+        return;
+    }
+
+    // ── Known tag from nfc_map.json: show its real identity ──
+    sfge::NfcTag *mapTag = token[0] ? sfge::lookupById(token) : nullptr;
+    bool isDatacard = (strncasecmp(token, "DATACARD_", 9) == 0);
+    if (mapTag || isDatacard) {
+        lv_obj_add_flag(dcSpinner, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(dcPrompt, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(dcResult, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clean(dcResult);
+        lv_obj_set_style_border_color(dcResult, C_AMB, 0);
+        accentBar(dcResult, C_AMB, 5);
+
+        // Category badge
+        const char *cat = (mapTag && mapTag->category[0]) ? mapTag->category : "DATACARD";
+        char catUp[24];
+        strlcpy(catUp, cat, sizeof(catUp));
+        for (char *p = catUp; *p; p++) *p = toupper(*p);
+        lv_obj_t *bdg = lv_label_create(dcResult);
+        lv_label_set_text(bdg, catUp);
+        lv_obj_set_style_text_font(bdg, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_bg_color(bdg, C_AMB, 0);
+        lv_obj_set_style_bg_opa(bdg, LV_OPA_COVER, 0);
+        lv_obj_set_style_text_color(bdg, C_BG, 0);
+        lv_obj_set_style_radius(bdg, 3, 0);
+        lv_obj_set_style_pad_hor(bdg, 8, 0);
+        lv_obj_set_style_pad_ver(bdg, 3, 0);
+        lv_obj_set_pos(bdg, 14, 0);
+
+        // Name (from the map, else the token itself)
+        lv_obj_t *nm2 = lv_label_create(dcResult);
+        lv_label_set_text(nm2, (mapTag && mapTag->name[0]) ? mapTag->name : token);
+        lv_obj_set_style_text_font(nm2, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_color(nm2, C_AMB_BRT, 0);
+        lv_obj_set_width(nm2, W - 60);
+        lv_obj_set_pos(nm2, 14, 26);
+
+        // Token id line
+        lv_obj_t *idl = lv_label_create(dcResult);
+        lv_label_set_text(idl, token);
+        lv_obj_set_style_text_font(idl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(idl, C_AMB_DIM, 0);
+        lv_obj_set_pos(idl, 14, 56);
+
+        // Description + what to do with it
+        lv_obj_t *ds2 = lv_label_create(dcResult);
+        lv_label_set_text(ds2, (mapTag && mapTag->description[0])
+                ? mapTag->description
+                : "Encrypted datacard.\n\nInsert it at a terminal, or hand\nit to a contact who asks for it.");
+        lv_obj_set_style_text_font(ds2, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(ds2, C_TXT, 0);
+        lv_obj_set_style_text_line_space(ds2, 4, 0);
+        lv_obj_set_width(ds2, W - 60);
+        lv_obj_set_pos(ds2, 14, 80);
+
+        char sb2[32];
+        snprintf(sb2, sizeof(sb2), "SCAN #%d REGISTERED", totalScans);
+        lv_obj_t *st2 = lv_label_create(dcResult);
+        lv_label_set_text(st2, sb2);
+        lv_obj_set_style_text_font(st2, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(st2, C_AMB_BRT, 0);
+        lv_obj_set_pos(st2, 14, 170);
 
         dcScanning = false;
         return;
@@ -1625,7 +1807,7 @@ void doFullScan() {
 
     for (int i = 0; i < n && foundCount < MAX_PROPS; i++) {
         String ssid = WiFi.SSID(i);
-        if (!ssid.startsWith("SWTS_")) continue;
+        if (!ssid.startsWith("SFGE_")) continue;
 
         FoundProp &fp = foundProps[foundCount];
         strlcpy(fp.ssid, ssid.c_str(), sizeof(fp.ssid));
@@ -1645,6 +1827,8 @@ void doFullScan() {
             if (strstr(rest,"R5")) strlcpy(fp.name,"R5-D4 Astromech",24);
             else if (strstr(rest,"GNK")) strlcpy(fp.name,"GNK Power Droid",24);
             else snprintf(fp.name,24,"Droid %s",rest+6);
+        } else if (strncmp(rest,"GUILD_",6)==0) {
+            strlcpy(fp.name,"Bounty Hunters' Guild",24);
         } else {
             strlcpy(fp.name,rest,24);
         }
@@ -1754,6 +1938,8 @@ String postInteract(const char* action) {
     p["mode"] = kidMode ? "KID" : "ADULT";
     JsonArray inv = p["inventory"].to<JsonArray>();
     for (int i = 0; i < inventoryCount; i++) inv.add(inventory[i]);
+    JsonArray cap = p["captured"].to<JsonArray>();
+    for (int i = 0; i < capturedCount; i++) cap.add(capturedBounties[i]);
 
     String body;
     serializeJson(req, body);
@@ -2995,10 +3181,10 @@ char lastDuelPeer[16] = "";
 unsigned long lastDuelAt = 0;
 
 // Pending mesh traffic (set on WiFi task, drained in loop)
-swts::MeshDuelRequest duelReqPending = {};
+sfge::MeshDuelRequest duelReqPending = {};
 volatile bool duelReqFlag = false;
 volatile bool duelAcceptFlag = false, duelDeclineFlag = false;
-swts::MeshDuelResult duelResPending = {};
+sfge::MeshDuelResult duelResPending = {};
 volatile bool duelResFlag = false;
 
 lv_obj_t *scrDuel = NULL;
@@ -3077,8 +3263,8 @@ void duelFinishLocal() {
     ledAllOff();
     btnHandler = defaultBtnTone;
     // Send twice for radio reliability (receiver treats repeats idempotently)
-    swts::sendDuelResult(duelId, callsign, duelMyTime, 0);
-    swts::sendDuelResult(duelId, callsign, duelMyTime, 0);
+    sfge::sendDuelResult(duelId, callsign, duelMyTime, 0);
+    sfge::sendDuelResult(duelId, callsign, duelMyTime, 0);
     duelPhase = DUEL_WAIT_RESULT;
     duelPhaseTime = millis();
     lv_label_set_text(duelBigLbl, "DONE");
@@ -3106,7 +3292,7 @@ void duelResolve() {
         lv_label_set_text(duelBigLbl, "VICTORY");
         char eb[40];
         snprintf(eb, sizeof(eb), "duel_won:%s:%s", callsign, duelOpponent);
-        swts::gmTriggerEvent(eb, "Duel won", 0, callsign);
+        sfge::gmTriggerEvent(eb, "Duel won", 0, callsign);
         queueGameEvent(eb);
     } else {
         score -= duelStakeCur;
@@ -3140,7 +3326,7 @@ void duelChallenge(const char *target) {
     duelSeed = esp_random();
     duelStakeCur = duelStake;
     duelTargetsCur = duelTargets;
-    swts::sendDuelRequest(duelId, callsign, target, duelStakeCur, duelSeed, duelTargetsCur);
+    sfge::sendDuelRequest(duelId, callsign, target, duelStakeCur, duelSeed, duelTargetsCur);
     duelPhase = DUEL_WAIT_ACCEPT;
     duelPhaseTime = millis();
     char b[48];
@@ -3162,13 +3348,13 @@ static void ev_duel_accept(lv_event_t *e) {
     duelStakeCur = duelReqPending.stake;
     duelTargetsCur = duelReqPending.targets;
     duelClosePrompt();
-    swts::sendDuelAccept(duelId, callsign, true);
-    swts::sendDuelAccept(duelId, callsign, true);
+    sfge::sendDuelAccept(duelId, callsign, true);
+    sfge::sendDuelAccept(duelId, callsign, true);
     duelStartPlay();
 }
 
 static void ev_duel_decline(lv_event_t *e) {
-    swts::sendDuelAccept(duelReqPending.duel_id, callsign, false);
+    sfge::sendDuelAccept(duelReqPending.duel_id, callsign, false);
     duelClosePrompt();
 }
 
@@ -3251,7 +3437,7 @@ static void ev_inv_use(lv_event_t *e) {
     if (strcasecmp(inventory[i], "INFORMANT_TIP") != 0 &&
         strcasecmp(inventory[i], "clue") != 0) return;
     // Ping the GM to release the next bounty clue
-    swts::gmTriggerEvent("informant_tip", "Informant tip cashed in", 1, callsign);
+    sfge::gmTriggerEvent("informant_tip", "Informant tip cashed in", 1, callsign);
     inventoryRemove(inventory[i]);
     playerDirty = true; playerLastSave = 0;
     buzzerScanOk();
@@ -3386,7 +3572,7 @@ void refreshRadarList() {
     lv_obj_clean(radarList);
     int shown = 0;
     for (int i = 0; i < MESH_PEER_TABLE; i++) {
-        swts::SenderSeq &p = swts::seqTable[i];
+        sfge::SenderSeq &p = sfge::seqTable[i];
         if (!p.id[0] || strcmp(p.id, callsign) == 0) continue;
         if (millis() - p.lastHeard > 10000) continue;   // stale — expired
         shown++;
@@ -3394,7 +3580,7 @@ void refreshRadarList() {
         const char *bucket = (p.rssi == 0) ? "?"
                            : (p.rssi >= -55) ? "NEAR"
                            : (p.rssi >= -68) ? "CLOSE" : "FAR";
-        bool isPlayer = (p.role == swts::ROLE_DATAPAD);
+        bool isPlayer = (p.role == sfge::ROLE_DATAPAD);
         const char *fac = isPlayer ? peerFactionGet(p.id) : "";
         lv_color_t col = !isPlayer ? C_AMB
                        : (!fac[0]) ? C_DIM
@@ -3490,13 +3676,13 @@ static void applyPlayerName(const char *raw) {
     if (n == 0) return;
 
     strlcpy(callsign, nm, sizeof(callsign));
-    strlcpy(swts::myId, callsign, sizeof(swts::myId));
+    strlcpy(sfge::myId, callsign, sizeof(sfge::myId));
     playerDirty = true;
     playerLastSave = 0;
     S.printf("[PLAYER] Named: %s\n", callsign);
     buzzerScanOk();
     // Fresh status so the GM roster shows the new name right away
-    swts::sendStatus(millis() / 1000, score, activeMissions, completedMissionCount(), totalScans, slicesWonCount, playerFaction, kidMode, xp);
+    sfge::sendStatus(millis() / 1000, score, activeMissions, completedMissionCount(), totalScans, slicesWonCount, playerFaction, kidMode, xp);
 }
 
 void showFactionPick();   // forward decl
@@ -3676,7 +3862,7 @@ static void applyFaction(const char *fac) {
     playerLastSave = 0;
     S.printf("[PLAYER] Faction: %s\n", playerFaction);
     buzzerSuccess();
-    swts::sendStatus(millis() / 1000, score, activeMissions, completedMissionCount(), totalScans, slicesWonCount, playerFaction, kidMode, xp);
+    sfge::sendStatus(millis() / 1000, score, activeMissions, completedMissionCount(), totalScans, slicesWonCount, playerFaction, kidMode, xp);
     // Day-one missions are faction-filtered, so (re)start them now, and
     // re-run boot comms so faction-tagged welcome messages deliver
     autoStartMissions();
@@ -3853,7 +4039,8 @@ void showPropGreeting() {
 
 // Generic dialogue actions (anything that isn't a minigame/logs/disconnect)
 // keep their action string here; buttons carry an index into this table.
-static char propChoiceActions[8][24];
+// 40 chars fits compound actions like "turn_in:<bounty_id>".
+static char propChoiceActions[8][40];
 static int  propChoiceCount = 0;
 
 bool handlePropCommon(JsonDocument &doc);   // forward decl
@@ -4097,7 +4284,7 @@ bool handlePropCommon(JsonDocument &doc) {
 static void ev_prop_action(lv_event_t *e) {
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
     if (idx < 0 || idx >= propChoiceCount) return;
-    char action[24];
+    char action[40];
     strlcpy(action, propChoiceActions[idx], sizeof(action));
 
     String resp = postInteract(action);
@@ -4254,7 +4441,7 @@ static void finishMinigameAndReturn(JsonDocument &req, bool won) {
     }
 
     // Report the minigame outcome to the GM (which prop + won/lost)
-    swts::sendSliceResult(propId[0] ? propId : "PROP", won, 0, won ? 50 : 0, 0);
+    sfge::sendSliceResult(propId[0] ? propId : "PROP", won, 0, won ? 50 : 0, 0);
 
     lv_obj_clean(propContent);
     showPropGreeting();
@@ -4731,7 +4918,7 @@ void showDebrief() {
     lv_scr_load_anim(scrDebrief, LV_SCR_LOAD_ANIM_FADE_ON, 400, 0, false);
 
     // Tell the GM (and any listening props) that this operative finished
-    swts::gmTriggerEvent("game_complete", "Operative extracted", 0, callsign);
+    sfge::gmTriggerEvent("game_complete", "Operative extracted", 0, callsign);
     buzzerFanfare();
 }
 
@@ -4746,6 +4933,7 @@ struct ActiveBounty {
     char target_name[24];
     char description[60];
     int  reward;
+    char target_player[16]; // manhunt: hunted player's callsign ("" = chain-code bounty)
     char clues[MAX_BOUNTY_CLUES][160];
     uint8_t clueCount;
     bool inUse;
@@ -4764,6 +4952,33 @@ ActiveBounty* findBounty(const char *id) {
     for (int i = 0; i < MAX_ACTIVE_BOUNTIES; i++)
         if (bountyPool[i].inUse && strcmp(bountyPool[i].id, id) == 0) return &bountyPool[i];
     return NULL;
+}
+
+// Accessor for code earlier in the file (chain-code scans):
+// 0 = no such bounty, 1 = open, 2 = closed
+int bountyLookup(const char *id, char *nameOut, size_t nameSz, int *rewardOut) {
+    ActiveBounty *b = findBounty(id);
+    if (!b) return 0;
+    if (nameOut) strlcpy(nameOut, b->target_name, nameSz);
+    if (rewardOut) *rewardOut = b->reward;
+    return b->closed ? 2 : 1;
+}
+
+// Manhunt accessor (operative-card scans): find a bounty whose hunted player
+// is `cs`. Returns 0 = none, 1 = open (id/reward filled), 2 = already settled.
+int manhuntLookup(const char *cs, char *idOut, size_t idSz, int *rewardOut) {
+    int best = 0;
+    for (int i = 0; i < MAX_ACTIVE_BOUNTIES; i++) {
+        ActiveBounty &b = bountyPool[i];
+        if (!b.inUse || strcasecmp(b.target_player, cs) != 0) continue;
+        if (!b.closed) {
+            if (idOut) strlcpy(idOut, b.id, idSz);
+            if (rewardOut) *rewardOut = b.reward;
+            return 1;
+        }
+        best = 2;   // keep looking — a newer open hunt wins over a settled one
+    }
+    return best;
 }
 
 ActiveBounty* allocBounty() {
@@ -5152,7 +5367,7 @@ void showCargoResult(uint8_t *uid, uint8_t len) {
     }
 
     // Real cargo identification
-    swts::sendNfcScan(ndefText, ndefText, "cargo");
+    sfge::sendNfcScan(ndefText, ndefText, "cargo");
     lv_obj_set_style_border_color(cgResult, C_AMB, 0);
 
     lv_obj_t *hd = lv_label_create(cgResult);
@@ -5234,13 +5449,13 @@ CommMsg *commInbox[MAX_COMMS]; // pointers to delivered messages (display order)
 int commInboxCount = 0;
 
 // ═══════════════════════════════════════
-//  MISSION + NFC TRIGGER LOADER — from /SWTS/missions.json
+//  MISSION + NFC TRIGGER LOADER — from /SFGE/missions.json
 // ═══════════════════════════════════════
 bool loadMissionsFromSD() {
     NUM_MISSIONS = 0;
     NUM_TRIGGERS = 0;
-    File f = SD.open("/SWTS/missions.json", FILE_READ);
-    if (!f) { S.println("[MSN] /SWTS/missions.json not found"); return false; }
+    File f = SD.open("/SFGE/missions.json", FILE_READ);
+    if (!f) { S.println("[MSN] /SFGE/missions.json not found"); return false; }
 
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, f);
@@ -5309,7 +5524,7 @@ bool loadMissionsFromSD() {
 }
 
 // ═══════════════════════════════════════
-//  PLAYER STATE — /SWTS/player.json
+//  PLAYER STATE — /SFGE/player.json
 //  Identity + runtime state. Survives reboot.
 //  Swap the SD into a spare datapad and it becomes that player.
 // ═══════════════════════════════════════
@@ -5377,7 +5592,7 @@ bool savePlayerState() {
         S.println("[PLAYER] save BLOCKED: existing player.json failed to parse on boot");
         return false;
     }
-    File f = SD.open("/SWTS/player.json", FILE_WRITE);
+    File f = SD.open("/SFGE/player.json", FILE_WRITE);
     if (!f) { S.println("[PLAYER] save FAIL: SD.open returned null"); return false; }
 
     JsonDocument doc;
@@ -5416,6 +5631,9 @@ bool savePlayerState() {
     JsonArray iv = doc["inventory"].to<JsonArray>();
     for (int i = 0; i < inventoryCount; i++) iv.add(inventory[i]);
 
+    JsonArray cp = doc["captured"].to<JsonArray>();
+    for (int i = 0; i < capturedCount; i++) cp.add(capturedBounties[i]);
+
     JsonArray bw = doc["bounties_won"].to<JsonArray>();
     for (int i = 0; i < playerWonBountyCount; i++) bw.add(playerWonBounties[i]);
 
@@ -5432,9 +5650,9 @@ bool loadPlayerState() {
     playerLoadOk = false;
     playerFileExisted = false;
     if (!sdOk) { S.println("[PLAYER] load SKIP: SD not mounted"); return false; }
-    File f = SD.open("/SWTS/player.json", FILE_READ);
+    File f = SD.open("/SFGE/player.json", FILE_READ);
     if (!f) {
-        S.println("[PLAYER] /SWTS/player.json not found — first boot, will create on first save");
+        S.println("[PLAYER] /SFGE/player.json not found — first boot, will create on first save");
         defaultCallsignFromMac(callsign, sizeof(callsign));
         playerLoadOk = true;   // safe to write fresh
         playerDirty = true;    // queue an initial save so the file is created
@@ -5443,7 +5661,7 @@ bool loadPlayerState() {
     }
     playerFileExisted = true;
     size_t sz = f.size();
-    S.printf("[PLAYER] reading /SWTS/player.json (%u bytes)\n", (unsigned)sz);
+    S.printf("[PLAYER] reading /SFGE/player.json (%u bytes)\n", (unsigned)sz);
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, f);
     f.close();
@@ -5504,6 +5722,10 @@ bool loadPlayerState() {
     for (const char *id : doc["inventory"].as<JsonArray>()) {
         if (id && id[0]) inventoryAdd(id);
     }
+    capturedCount = 0;
+    for (const char *id : doc["captured"].as<JsonArray>()) {
+        if (id && id[0]) capturedAdd(id);
+    }
     for (const char *id : doc["comms_read"].as<JsonArray>()) {
         if (playerReadCommCount >= MAX_READ_COMMS) break;
         strlcpy(playerReadComms[playerReadCommCount++], id ? id : "", 20);
@@ -5523,7 +5745,7 @@ bool loadPlayerState() {
 void loadCommsFromSD() {
     commPoolCount = 0;
     commInboxCount = 0;
-    File f = SD.open("/SWTS/comms.json", FILE_READ);
+    File f = SD.open("/SFGE/comms.json", FILE_READ);
     if (!f) {
         S.println("[COMMS] No comms.json on SD");
         return;
@@ -5623,15 +5845,15 @@ void showObjectiveToast(const char *title, const char *body) {
     lastGmAlertTime = millis();
 }
 
-void onMeshMsg(const swts::MeshHeader *hdr, const uint8_t *payload, int len) {
+void onMeshMsg(const sfge::MeshHeader *hdr, const uint8_t *payload, int len) {
     switch (hdr->type) {
-        case swts::MSG_COMM: {
-            if (len < (int)sizeof(swts::MeshComm)) return;
-            const swts::MeshComm *c = (const swts::MeshComm *)payload;
+        case sfge::MSG_COMM: {
+            if (len < (int)sizeof(sfge::MeshComm)) return;
+            const sfge::MeshComm *c = (const sfge::MeshComm *)payload;
             // Targeting: "" = broadcast, "@FACTION" = faction-wide, else one callsign
             if (c->target[0] == '@') {
                 if (strcasecmp(c->target + 1, playerFaction) != 0) return;
-            } else if (c->target[0] != '\0' && strcmp(c->target, swts::myId) != 0) {
+            } else if (c->target[0] != '\0' && strcmp(c->target, sfge::myId) != 0) {
                 return;
             }
             extern void addComm(const char *id, const char *from, const char *subject, const char *body);
@@ -5639,9 +5861,9 @@ void onMeshMsg(const swts::MeshHeader *hdr, const uint8_t *payload, int len) {
             S.printf("[MESH] Comm received: %s\n", c->subject);
             break;
         }
-        case swts::MSG_ALERT: {
-            if (len < (int)sizeof(swts::MeshAlert)) return;
-            const swts::MeshAlert *a = (const swts::MeshAlert *)payload;
+        case sfge::MSG_ALERT: {
+            if (len < (int)sizeof(sfge::MeshAlert)) return;
+            const sfge::MeshAlert *a = (const sfge::MeshAlert *)payload;
             strlcpy(lastGmAlertTitle, a->title, sizeof(lastGmAlertTitle));
             strlcpy(lastGmAlertBody, a->body, sizeof(lastGmAlertBody));
             lastGmAlertSeverity = a->severity;
@@ -5650,10 +5872,10 @@ void onMeshMsg(const swts::MeshHeader *hdr, const uint8_t *payload, int len) {
             S.printf("[MESH] Alert: %s\n", a->title);
             break;
         }
-        case swts::MSG_BOUNTY: {
-            if (len < (int)sizeof(swts::MeshBounty)) return;
-            const swts::MeshBounty *b = (const swts::MeshBounty *)payload;
-            if (strlen(b->target) > 0 && strcmp(b->target, swts::myId) != 0) return;
+        case sfge::MSG_BOUNTY: {
+            if (len < (int)sizeof(sfge::MeshBounty)) return;
+            const sfge::MeshBounty *b = (const sfge::MeshBounty *)payload;
+            if (strlen(b->target) > 0 && strcmp(b->target, sfge::myId) != 0) return;
             ActiveBounty *ab = findBounty(b->bounty_id);
             // Dedupe: if already in pool, drop. (Already-closed bounty must not re-open.)
             if (ab) {
@@ -5667,21 +5889,31 @@ void onMeshMsg(const swts::MeshHeader *hdr, const uint8_t *payload, int len) {
             strlcpy(ab->target_name, b->target_name, sizeof(ab->target_name));
             strlcpy(ab->description, b->description, sizeof(ab->description));
             ab->reward = b->reward;
+            strlcpy(ab->target_player, b->target_player, sizeof(ab->target_player));
             ab->closed = false;
             ab->closedBy[0] = 0;
             ab->wonByMe = false;
-            strlcpy(lastGmAlertTitle, "NEW BOUNTY", sizeof(lastGmAlertTitle));
-            snprintf(lastGmAlertBody, sizeof(lastGmAlertBody), "%s — %d %s", b->target_name, b->reward, scoreSuffix);
-            lastGmAlertSeverity = 1;
+            if (b->target_player[0] && strcasecmp(b->target_player, callsign) == 0) {
+                // The hunted sees it too — now they know to run
+                strlcpy(lastGmAlertTitle, "YOU ARE WANTED", sizeof(lastGmAlertTitle));
+                snprintf(lastGmAlertBody, sizeof(lastGmAlertBody),
+                         "A %d %s bounty is on YOUR head.\nStay away from other operatives.", b->reward, scoreSuffix);
+                lastGmAlertSeverity = 3;
+            } else {
+                strlcpy(lastGmAlertTitle, b->target_player[0] ? "MANHUNT POSTED" : "NEW BOUNTY",
+                        sizeof(lastGmAlertTitle));
+                snprintf(lastGmAlertBody, sizeof(lastGmAlertBody), "%s — %d %s", b->target_name, b->reward, scoreSuffix);
+                lastGmAlertSeverity = 1;
+            }
             lastGmAlertDuration = 4000;
             lastGmAlertTime = millis();
             S.printf("[MESH] Bounty posted: %s (%d)\n", b->target_name, b->reward);
             uiDirtyBountyList = true;
             break;
         }
-        case swts::MSG_BOUNTY_CLUE: {
-            if (len < (int)sizeof(swts::MeshBountyClue)) return;
-            const swts::MeshBountyClue *c = (const swts::MeshBountyClue *)payload;
+        case sfge::MSG_BOUNTY_CLUE: {
+            if (len < (int)sizeof(sfge::MeshBountyClue)) return;
+            const sfge::MeshBountyClue *c = (const sfge::MeshBountyClue *)payload;
             ActiveBounty *ab = findBounty(c->bounty_id);
             if (!ab) { S.printf("[BOUNTY] clue for unknown %s\n", c->bounty_id); break; }
             uint8_t idx = c->clue_num >= 1 ? c->clue_num - 1 : 0;
@@ -5703,9 +5935,9 @@ void onMeshMsg(const swts::MeshHeader *hdr, const uint8_t *payload, int len) {
             if (scrBountyDetail && currentBounty == ab) uiDirtyBountyDetail = true;
             break;
         }
-        case swts::MSG_BOUNTY_CLAIM: {
-            if (len < (int)sizeof(swts::MeshBountyClaim)) return;
-            const swts::MeshBountyClaim *c = (const swts::MeshBountyClaim *)payload;
+        case sfge::MSG_BOUNTY_CLAIM: {
+            if (len < (int)sizeof(sfge::MeshBountyClaim)) return;
+            const sfge::MeshBountyClaim *c = (const sfge::MeshBountyClaim *)payload;
             ActiveBounty *ab = findBounty(c->bounty_id);
             // Dedupe: if we already processed this claim, drop. (Closed bounty = already handled.)
             // Special-case: ab missing means we never saw the POST — still accept the claim once,
@@ -5714,7 +5946,7 @@ void onMeshMsg(const swts::MeshHeader *hdr, const uint8_t *payload, int len) {
                 S.printf("[MESH] Dup claim for %s, dropping\n", c->bounty_id);
                 break;
             }
-            bool me = (strcmp(c->claimer_id, swts::myId) == 0);
+            bool me = (strcmp(c->claimer_id, sfge::myId) == 0);
             if (!ab) {
                 ab = allocBounty();
                 if (ab) {
@@ -5731,11 +5963,17 @@ void onMeshMsg(const swts::MeshHeader *hdr, const uint8_t *payload, int len) {
                 strlcpy(ab->closedBy, claimerLabel, sizeof(ab->closedBy));
                 if (me) ab->wonByMe = true;
             }
+            // Contract settled — the chain code is no longer "in custody"
+            if (capturedHas(c->bounty_id)) {
+                capturedRemove(c->bounty_id);
+                playerDirty = true;
+                playerLastSave = 0;
+            }
             if (me) {
                 score += c->reward;
                 uiDirtyScore = true;
                 playerMarkBountyWon(c->bounty_id);
-                swts::sendScore(score, c->reward, "BOUNTY");
+                sfge::sendScore(score, c->reward, "BOUNTY");
                 strlcpy(lastGmAlertTitle, "BOUNTY COLLECTED", sizeof(lastGmAlertTitle));
                 snprintf(lastGmAlertBody, sizeof(lastGmAlertBody), "%s   +%d %s", targetName, c->reward, scoreSuffix);
                 lastGmAlertSeverity = 0;
@@ -5753,9 +5991,9 @@ void onMeshMsg(const swts::MeshHeader *hdr, const uint8_t *payload, int len) {
             if (scrBountyDetail && currentBounty == ab && ab) uiDirtyBountyDetail = true;
             break;
         }
-        case swts::MSG_BOUNTY_CANCEL: {
-            if (len < (int)sizeof(swts::MeshBountyCancel)) return;
-            const swts::MeshBountyCancel *c = (const swts::MeshBountyCancel *)payload;
+        case sfge::MSG_BOUNTY_CANCEL: {
+            if (len < (int)sizeof(sfge::MeshBountyCancel)) return;
+            const sfge::MeshBountyCancel *c = (const sfge::MeshBountyCancel *)payload;
             ActiveBounty *ab = findBounty(c->bounty_id);
             if (!ab) break;
             ab->closed = true;
@@ -5764,74 +6002,92 @@ void onMeshMsg(const swts::MeshHeader *hdr, const uint8_t *payload, int len) {
             uiDirtyBountyList = true;
             break;
         }
-        case swts::MSG_EVENT: {
-            if (len < (int)sizeof(swts::MeshEvent)) return;
-            const swts::MeshEvent *e = (const swts::MeshEvent *)payload;
+        case sfge::MSG_EVENT: {
+            if (len < (int)sizeof(sfge::MeshEvent)) return;
+            const sfge::MeshEvent *e = (const sfge::MeshEvent *)payload;
             // Faction-scoped events only reach players of that faction
             if (e->faction[0] && strcasecmp(e->faction, playerFaction) != 0) {
                 S.printf("[MESH] Event %s is for %s — ignored\n", e->event_id, e->faction);
                 return;
             }
             S.printf("[MESH] Event: %s (sev %d)\n", e->event_name, e->severity);
+            // Manhunt: the hunted player finds out they've been brought in
+            // (payload = the hunter's callsign)
+            if (strncasecmp(e->event_id, "manhunt_capture:", 16) == 0 &&
+                strcasecmp(e->event_id + 16, callsign) == 0) {
+                strlcpy(lastGmAlertTitle, "CAPTURED", sizeof(lastGmAlertTitle));
+                snprintf(lastGmAlertBody, sizeof(lastGmAlertBody),
+                         "%s scanned your operative card.\nYou've been brought in.", e->payload);
+                lastGmAlertSeverity = 3;
+                lastGmAlertDuration = 6000;
+                lastGmAlertTime = millis();
+            }
             // Queued, not handled inline: this callback can run on the WiFi task.
             // loop() drains the queue → fires comms + advances mission steps.
             queueGameEvent(e->event_id);
             break;
         }
-        case swts::MSG_RESET: {
+        case sfge::MSG_RESET: {
             S.println("[MESH] Reset command — restarting");
             delay(500);
             ESP.restart();
             break;
         }
-        case swts::MSG_ASSIGN: {
-            if (len < (int)sizeof(swts::MeshAssign)) return;
-            const swts::MeshAssign *a = (const swts::MeshAssign *)payload;
+        case sfge::MSG_ASSIGN: {
+            if (len < (int)sizeof(sfge::MeshAssign)) return;
+            const sfge::MeshAssign *a = (const sfge::MeshAssign *)payload;
             // Only act if this assignment targets us specifically (by current callsign).
-            if (strcmp(a->target, swts::myId) != 0) return;
+            if (strcmp(a->target, sfge::myId) != 0) return;
             if (!a->new_callsign[0]) return;
             S.printf("[MESH] Callsign assignment: %s -> %s\n", callsign, a->new_callsign);
             strlcpy(callsign, a->new_callsign, sizeof(callsign));
-            strlcpy(swts::myId, callsign, sizeof(swts::myId));
+            strlcpy(sfge::myId, callsign, sizeof(sfge::myId));
             playerDirty = true;
             playerLastSave = 0;
             // Send a fresh status with the new ID so the GM can drop the "OPERATIVE/DATAPAD-xxxx" entry
             unsigned long up = millis() / 1000;
-            swts::sendStatus(up, score, activeMissions, completedMissionCount(), totalScans, slicesWonCount, playerFaction, kidMode, xp);
+            sfge::sendStatus(up, score, activeMissions, completedMissionCount(), totalScans, slicesWonCount, playerFaction, kidMode, xp);
             break;
         }
-        case swts::MSG_SYNC_REQUEST: {
+        case sfge::MSG_SYNC_REQUEST: {
             // GM is asking everyone to re-report their state.
             unsigned long up = millis() / 1000;
-            swts::sendStatus(up, score, activeMissions, completedMissionCount(), totalScans, slicesWonCount, playerFaction, kidMode, xp);
+            sfge::sendStatus(up, score, activeMissions, completedMissionCount(), totalScans, slicesWonCount, playerFaction, kidMode, xp);
             S.println("[MESH] Sync request — replied with status");
             break;
         }
-        case swts::MSG_PLAYER_MODE: {
+        case sfge::MSG_NEW_GAME: {
+            // GM session wipe — handled from loop() so a mid-flight player
+            // save can't resurrect the old state
+            extern volatile bool newGameRequested;
+            newGameRequested = true;
+            break;
+        }
+        case sfge::MSG_PLAYER_MODE: {
             // GM sets this player's difficulty mode (ADULT/KID)
-            if (len < (int)sizeof(swts::MeshPlayerMode)) return;
-            const swts::MeshPlayerMode *m = (const swts::MeshPlayerMode *)payload;
-            if (strcmp(m->target, swts::myId) != 0) return;
+            if (len < (int)sizeof(sfge::MeshPlayerMode)) return;
+            const sfge::MeshPlayerMode *m = (const sfge::MeshPlayerMode *)payload;
+            if (strcmp(m->target, sfge::myId) != 0) return;
             kidMode = (m->kid != 0);
             playerDirty = true;
             playerLastSave = 0;
             S.printf("[MESH] Difficulty mode set: %s\n", kidMode ? "KID" : "ADULT");
             showObjectiveToast("DIFFICULTY UPDATED", kidMode ? "KID MODE" : "ADULT MODE");
             unsigned long up = millis() / 1000;
-            swts::sendStatus(up, score, activeMissions, completedMissionCount(), totalScans, slicesWonCount, playerFaction, kidMode, xp);
+            sfge::sendStatus(up, score, activeMissions, completedMissionCount(), totalScans, slicesWonCount, playerFaction, kidMode, xp);
             break;
         }
-        case swts::MSG_STATUS: {
+        case sfge::MSG_STATUS: {
             // Other datapads' broadcasts — cache their faction for the radar
-            if (hdr->role != swts::ROLE_DATAPAD) return;
-            if (len < (int)sizeof(swts::MeshStatus)) return;
-            const swts::MeshStatus *s = (const swts::MeshStatus *)payload;
+            if (hdr->role != sfge::ROLE_DATAPAD) return;
+            if (len < (int)sizeof(sfge::MeshStatus)) return;
+            const sfge::MeshStatus *s = (const sfge::MeshStatus *)payload;
             peerFactionNote(hdr->from_id, s->faction);
             break;
         }
-        case swts::MSG_TIMER: {
-            if (len < (int)sizeof(swts::MeshTimer)) return;
-            const swts::MeshTimer *t = (const swts::MeshTimer *)payload;
+        case sfge::MSG_TIMER: {
+            if (len < (int)sizeof(sfge::MeshTimer)) return;
+            const sfge::MeshTimer *t = (const sfge::MeshTimer *)payload;
             // Faction-scoped timers only show for that faction
             if (t->faction[0] && strcasecmp(t->faction, playerFaction) != 0) return;
             if (!t->active) { timerEndsAtMs = 0; timerLabel[0] = 0; break; }
@@ -5839,36 +6095,36 @@ void onMeshMsg(const swts::MeshHeader *hdr, const uint8_t *payload, int len) {
             timerEndsAtMs = millis() + t->remaining_s * 1000UL;
             break;
         }
-        case swts::MSG_DUEL_REQUEST: {
-            if (len < (int)sizeof(swts::MeshDuelRequest)) return;
-            const swts::MeshDuelRequest *d = (const swts::MeshDuelRequest *)payload;
-            if (strcmp(d->target, swts::myId) != 0) return;
+        case sfge::MSG_DUEL_REQUEST: {
+            if (len < (int)sizeof(sfge::MeshDuelRequest)) return;
+            const sfge::MeshDuelRequest *d = (const sfge::MeshDuelRequest *)payload;
+            if (strcmp(d->target, sfge::myId) != 0) return;
             if (duelPhase != DUEL_IDLE || duelReqFlag) return;   // busy
             memcpy(&duelReqPending, d, sizeof(duelReqPending));
             duelReqFlag = true;   // loop() shows the accept/decline prompt
             break;
         }
-        case swts::MSG_DUEL_ACCEPT: {
-            if (len < (int)sizeof(swts::MeshDuelAccept)) return;
-            const swts::MeshDuelAccept *d = (const swts::MeshDuelAccept *)payload;
+        case sfge::MSG_DUEL_ACCEPT: {
+            if (len < (int)sizeof(sfge::MeshDuelAccept)) return;
+            const sfge::MeshDuelAccept *d = (const sfge::MeshDuelAccept *)payload;
             if (duelPhase != DUEL_WAIT_ACCEPT || strcmp(d->duel_id, duelId) != 0) return;
             if (d->accept) duelAcceptFlag = true;
             else           duelDeclineFlag = true;
             break;
         }
-        case swts::MSG_DUEL_RESULT: {
-            if (len < (int)sizeof(swts::MeshDuelResult)) return;
-            const swts::MeshDuelResult *d = (const swts::MeshDuelResult *)payload;
+        case sfge::MSG_DUEL_RESULT: {
+            if (len < (int)sizeof(sfge::MeshDuelResult)) return;
+            const sfge::MeshDuelResult *d = (const sfge::MeshDuelResult *)payload;
             if (strcmp(d->duel_id, duelId) != 0) return;
             if (strcmp(d->callsign, duelOpponent) != 0) return;   // only theirs
             memcpy(&duelResPending, d, sizeof(duelResPending));
             duelResFlag = true;
             break;
         }
-        case swts::MSG_FACTIONS: {
+        case sfge::MSG_FACTIONS: {
             // GM broadcasts the scenario's faction roster
-            if (len < (int)sizeof(swts::MeshFactions)) return;
-            const swts::MeshFactions *f = (const swts::MeshFactions *)payload;
+            if (len < (int)sizeof(sfge::MeshFactions)) return;
+            const sfge::MeshFactions *f = (const sfge::MeshFactions *)payload;
             if (f->count == 0) return;
             factionCount = 0;
             for (int i = 0; i < f->count && i < MESH_MAX_FACTIONS; i++) {
@@ -5879,7 +6135,7 @@ void onMeshMsg(const swts::MeshHeader *hdr, const uint8_t *payload, int len) {
             factionListDirty = true;
             break;
         }
-        case swts::MSG_SCORE_SET: {
+        case sfge::MSG_SCORE_SET: {
             if (len < 4) return;
             int32_t newScore = *(int32_t*)payload;
             extern int score;
@@ -5887,6 +6143,44 @@ void onMeshMsg(const swts::MeshHeader *hdr, const uint8_t *payload, int len) {
             uiDirtyScore = true;
             playerDirty = true;
             S.printf("[MESH] Score forced to %d\n", newScore);
+            break;
+        }
+        case sfge::MSG_AWARD: {
+            // Actor tool (or GM) hands this player credits and/or an item
+            if (len < (int)sizeof(sfge::MeshAward)) return;
+            const sfge::MeshAward *a = (const sfge::MeshAward *)payload;
+            if (strcasecmp(a->target, callsign) != 0) return;
+            // Sender repeats 3x against frame loss — apply each code once
+            static uint32_t seenAwards[8] = {};
+            static int seenAwardIdx = 0;
+            for (int i = 0; i < 8; i++) if (seenAwards[i] == a->code) return;
+            seenAwards[seenAwardIdx] = a->code;
+            seenAwardIdx = (seenAwardIdx + 1) % 8;
+            extern int score;
+            bool gotItem = false;
+            if (a->item[0]) gotItem = inventoryAdd(a->item);
+            score += a->delta;
+            if (score < 0) score = 0;
+            uiDirtyScore = true;
+            playerDirty = true; playerLastSave = 0;
+            if (a->delta >= 0)
+                strlcpy(lastGmAlertTitle, gotItem ? "SUPPLY DROP" : "CREDITS AWARDED",
+                        sizeof(lastGmAlertTitle));
+            else
+                strlcpy(lastGmAlertTitle, "CREDITS DEDUCTED", sizeof(lastGmAlertTitle));
+            if (a->delta != 0 && gotItem)
+                snprintf(lastGmAlertBody, sizeof(lastGmAlertBody), "%+d %s and %s\n%s",
+                         (int)a->delta, scoreSuffix, a->item, a->reason);
+            else if (gotItem)
+                snprintf(lastGmAlertBody, sizeof(lastGmAlertBody), "Received: %s\n%s",
+                         a->item, a->reason);
+            else
+                snprintf(lastGmAlertBody, sizeof(lastGmAlertBody), "%+d %s\n%s",
+                         (int)a->delta, scoreSuffix, a->reason);
+            lastGmAlertSeverity = a->delta < 0 ? 2 : 1;
+            lastGmAlertDuration = 5000;
+            lastGmAlertTime = millis();
+            S.printf("[MESH] Award from %s: %+d, item=%s\n", hdr->from_id, (int)a->delta, a->item);
             break;
         }
         default:
@@ -6216,7 +6510,7 @@ void setup() {
     // Wait for serial monitor to connect
     delay(3000);
     S.println("\n================================");
-    S.println("  SWTS DATAPAD — Czerka DP-47");
+    S.println("  SFGE DATAPAD — Czerka DP-47");
     S.println("================================");
     // Why did the previous boot end? Critical info for diagnosing "random reboots":
     //   POWERON_RESET (1) = power cycle / USB suspend on host
@@ -6256,12 +6550,15 @@ void setup() {
         sdOk = true;
         S.printf("[SD] Mounted %lluMB\n", SD.cardSize() / (1024*1024));
 
+        // Firmware update staged on the card? Flash it before anything else.
+        sfge_ota::checkAndFlash(SD);
+
         // TESTING: write embedded gameplay configs to the card (no-op when
-        // SWTS_WRITE_TEST_CONFIGS is commented out in swts_test_configs.h)
-        swts_test::writeTestConfigs(SD);
+        // SFGE_WRITE_TEST_CONFIGS is commented out in sfge_test_configs.h)
+        sfge_test::writeTestConfigs(SD);
 
         // Load config from SD
-        File cfg = SD.open("/SWTS/config.json", FILE_READ);
+        File cfg = SD.open("/SFGE/config.json", FILE_READ);
         if (cfg) {
             JsonDocument doc;
             if (!deserializeJson(doc, cfg)) {
@@ -6283,6 +6580,7 @@ void setup() {
 
         // Load game data from SD — order matters: missions before player state
         initMissions();
+        sfge::loadNfcMap(SD);   // tag identities for the datacard reader
         loadMissionsFromSD();
         loadPlayerState();    // restores callsign, score, mission progress, comm-read flags
         loadCommsFromSD();    // loads pool + delivers boot-triggered comms (welcome etc.)
@@ -6359,8 +6657,8 @@ void setup() {
     // ── ESPNOW Mesh ──
     // WiFi must be in STA mode for ESPNOW (it already is after our scan)
     WiFi.mode(WIFI_STA);
-    swts::meshInit(callsign, swts::ROLE_DATAPAD, onMeshMsg);
-    if (radarEnabled) swts::meshEnableRssi();   // per-peer RSSI for the radar
+    sfge::meshInit(callsign, sfge::ROLE_DATAPAD, onMeshMsg);
+    if (radarEnabled) sfge::meshEnableRssi();   // per-peer RSSI for the radar
 }
 
 // ═══════════════════════════════════════
@@ -6371,6 +6669,7 @@ static unsigned long cgTime = 0;
 
 void loop() {
     lv_timer_handler();
+    sfge::eventRetryService();   // event acks out + re-fire our own unconfirmed events
 
     // Physical button polling — drives the colored LEDs + emits edge events
     pollButtons();
@@ -6454,6 +6753,18 @@ void loop() {
         openPropScreen(idx);
     }
 
+    // NEW GAME from the GM: wipe this player's save and reboot into the
+    // registration flow for the next renter
+    extern volatile bool newGameRequested;
+    if (newGameRequested) {
+        newGameRequested = false;
+        S.println("[GAME] NEW GAME — wiping player state");
+        showObjectiveToast("NEW GAME", "RESETTING DATAPAD");
+        if (sdOk) SD.remove("/SFGE/player.json");
+        delay(500);
+        ESP.restart();
+    }
+
     // Game events (mesh + prop responses): fire comms, advance mission steps
     processGameEvents();
 
@@ -6490,10 +6801,10 @@ void loop() {
     if (duelReqFlag) {
         duelReqFlag = false;
         if (kidMode || !duelEnabled || duelPhase != DUEL_IDLE) {
-            swts::sendDuelAccept(duelReqPending.duel_id, callsign, false);
+            sfge::sendDuelAccept(duelReqPending.duel_id, callsign, false);
         } else if (strcmp(lastDuelPeer, duelReqPending.challenger) == 0 &&
                    millis() - lastDuelAt < (unsigned long)duelCooldownS * 1000UL) {
-            swts::sendDuelAccept(duelReqPending.duel_id, callsign, false);
+            sfge::sendDuelAccept(duelReqPending.duel_id, callsign, false);
         } else {
             duelShowPrompt();
         }
@@ -6681,7 +6992,7 @@ void loop() {
                  (unsigned)freeHeap, (unsigned)heapMinEver, (unsigned)freePsram);
 
         // Tell GM we're alive + send full status
-        swts::sendStatus(up, score, activeMissions, completedMissionCount(), totalScans, slicesWonCount, playerFaction, kidMode, xp);
+        sfge::sendStatus(up, score, activeMissions, completedMissionCount(), totalScans, slicesWonCount, playerFaction, kidMode, xp);
     }
 
     delay(5);

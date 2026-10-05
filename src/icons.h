@@ -1,5 +1,5 @@
 /*
- * SWTS Datapad — 24x24 Alpha-8bit Icons
+ * SFGE Datapad — 24x24 Alpha-8bit Icons
  * Hand-drawn Star Wars motifs, tinted via LVGL recolor
  * 0x00=transparent, 0xFF=opaque
  */
