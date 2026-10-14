@@ -27,7 +27,7 @@ One PlatformIO project, seven firmware targets (same repo, `src/`):
 | `gm_datapad` | Game Master console   | ESP32-S3 N4R8, 7" 800x480 RGB + GT911 touch, SD_MMC | `gm.cpp`      |
 | `panel`      | Wall panel (headless) | ESP32-S3, PN532 NFC, SD → runs from LittleFS, buzzer, RGB strip | `panel.cpp`   |
 | `terminal`   | NFC kiosk (headless)  | ESP32-S3, PN532 NFC, SD, buzzer, RGB strip | `terminal.cpp`|
-| `droid`      | Astromech prop        | ESP32-S3, SD, buzzer, head servo, RGB strip (eye = pixel 0) | `droid.cpp`   |
+| `droid`      | Astromech prop        | ESP32-S3, SD, buzzer, head servo, RGB strip (eye = pixel 0), optional NFC | `droid.cpp`   |
 | `guildmaster`| Bounty Hunters' Guild | Waveshare DualEye-LCD-1.28 (2x GC9A01 eyes, ES8311 speaker, TF) | `guild.cpp`   |
 | `actor`      | Actor tool (staff)    | Same hardware as the player datapad        | `actor.cpp`   |
 
@@ -58,9 +58,15 @@ Dev bench port map: datapad COM4, GM COM5, terminal COM6, panel COM7, droid COM8
 | SD (HSPI) | CS 15, MOSI 16, CLK 17, MISO 18 |
 | Buzzer (passive piezo) | 4 |
 | **RGB strip data** | **21** (overridable in `lights.txt`) |
-| NFC I2C — primary (panel + terminal) | SDA 14, SCL 13 |
-| NFC I2C — secondary, terminal code-cylinder reader (optional) | SDA 38, SCL 39 |
+| NFC I2C — primary (panel, terminal, droid-optional) | SDA 14, SCL 13 |
+| AUX port — 2nd NFC reader OR two momentary buttons | 38 (SDA / button A), 39 (SCL / button B) |
 | Droid head servo signal (optional) | 5 (configurable; power the servo from 5V, common ground) |
+
+The droid can take an optional card reader on the standard NFC1 pins
+(`hardware.has_nfc_reader`, probed at boot — absent reader = card-less as
+before). Feeding him a card chirps, wiggles the head, bumps his mood +1 and
+broadcasts `nfc:<DROID_ID>:<TOKEN>` — a mission step / comm trigger exactly
+like a terminal scan. The reader is dead while he's sabotaged.
 
 The droid's eye is **pixel 0 of the RGB strip** (configurable via
 `behavior.eye_pixel`) — the mood system drives its color. The head servo is
@@ -70,12 +76,37 @@ on failures).
 
 NFC note: the PN532's I2C address is fixed, so it's one reader per I2C bus —
 the ESP32-S3's two controllers give a hard maximum of **two readers per
-prop**. The terminal auto-detects the second reader at boot; absent = normal
-single-slot operation. The cylinder slot only accepts tags whose NDEF text
-starts with `CODE_` (e.g. `CODE_RED`); anything else is rejected with the
-denied effect. Accepted scans broadcast `cyl:<TERM_ID>:<CODE_XX>` events
-(usable as mission step targets and comm triggers) and log as `cylinder`
-scans in the GM analytics.
+prop**. Readers auto-detect at boot; absent = single-slot operation. The
+cylinder slot only accepts tags whose NDEF text starts with `CODE_` (e.g.
+`CODE_RED`); anything else is rejected with the denied effect. Accepted scans
+broadcast `cyl:<PROP_ID>:<CODE_XX>` events (usable as mission step targets
+and comm triggers) and log as `cylinder` scans in the GM analytics.
+
+**Which reader does what is JSON, not wiring.** On the terminal,
+`hardware.nfc_primary_role` / `nfc_secondary_role` assign each physical
+reader a job — `"cards"` (datacards, player taps, cargo), `"cylinder"`, or
+`"none"`. Defaults match the classic layout (primary = cards, secondary =
+cylinder), but you can swap them, or run two cylinder slots.
+
+**Panel AUX port** (`hardware.aux_mode`): the spare pins 38/39 become either
+`"nfc2"` — a code-cylinder slot just like the terminal's — or `"buttons"` —
+two momentary buttons (to GND, internal pullups). Each press fires its
+configured game event over the reliable mesh with light + buzzer feedback:
+
+```json
+"hardware": { "aux_mode": "buttons" },
+"behavior": {
+  "buttons": [
+    { "event": "btn_door_cycle",  "name": "DOOR CONTROL" },
+    { "event": "btn_power_relay", "name": "POWER RELAY" }
+  ],
+  "button_cooldown_ms": 1500
+}
+```
+
+Button events are ordinary game events — mission `event` steps and comm
+triggers can target them (big dramatic physical buttons that actually move
+the story). A sabotaged panel's AUX port is dead until repaired.
 
 ---
 
@@ -93,6 +124,7 @@ All devices share a broadcast mesh. Key message types:
 | `MSG_EVENT_ACK` | datapad/GM → sender | Receipt confirmation for a game event (see *Reliable events* below) |
 | `MSG_COMM` / `MSG_ALERT` / `MSG_BOUNTY*` | GM → datapads | Messages, alerts, bounty flow. Comm target: `""` = all, `<callsign>` = one player, `@FACTION` = one faction. A bounty with `target_player` set is a **manhunt** (see §4) |
 | `MSG_AWARD` | actor/GM → datapad | Give a player credits (can be negative) and/or an inventory item; sent 3x with a dedupe code so a lost frame can't eat the award |
+| `MSG_SCENARIO` | GM → all | Active scenario id (boot pick, rebroadcast every 10 s). Devices with `/SFGE/scenarios/<id>/` reboot into it; others keep defaults as side-game props |
 | `MSG_ASSIGN` / `MSG_PLAYER_MODE` | GM → datapad | Rename a datapad; set ADULT/KID difficulty |
 | `MSG_FACTIONS` | GM → all | Scenario faction roster (drives the datapad's allegiance screen) |
 | `MSG_SYNC_REQUEST` / `MSG_RESET` | GM → all | Re-report status; reboot |
@@ -134,7 +166,10 @@ trigger comms.
 | `dialogue/`, `lore/` | props | Greeting dialogue, sliceable data files |
 
 The panel copies `/SFGE/` from SD to LittleFS at boot and runs from flash.
-Scenario masters live in `scenarios/<name>/<device>/SFGE/`.
+Scenario masters live in `scenarios/<name>/<device>/SFGE/` — refresh a card
+with `./tools/refresh_card.ps1 -Device PANEL_02 -Drive E:` (`-List` shows all
+devices; `-Wipe` for a factory-fresh card; the default overwrite-copy keeps
+extra card files like guild speech WAVs and a live player.json's siblings).
 
 **Test provisioning:** while `SFGE_WRITE_TEST_CONFIGS` is defined in
 `src/sfge_test_configs.h`, every device writes embedded copies of the
@@ -208,7 +243,7 @@ Common shape:
     "name": "Cantina Comm Board", // shown in dialogue headers
     "faction": "neutral",         // neutral | REBEL | IMPERIAL | ... (drives
                                   // friendly/hostile minigame difficulty)
-    "location_hint": "Twin Suns Cantina dome"
+    "location_hint": "Outpost 77 Cantina dome"
   },
   "hardware": { "has_nfc_reader": false, "has_buzzer": true, "buzzer_pin": 4 },
   "behavior": { }                 // per prop type, below
@@ -391,7 +426,7 @@ the firmware as the player plays.)
   ],
 
   "bounties": [                             // BOUNTIES tab
-    { "id": "bounty_greedo", "target_name": "Greedo",
+    { "id": "bounty_shilak", "target_name": "Shilak",
       "description": "Short wanted text.", "reward": 300,
       "clues": ["Clue 1.", "Clue 2."] }     // max 5, revealed one at a time
   ]
@@ -423,7 +458,7 @@ Step types:
   and `endgame: true` (completion shows the **debrief screen**: rank by score,
   final stats, fanfare, `game_complete` event to the GM).
 
-Twin Suns demo arc — Rebel: INTEL RUN (scan INTEL_01 → decrypt DT_VAULT at the
+Outpost 77 demo arc — Rebel: INTEL RUN (scan INTEL_01 → decrypt DT_VAULT at the
 terminal → purge R5's core + hand off) then EXTRACTION (slice the panel, broadcast
 the signal, scan the EXTRACT_01 beacon). Imperial: COUNTER-SLICE (breach the
 panel, seize the INTEL_01 dead drop).
@@ -435,12 +470,81 @@ panel, seize the INTEL_01 dead drop).
 | Timing-bar slice | touchscreen | Tap when the cursor crosses target zones |
 | Simon "Pattern Lock" | physical buttons + LEDs | Repeat a growing color sequence |
 | Core Purge (defrag) | touchscreen | Tap flashing ERR blocks on a 4x4 grid, avoid SYS decoys, 3 faults out |
+| Hot Wire | touchscreen | Match shuffled wire pairs by color before the breaker trips; wrong pair = spark (3 faults out). Also the sabotage REPAIR game |
+| Frequency Lock | touchscreen | Three sliders chase three drifting carriers; hold ALL channels in the green for 2.5 s before the trace completes |
+
+Props pick a game with `behavior.minigame_default`: `slice`, `simon`, `purge`,
+`wires` (params `wires` 3-6, `time_limit`), or `freq` (params `time_limit`,
+`tolerance`). Decrypt is launched by terminals and encrypted comms.
 
 Difficulty modifiers (stack):
 - **Faction**: friendly prop easier (−1 round / −1 difficulty / −4 targets +10s),
   hostile harder (+2 rounds / +1 difficulty / +4 targets −5s). Neutral props unchanged.
 - **KID mode** (GM-set per player): one notch/round easier, slower Simon playback,
   longer input windows, fewer purge targets, longer block lifetimes.
+
+### Sabotage & repair
+
+With `behavior.sabotage_enabled` on a panel/terminal, hostile-faction players
+get a **Sabotage junction box** choice; the GM can also sabotage or restore
+any prop (including the droid) from the PANELS tab. A sabotaged prop goes
+fully OFFLINE — broken-circuit red/amber flicker on the strip, every
+interaction replaced by one offer: *Repair the wiring*, which launches the
+Hot Wire minigame (easier for the prop's own faction). Winning restores the
+prop (+30 XP) and fires `prop_repaired:<ID>`; the sabotage itself fires
+`sabotaged:<ID>` — both usable as mission steps. The GM's PANELS tab shows
+`!! SABOTAGED !!` and the activity feed logs both directions.
+
+### Keypad access codes
+
+The datacard screen's **KEYPAD** button opens a numeric pad. Codes live in
+`missions.json`:
+
+```json
+"codes": [
+  { "code": "7731", "event": "dock_access_granted", "name": "DOCK ACCESS" },
+  { "code": "2187", "event": "supply_cache_opened", "name": "SUPPLY CACHE",
+    "reusable": true }
+]
+```
+
+Entering a valid code fires its event exactly like an NFC scan (missions
+advance, comms trigger, the GM logs it). Codes are one-time per datapad
+unless `reusable`. Hide them in lore files, prop dialogue, or hand them out
+through actors — puzzles with zero extra hardware.
+
+### Scenario selector (one card set, many games)
+
+Cards may hold extra content folders in the same layout as the defaults:
+`/SFGE/scenarios/<id>/...`. When the GM's card has any, the GM shows a
+**SELECT SCENARIO** picker at boot and broadcasts the choice; every device
+with that folder reboots into it. A device *without* that folder keeps its
+default `/SFGE` content and becomes a generic **side-game prop** — its
+minigames still pay credits, but its events don't match the scenario's
+missions, so it never breaks the story. The choice persists across reboots
+(`active_scenario.txt`) and is rebroadcast every 10 s for late joiners.
+Device state (`player.json`, `droid_state.json`, `gm_state.json`) stays
+global and is wiped by NEW GAME as usual.
+
+### Bounty contracts (the Guild loop)
+
+Standard chain-code bounties are a four-beat loop, bracketed by the Guild
+Master's ~3-foot proximity gate (`proximity_rssi_start: -55`):
+
+1. **POST** — the GM fires the contract from the BOUNTIES tab. Datapads get
+   the wanted-board entry, and Vex announces it (`<bounty_id>_posted` line).
+2. **ACCEPT** — a hunter walks up to the Guild table (within ~3 ft), connects,
+   and takes *Accept contract*. The datapad records it (persisted in
+   player.json); the GM logs `bounty_accepted:<id>`.
+3. **HUNT** — scanning the target's `CHAIN:<bounty_id>` tag captures it —
+   but only for hunters who accepted; everyone else gets CONTRACT NOT TAKEN.
+4. **COLLECT** — back at the Guild table (same 3-ft gate), *Collect bounty*
+   verifies the chain code, pays out, closes the contract everywhere, and
+   Vex speaks the collected line (`<bounty_id>` track) — the only moment that
+   clip plays.
+
+Manhunts (below) stay opportunistic: scanning the hunted player's card
+captures without an accept step.
 
 ### Manhunt bounties (PvP hide-and-seek)
 
@@ -495,7 +599,18 @@ Tabs: HOME (leaderboard, panel status, activity feed), EVENTS (faction-scopable
 triggers), COMMS (templates + compose; target ALL / a faction / one player),
 BOUNTIES, PLAYERS (tap a player for full stats, interaction log, KID/ADULT
 toggle, POST MANHUNT; UNASSIGNED list for naming datapads), FACTIONS
-(per-faction totals and progress vs the scenario score goal), PANELS.
+(per-faction totals and progress vs the scenario score goal), PANELS
+(alarm/sabotage state + CLEAR ALARM / SABOTAGE / RESTORE per prop).
+
+**Ghost view:** every datapad reports what its player is doing right now
+(HOME, SLICING, DECRYPTING, KEYPAD, DUELING, REGISTERING, ...) in its status
+heartbeat; the player detail modal shows it as `NOW: <activity>` — spot a
+stuck player before they come find you.
+
+**Session debriefs:** each player automatically receives a personal SESSION
+DEBRIEF comm (rank, score, XP, scans, slices, missions) the moment their
+`game_complete` fires; GM MENU → SEND DEBRIEFS pushes one to everyone — do
+this before NEW GAME wipes the roster.
 
 ---
 

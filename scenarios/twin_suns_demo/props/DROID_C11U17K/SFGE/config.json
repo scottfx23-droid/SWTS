@@ -1,0 +1,46 @@
+{
+  "$schema": "sfge-config-v1",
+  "scenario": {"name": "Tatooine Run", "version": "0.1-demo"},
+  "prop": {
+    "type": "droid",
+    "id": "DROID_C11U17K",
+    "ssid": "SFGE_DROID_C1",
+    "wifi_channel": 1,
+    "name": "C1-1U17K",
+    "faction": "rebel",
+    "location_hint": "Docking bay, parked by the fuel drums"
+  },
+  "hardware": {
+    "has_nfc_reader": true,
+    "has_leds": true,
+    "has_buzzer": true,
+    "buzzer_pin": 4
+  },
+  "behavior": {
+    "restraining_bolt": { "enabled": false, "grace_ms": 3000 },
+    "startup_tune": true,
+    "startup_head_shakes": 3,
+    "idle_animation": "astromech_idle",
+    "minigame_default": "purge",
+    "purge_targets": 10,
+    "purge_time_s": 40,
+    "proximity_enabled": true,
+    "proximity_rssi_start": -60,
+    "proximity_rssi_drop": -72,
+    "proximity_grace_ms": 2000,
+    "mood_enabled": true,
+    "mood_decay_s": 90,
+    "mood_colors": { "hostile": "FF2000", "neutral": "FF8800", "friendly": "FFC400" },
+    "eye_pixel": 0,
+    "servo": {
+      "enabled": true,
+      "pin": 38,
+      "min_us": 600,
+      "max_us": 2400,
+      "min_deg": 20,
+      "max_deg": 160,
+      "idle_s": 5
+    },
+    "dialogue_greeting": "dialogue/greeting.json"
+  }
+}

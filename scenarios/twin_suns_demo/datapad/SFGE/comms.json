@@ -5,7 +5,7 @@
       "id": "welcome",
       "from": "ALLIANCE COMMAND",
       "subject": "WELCOME TO OUTPOST 77",
-      "body": "Operative, you've been deployed to the Twin Suns Outpost. A rebel contact has left intel for us at the cantina. Find it, decrypt it at the Repair Shop Terminal, and get the coordinates to R5-D8 in the storage facility. Watch for Imperial patrols.",
+      "body": "Operative, you've been deployed to the Outpost 77. A rebel contact has left intel for us at the cantina. Find it, decrypt it at the Repair Shop Terminal, and get the coordinates to R5-D8 in the storage facility. Watch for Imperial patrols.",
       "trigger": "boot",
       "faction": "REBEL"
     },
@@ -13,7 +13,7 @@
       "id": "welcome_imp",
       "from": "ISB COMMAND",
       "subject": "WELCOME TO OUTPOST 77",
-      "body": "Agent, rebel activity is confirmed at the Twin Suns Outpost. They are moving intelligence through the cantina. Trace their slicer network, recover whatever they are hiding, and log it as evidence. The Empire is watching your performance.",
+      "body": "Agent, rebel activity is confirmed at the Outpost 77. They are moving intelligence through the cantina. Trace their slicer network, recover whatever they are hiding, and log it as evidence. The Empire is watching your performance.",
       "trigger": "boot",
       "faction": "IMPERIAL"
     },
@@ -91,7 +91,7 @@
     },
     {
       "id": "shuttle_inbound",
-      "from": "TWIN SUNS FLIGHT",
+      "from": "OUTPOST 77 FLIGHT",
       "subject": "SHUTTLE INBOUND",
       "body": "Signal received, operative. Lambda shuttle on approach -- ETA ten minutes. Proceed to the landing zone and scan the extraction beacon EXTRACT_01 to confirm pickup. Clear skies.",
       "trigger": "event:extraction:PANEL_01",
@@ -111,6 +111,41 @@
       "body": "Backup extraction frequency is 121.9 -- memorize it and burn this message. If the comm board is compromised, broadcast from the repair shop decoder instead. Trust no one wearing white armor.",
       "trigger": "boot",
       "encrypted": true
+    },
+    {
+      "id": "guild_contract",
+      "from": "BOUNTY HUNTERS' GUILD",
+      "subject": "CONTRACT POSTED",
+      "body": "The Guild is open for business at the cantina back table. First contract of the season: SHILAK, Rodian gun-for-hire, armed and freelancing for the Empire -- 300 credits, no questions asked. Find him, scan his chain code, and bring it to Guild Master Vex. First hunter to deliver gets paid. The Guild does not split fees.",
+      "trigger": "boot"
+    },
+    {
+      "id": "grid_breached",
+      "from": "OUTPOST WATCH",
+      "subject": "POWER GRID BREACH",
+      "body": "Someone just retuned the docking bay power junction. The duty log mentions berth 7 going dark off the books -- and a backup spin-up code the techs were told not to share. Try it on your keypad.",
+      "trigger": "event:panel_sliced:PANEL_02"
+    },
+    {
+      "id": "clamps_released",
+      "from": "DOCKING CONTROL",
+      "subject": "CLAMP ALERT",
+      "body": "Berth 7 docking clamps just released without authorization. Whatever was parked there is free to fly. If that was you -- move now, before control re-engages them.",
+      "trigger": "event:btn_clamp_release"
+    },
+    {
+      "id": "bolt_removed_c1",
+      "from": "ALLIANCE INTEL",
+      "subject": "C1 UNIT UNSHACKLED",
+      "body": "Someone pulled the restraining bolt off the C1 unit in the docking bay. That droid has been carrying a locked uplink since before the occupation -- feed it the battle plans datacard while it's free.",
+      "trigger": "event:bolt_removed:DROID_C11U17K"
+    },
+    {
+      "id": "battle_plans_up",
+      "from": "ALLIANCE COMMAND",
+      "subject": "BATTLE PLANS RECEIVED",
+      "body": "The C1 unit just burst-transmitted the battle plans to the fleet. Outstanding work, operative. Keep that droid out of Imperial hands.",
+      "trigger": "event:nfc:DROID_C11U17K:DATACARD_02"
     }
   ]
 }

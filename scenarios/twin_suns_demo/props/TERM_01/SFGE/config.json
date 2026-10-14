@@ -13,7 +13,9 @@
   "hardware": {
     "has_nfc_reader": true,
     "has_buzzer": true,
-    "buzzer_pin": 4
+    "buzzer_pin": 4,
+    "nfc_primary_role": "cards",
+    "nfc_secondary_role": "cylinder"
   },
   "behavior": {
     "scan_cooldown_ms": 1500,
@@ -25,6 +27,7 @@
     "decrypt_required": true,
     "decrypt_tries": 6,
     "decrypt_glyphs": 6,
+    "sabotage_enabled": true,
     "dialogue_greeting": "dialogue/greeting.json"
   }
 }

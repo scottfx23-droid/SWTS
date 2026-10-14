@@ -1,0 +1,13 @@
+# PANEL_02 - Docking Bay Power Junction strip
+chip=ws2812
+order=GRB
+pin=21
+# RRGGBB,on_ms,off_ms  (on 0 = solid, on -1 = flicker)
+3388FF,0,0
+AAC8FF,0,0
+3388FF,800,500
+FFFFFF,-1,0
+3388FF,0,0
+AAC8FF,600,900
+3388FF,0,0
+FFFFFF,0,0

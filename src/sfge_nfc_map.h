@@ -67,8 +67,8 @@ inline NfcTag* lookupById(const char *id) {
     return nullptr;
 }
 
-inline bool loadNfcMap(fs::FS &fsys) {
-    File f = fsys.open("/SFGE/nfc_map.json", "r");
+inline bool loadNfcMap(fs::FS &fsys, const char *path = "/SFGE/nfc_map.json") {
+    File f = fsys.open(path, "r");
     if (!f) {
         Serial.println("[NFC] No nfc_map.json");
         return false;

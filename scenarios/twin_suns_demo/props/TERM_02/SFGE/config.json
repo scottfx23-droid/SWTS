@@ -1,0 +1,28 @@
+{
+  "$schema": "sfge-config-v1",
+  "scenario": {"name": "Tatooine Run", "version": "0.1-demo"},
+  "prop": {
+    "type": "terminal",
+    "id": "TERM_02",
+    "ssid": "SFGE_TERM_02",
+    "wifi_channel": 1,
+    "name": "Rebel Safehouse Uplink",
+    "faction": "rebel",
+    "location_hint": "Behind the storage facility, under the awning"
+  },
+  "hardware": {
+    "has_nfc_reader": true,
+    "has_buzzer": true,
+    "buzzer_pin": 4,
+    "nfc_primary_role": "cards",
+    "nfc_secondary_role": "cylinder"
+  },
+  "behavior": {
+    "scan_cooldown_ms": 1500,
+    "require_tap_to_use": true,
+    "session_timeout_s": 60,
+    "decrypt_required": false,
+    "sabotage_enabled": true,
+    "dialogue_greeting": "dialogue/greeting.json"
+  }
+}

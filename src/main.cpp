@@ -20,6 +20,7 @@
 #include "sfge_ota.h"            // firmware-from-SD updates
 #include "sfge_test_configs.h"   // boot-time test provisioning (see header to disable)
 #include "sfge_config.h"
+#include "sfge_scenario.h"       // GM-selected scenario -> content folder
 #include "sfge_nfc_map.h"
 #include "sfge_missions.h"
 #include "sfge_comms.h"
@@ -439,6 +440,23 @@ void inventoryRemove(const char *id) {
     }
 }
 
+// ── Accepted contracts ── bounties taken at the Guild Master (3-foot
+// handshake). A chain code only counts if the contract was accepted first.
+#define MAX_ACCEPTED 6
+char acceptedBounties[MAX_ACCEPTED][24];
+int  acceptedCount = 0;
+
+bool acceptedHas(const char *id) {
+    for (int i = 0; i < acceptedCount; i++)
+        if (strcmp(acceptedBounties[i], id) == 0) return true;
+    return false;
+}
+bool acceptedAdd(const char *id) {
+    if (!id || !id[0] || acceptedCount >= MAX_ACCEPTED || acceptedHas(id)) return false;
+    strlcpy(acceptedBounties[acceptedCount++], id, sizeof(acceptedBounties[0]));
+    return true;
+}
+
 // ── Captured bounties ── chain codes scanned, awaiting Guild turn-in
 #define MAX_CAPTURED 4
 char capturedBounties[MAX_CAPTURED][24];
@@ -513,6 +531,7 @@ int xp = 0;
 int activeMissions = 0, inventoryItems = 0, unreadComms = 0, totalScans = 0;
 int slicesWonCount = 0;   // minigames won (any type) — reported to the GM
 volatile bool newGameRequested = false;   // GM NEW GAME broadcast received
+volatile bool scenarioRebootRequested = false;   // GM switched the scenario
 
 // ── Player state forward decls (full impl lives near the SD loaders) ──
 extern volatile bool playerDirty;
@@ -1055,6 +1074,25 @@ void buildDatacardScreen() {
     lv_obj_add_flag(dcResult, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(dcResult, LV_OBJ_FLAG_SCROLLABLE);
 
+    // KEYPAD — numeric access codes (same screen family as card scanning)
+    lv_obj_t *kb = lv_btn_create(scrDatacard);
+    lv_obj_set_size(kb, 82, 26);
+    lv_obj_set_pos(kb, W - 94, 54);
+    lv_obj_set_style_bg_color(kb, C_PNL, 0);
+    lv_obj_set_style_bg_color(kb, C_PNL2, LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(kb, C_AMB_DIM, 0);
+    lv_obj_set_style_border_width(kb, 1, 0);
+    lv_obj_set_style_shadow_width(kb, 0, 0);
+    lv_obj_add_event_cb(kb, [](lv_event_t *e) {
+        extern lv_obj_t *scrKeypad;
+        lv_scr_load_anim(scrKeypad, LV_SCR_LOAD_ANIM_MOVE_LEFT, 180, 0, false);
+    }, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *kl = lv_label_create(kb);
+    lv_label_set_text(kl, "KEYPAD");
+    lv_obj_set_style_text_font(kl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(kl, C_AMB, 0);
+    lv_obj_center(kl);
+
     // Footer
     hline(scrDatacard, H - 28, C_FRM, 1);
     lv_obj_t *ftr = lv_obj_create(scrDatacard);
@@ -1258,6 +1296,14 @@ void showCardResult(uint8_t *uid, uint8_t len) {
             lv_label_set_text(nm, bstate == 2 ? bname : bid);
             lv_label_set_text(bd, bstate == 2 ? "This contract is already settled."
                                               : "No active Guild contract\non this target.");
+            lv_obj_set_style_text_color(bd, C_DIM, 0);
+            buzzerScanFail();
+        } else if (!acceptedHas(bid)) {
+            // Posted but this hunter never took the contract at the Guild
+            lv_label_set_text(hd, "CONTRACT NOT TAKEN");
+            lv_obj_set_style_text_color(hd, C_AMB_DIM, 0);
+            lv_label_set_text(nm, bname);
+            lv_label_set_text(bd, "The Guild pays contract holders only.\n\nACCEPT this contract at the\nGUILD MASTER'S table first.");
             lv_obj_set_style_text_color(bd, C_DIM, 0);
             buzzerScanFail();
         } else if (capturedHas(bid)) {
@@ -1940,6 +1986,8 @@ String postInteract(const char* action) {
     for (int i = 0; i < inventoryCount; i++) inv.add(inventory[i]);
     JsonArray cap = p["captured"].to<JsonArray>();
     for (int i = 0; i < capturedCount; i++) cap.add(capturedBounties[i]);
+    JsonArray acc = p["accepted"].to<JsonArray>();
+    for (int i = 0; i < acceptedCount; i++) acc.add(acceptedBounties[i]);
 
     String body;
     serializeJson(req, body);
@@ -3163,6 +3211,520 @@ void launchDecryptGame(DecryptMode mode, int tries, int glyphs, int codeLen, int
 }
 
 // ═══════════════════════════════════════
+//  HOT WIRE MINIGAME — match the wire pairs
+//  Left column: terminal pads in order. Right column: the same colors
+//  shuffled. Tap a left pad then its color match on the right. Wrong
+//  pair = a spark (fault). Connect them all before the clock runs out.
+//  Launched by props (behavior.minigame "wires") and as the sabotage
+//  REPAIR game.
+// ═══════════════════════════════════════
+#define WIR_MAX 6
+static const uint32_t WIR_COLORS[WIR_MAX] =
+    { 0xFF3B2F, 0x2F6BFF, 0xFFC400, 0x2FBF4F, 0xB04FFF, 0x00C8C8 };
+static const char *WIR_NAMES[WIR_MAX] = { "RED", "BLU", "YEL", "GRN", "VIO", "CYN" };
+
+int  wirCount = 5, wirTimeS = 25, wirMaxFaults = 3;
+int  wirRightColor[WIR_MAX];          // color index shown at each right slot
+bool wirDone[WIR_MAX];                // per color index: connected
+int  wirSelected = -1;                // left pad currently selected (-1 none)
+int  wirFaults = 0;
+bool wirActive = false, wirWon = false;
+unsigned long wirStartTime = 0, wirEndTime = 0;
+
+lv_obj_t *scrWires = NULL;
+lv_obj_t *wirLeftPad[WIR_MAX], *wirRightPad[WIR_MAX];
+lv_obj_t *wirStatus = NULL, *wirTimerLbl = NULL, *wirFaultLbl = NULL, *wirHintLbl = NULL;
+
+static void wirRefresh() {
+    for (int i = 0; i < WIR_MAX; i++) {
+        bool shown = i < wirCount;
+        if (shown) { lv_obj_clear_flag(wirLeftPad[i], LV_OBJ_FLAG_HIDDEN);
+                     lv_obj_clear_flag(wirRightPad[i], LV_OBJ_FLAG_HIDDEN); }
+        else       { lv_obj_add_flag(wirLeftPad[i], LV_OBJ_FLAG_HIDDEN);
+                     lv_obj_add_flag(wirRightPad[i], LV_OBJ_FLAG_HIDDEN); continue; }
+        // Left pad i = color i
+        lv_obj_set_style_bg_color(wirLeftPad[i],
+            wirDone[i] ? C_PNL : lv_color_hex(WIR_COLORS[i]), 0);
+        lv_obj_set_style_border_color(wirLeftPad[i],
+            (wirSelected == i) ? C_WHITE : (wirDone[i] ? C_FRM : C_AMB_DIM), 0);
+        lv_obj_set_style_border_width(wirLeftPad[i], (wirSelected == i) ? 3 : 1, 0);
+        lv_obj_t *ll = lv_obj_get_child(wirLeftPad[i], 0);
+        lv_label_set_text(ll, wirDone[i] ? "OK" : WIR_NAMES[i]);
+        // Right slot i shows color wirRightColor[i]
+        int rc = wirRightColor[i];
+        lv_obj_set_style_bg_color(wirRightPad[i],
+            wirDone[rc] ? C_PNL : lv_color_hex(WIR_COLORS[rc]), 0);
+        lv_obj_set_style_border_color(wirRightPad[i], wirDone[rc] ? C_FRM : C_AMB_DIM, 0);
+        lv_obj_t *rl = lv_obj_get_child(wirRightPad[i], 0);
+        lv_label_set_text(rl, wirDone[rc] ? "OK" : WIR_NAMES[rc]);
+    }
+    char b[24];
+    snprintf(b, sizeof(b), "FAULTS %d/%d", wirFaults, wirMaxFaults);
+    lv_label_set_text(wirFaultLbl, b);
+}
+
+static void wirEnd(bool won, const char *msg) {
+    wirActive = false;
+    wirWon = won;
+    wirEndTime = millis();
+    wirSelected = -1;
+    if (won) buzzerSuccess(); else buzzerFail();
+    lv_label_set_text(wirStatus, msg);
+    lv_obj_set_style_text_color(wirStatus, won ? C_AMB_BRT : C_AMB_DIM, 0);
+    lv_label_set_text(wirHintLbl, won ? "CIRCUIT RESTORED" : "PANEL LOCKED OUT");
+    wirRefresh();
+}
+
+static void ev_wir_left(lv_event_t *e) {
+    if (!wirActive) return;
+    int i = (int)(intptr_t)lv_event_get_user_data(e);
+    if (i >= wirCount || wirDone[i]) return;
+    wirSelected = (wirSelected == i) ? -1 : i;
+    buzzerClick();
+    wirRefresh();
+}
+
+static void ev_wir_right(lv_event_t *e) {
+    if (!wirActive || wirSelected < 0) return;
+    int slot = (int)(intptr_t)lv_event_get_user_data(e);
+    if (slot >= wirCount) return;
+    int rc = wirRightColor[slot];
+    if (wirDone[rc]) return;
+    if (rc == wirSelected) {
+        wirDone[rc] = true;
+        wirSelected = -1;
+        buzzerTone(1200, 60);
+        bool all = true;
+        for (int i = 0; i < wirCount; i++) if (!wirDone[i]) all = false;
+        wirRefresh();
+        if (all) wirEnd(true, "ALL CIRCUITS LIVE");
+    } else {
+        wirFaults++;
+        wirSelected = -1;
+        buzzerTone(180, 160);   // spark
+        wirRefresh();
+        if (wirFaults >= wirMaxFaults) wirEnd(false, "WIRING SHORTED OUT");
+    }
+}
+
+void buildWiresScreen() {
+    scrWires = lv_obj_create(NULL);
+    lv_obj_add_style(scrWires, &s_scr, 0);
+    lv_obj_clear_flag(scrWires, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(scrWires);
+    lv_label_set_text(title, "HOT WIRE");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(title, C_AMB_BRT, 0);
+    lv_obj_set_style_text_letter_space(title, 2, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 14);
+
+    wirStatus = lv_label_create(scrWires);
+    lv_obj_set_style_text_font(wirStatus, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(wirStatus, C_AMB, 0);
+    lv_obj_align(wirStatus, LV_ALIGN_TOP_MID, 0, 44);
+
+    wirTimerLbl = lv_label_create(scrWires);
+    lv_obj_set_style_text_font(wirTimerLbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(wirTimerLbl, C_AMB, 0);
+    lv_obj_set_pos(wirTimerLbl, 16, 70);
+
+    wirFaultLbl = lv_label_create(scrWires);
+    lv_obj_set_style_text_font(wirFaultLbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(wirFaultLbl, C_AMB, 0);
+    lv_obj_align(wirFaultLbl, LV_ALIGN_TOP_RIGHT, -16, 70);
+
+    hline(scrWires, 94, C_FRM, 1);
+
+    // Pads: left column (source) and right column (shuffled), 6 rows max
+    const int padW = 108, padH = 48, rowGap = 8, y0 = 106;
+    for (int i = 0; i < WIR_MAX; i++) {
+        lv_obj_t *lp = lv_obj_create(scrWires);
+        lv_obj_set_size(lp, padW, padH);
+        lv_obj_set_pos(lp, 14, y0 + i * (padH + rowGap));
+        lv_obj_set_style_radius(lp, 4, 0);
+        lv_obj_set_style_border_width(lp, 1, 0);
+        lv_obj_clear_flag(lp, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(lp, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(lp, ev_wir_left, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+        lv_obj_t *ll = lv_label_create(lp);
+        lv_obj_set_style_text_font(ll, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(ll, C_BG, 0);
+        lv_obj_center(ll);
+        wirLeftPad[i] = lp;
+
+        lv_obj_t *rp = lv_obj_create(scrWires);
+        lv_obj_set_size(rp, padW, padH);
+        lv_obj_set_pos(rp, W - 14 - padW, y0 + i * (padH + rowGap));
+        lv_obj_set_style_radius(rp, 4, 0);
+        lv_obj_set_style_border_width(rp, 1, 0);
+        lv_obj_clear_flag(rp, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(rp, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(rp, ev_wir_right, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+        lv_obj_t *rl = lv_label_create(rp);
+        lv_obj_set_style_text_font(rl, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(rl, C_BG, 0);
+        lv_obj_center(rl);
+        wirRightPad[i] = rp;
+    }
+
+    wirHintLbl = lv_label_create(scrWires);
+    lv_label_set_text(wirHintLbl, "");
+    lv_obj_set_style_text_font(wirHintLbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(wirHintLbl, C_AMB, 0);
+    lv_obj_align(wirHintLbl, LV_ALIGN_BOTTOM_MID, 0, -16);
+}
+
+void launchWiresGame(int wires, int timeS) {
+    if (kidMode) { wires--; timeS += 15; }
+    wirCount = constrain(wires, 3, WIR_MAX);
+    wirTimeS = constrain(timeS, 10, 120);
+    wirMaxFaults = kidMode ? 5 : 3;
+    wirFaults = 0;
+    wirSelected = -1;
+    wirActive = true;
+    wirWon = false;
+    wirEndTime = 0;
+    wirStartTime = millis();
+    for (int i = 0; i < WIR_MAX; i++) wirDone[i] = false;
+    // Shuffle right-column colors (Fisher-Yates over the first wirCount)
+    for (int i = 0; i < wirCount; i++) wirRightColor[i] = i;
+    for (int i = wirCount - 1; i > 0; i--) {
+        int j = esp_random() % (i + 1);
+        int t = wirRightColor[i]; wirRightColor[i] = wirRightColor[j]; wirRightColor[j] = t;
+    }
+    lv_label_set_text(wirStatus, "JUNCTION BOX OPEN");
+    lv_obj_set_style_text_color(wirStatus, C_AMB, 0);
+    lv_label_set_text(wirHintLbl, "TAP A WIRE, THEN ITS MATCH");
+    lv_obj_set_style_text_color(wirHintLbl, C_AMB, 0);
+    char tb[16];
+    snprintf(tb, sizeof(tb), "TIME %ds", wirTimeS);
+    lv_label_set_text(wirTimerLbl, tb);
+    wirRefresh();
+    lv_scr_load_anim(scrWires, LV_SCR_LOAD_ANIM_MOVE_LEFT, 180, 0, false);
+}
+
+void updateWiresGame() {
+    if (!wirActive) return;
+    int remaining = wirTimeS - (int)((millis() - wirStartTime) / 1000);
+    if (remaining < 0) remaining = 0;
+    char tb[16];
+    snprintf(tb, sizeof(tb), "TIME %ds", remaining);
+    lv_label_set_text(wirTimerLbl, tb);
+    if (remaining == 0) wirEnd(false, "BREAKER TRIPPED -- TOO SLOW");
+}
+
+// ═══════════════════════════════════════
+//  FREQUENCY LOCK MINIGAME — tune the drifting channels
+//  Three sliders, three hidden carrier frequencies that drift. Each
+//  channel's signal bar shows how close you are. Hold ALL THREE in the
+//  green long enough to lock before the trace completes.
+// ═══════════════════════════════════════
+#define FRQ_CH 3
+int  frqTarget[FRQ_CH], frqTimeS = 30, frqTol = 6;
+unsigned long frqLockNeedMs = 2500;
+unsigned long frqLockStart = 0;        // 0 = not currently all-green
+unsigned long frqStartTime = 0, frqEndTime = 0, frqDriftTime = 0;
+int  frqDriftMax = 2;                  // random walk step per tick
+bool frqActive = false, frqWon = false;
+
+lv_obj_t *scrFreq = NULL;
+lv_obj_t *frqSlider[FRQ_CH], *frqBar[FRQ_CH], *frqLed[FRQ_CH];
+lv_obj_t *frqStatus = NULL, *frqTimerLbl = NULL, *frqLockBar = NULL, *frqHintLbl = NULL;
+
+static void frqEnd(bool won, const char *msg) {
+    frqActive = false;
+    frqWon = won;
+    frqEndTime = millis();
+    if (won) buzzerSuccess(); else buzzerFail();
+    lv_label_set_text(frqStatus, msg);
+    lv_obj_set_style_text_color(frqStatus, won ? C_AMB_BRT : C_AMB_DIM, 0);
+    lv_label_set_text(frqHintLbl, won ? "CARRIER LOCKED" : "TRACE COMPLETE -- LOCKED OUT");
+}
+
+void buildFreqScreen() {
+    scrFreq = lv_obj_create(NULL);
+    lv_obj_add_style(scrFreq, &s_scr, 0);
+    lv_obj_clear_flag(scrFreq, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(scrFreq);
+    lv_label_set_text(title, "FREQUENCY LOCK");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(title, C_AMB_BRT, 0);
+    lv_obj_set_style_text_letter_space(title, 2, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 14);
+
+    frqStatus = lv_label_create(scrFreq);
+    lv_obj_set_style_text_font(frqStatus, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(frqStatus, C_AMB, 0);
+    lv_obj_align(frqStatus, LV_ALIGN_TOP_MID, 0, 44);
+
+    frqTimerLbl = lv_label_create(scrFreq);
+    lv_obj_set_style_text_font(frqTimerLbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(frqTimerLbl, C_AMB, 0);
+    lv_obj_align(frqTimerLbl, LV_ALIGN_TOP_MID, 0, 66);
+
+    hline(scrFreq, 90, C_FRM, 1);
+
+    // One row per channel: slider (tune) + signal bar (closeness) + lock LED
+    const int rowY[FRQ_CH] = { 112, 196, 280 };
+    for (int c = 0; c < FRQ_CH; c++) {
+        lv_obj_t *lbl = lv_label_create(scrFreq);
+        char cb[8]; snprintf(cb, sizeof(cb), "CH %d", c + 1);
+        lv_label_set_text(lbl, cb);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(lbl, C_AMB, 0);
+        lv_obj_set_pos(lbl, 16, rowY[c]);
+
+        lv_obj_t *sl = lv_slider_create(scrFreq);
+        lv_obj_set_size(sl, W - 110, 14);
+        lv_obj_set_pos(sl, 70, rowY[c] + 2);
+        lv_slider_set_range(sl, 0, 100);
+        lv_obj_set_style_bg_color(sl, C_FRM, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(sl, C_AMB_DIM, LV_PART_INDICATOR);
+        lv_obj_set_style_bg_color(sl, C_AMB, LV_PART_KNOB);
+        frqSlider[c] = sl;
+
+        lv_obj_t *bar = lv_bar_create(scrFreq);
+        lv_obj_set_size(bar, W - 110, 10);
+        lv_obj_set_pos(bar, 70, rowY[c] + 34);
+        lv_bar_set_range(bar, 0, 100);
+        lv_obj_set_style_bg_color(bar, C_PNL, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(bar, C_AMB, LV_PART_INDICATOR);
+        frqBar[c] = bar;
+
+        lv_obj_t *led = lv_obj_create(scrFreq);
+        lv_obj_set_size(led, 16, 16);
+        lv_obj_set_pos(led, 36, rowY[c] + 31);
+        lv_obj_set_style_radius(led, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_border_width(led, 1, 0);
+        lv_obj_set_style_border_color(led, C_FRM, 0);
+        lv_obj_set_style_bg_color(led, C_PNL, 0);
+        lv_obj_clear_flag(led, LV_OBJ_FLAG_SCROLLABLE);
+        frqLed[c] = led;
+    }
+
+    lv_obj_t *lockLbl = lv_label_create(scrFreq);
+    lv_label_set_text(lockLbl, "CARRIER LOCK");
+    lv_obj_set_style_text_font(lockLbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(lockLbl, C_DIM, 0);
+    lv_obj_set_pos(lockLbl, 16, 362);
+
+    frqLockBar = lv_bar_create(scrFreq);
+    lv_obj_set_size(frqLockBar, W - 32, 16);
+    lv_obj_set_pos(frqLockBar, 16, 380);
+    lv_bar_set_range(frqLockBar, 0, 100);
+    lv_obj_set_style_bg_color(frqLockBar, C_PNL, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(frqLockBar, C_AMB_BRT, LV_PART_INDICATOR);
+
+    frqHintLbl = lv_label_create(scrFreq);
+    lv_label_set_text(frqHintLbl, "");
+    lv_obj_set_style_text_font(frqHintLbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(frqHintLbl, C_AMB, 0);
+    lv_obj_align(frqHintLbl, LV_ALIGN_BOTTOM_MID, 0, -16);
+}
+
+void launchFreqGame(int timeS, int tol) {
+    if (kidMode) { timeS += 15; tol += 6; }
+    frqTimeS = constrain(timeS, 15, 120);
+    frqTol = constrain(tol, 3, 25);
+    frqDriftMax = kidMode ? 1 : 2;
+    frqLockNeedMs = kidMode ? 2000 : 2500;
+    frqLockStart = 0;
+    frqActive = true;
+    frqWon = false;
+    frqEndTime = 0;
+    frqStartTime = millis();
+    frqDriftTime = millis();
+    for (int c = 0; c < FRQ_CH; c++) {
+        frqTarget[c] = 15 + (int)(esp_random() % 71);        // 15..85
+        lv_slider_set_value(frqSlider[c], 50, LV_ANIM_OFF);
+    }
+    lv_bar_set_value(frqLockBar, 0, LV_ANIM_OFF);
+    lv_label_set_text(frqStatus, "CARRIERS DRIFTING -- TUNE ALL THREE");
+    lv_obj_set_style_text_color(frqStatus, C_AMB, 0);
+    lv_label_set_text(frqHintLbl, "HOLD EVERY CHANNEL IN THE GREEN");
+    lv_obj_set_style_text_color(frqHintLbl, C_AMB, 0);
+    lv_scr_load_anim(scrFreq, LV_SCR_LOAD_ANIM_MOVE_LEFT, 180, 0, false);
+}
+
+void updateFreqGame() {
+    if (!frqActive) return;
+    unsigned long now = millis();
+
+    int remaining = frqTimeS - (int)((now - frqStartTime) / 1000);
+    if (remaining < 0) remaining = 0;
+    char tb[20];
+    snprintf(tb, sizeof(tb), "TRACE IN %ds", remaining);
+    lv_label_set_text(frqTimerLbl, tb);
+    if (remaining == 0) { frqEnd(false, "SIGNAL TRACED"); return; }
+
+    // Carriers drift (random walk)
+    if (now - frqDriftTime > 120) {
+        frqDriftTime = now;
+        for (int c = 0; c < FRQ_CH; c++) {
+            frqTarget[c] += (int)(esp_random() % (2 * frqDriftMax + 1)) - frqDriftMax;
+            frqTarget[c] = constrain(frqTarget[c], 5, 95);
+        }
+    }
+
+    bool allGreen = true;
+    for (int c = 0; c < FRQ_CH; c++) {
+        int diff = abs((int)lv_slider_get_value(frqSlider[c]) - frqTarget[c]);
+        int sig = 100 - diff * 3;
+        if (sig < 0) sig = 0;
+        lv_bar_set_value(frqBar[c], sig, LV_ANIM_OFF);
+        bool green = diff <= frqTol;
+        lv_obj_set_style_bg_color(frqLed[c], green ? lv_color_hex(0x2FBF4F)
+                                 : (diff <= frqTol * 2 ? C_AMB : lv_color_hex(0xAA2200)), 0);
+        if (!green) allGreen = false;
+    }
+
+    if (allGreen) {
+        if (!frqLockStart) { frqLockStart = now; buzzerTone(900, 30); }
+        int pct = (int)((now - frqLockStart) * 100 / frqLockNeedMs);
+        if (pct > 100) pct = 100;
+        lv_bar_set_value(frqLockBar, pct, LV_ANIM_OFF);
+        if ((unsigned long)(now - frqLockStart) >= frqLockNeedMs) frqEnd(true, "FREQUENCY LOCKED");
+    } else {
+        if (frqLockStart) buzzerTone(300, 30);
+        frqLockStart = 0;
+        lv_bar_set_value(frqLockBar, 0, LV_ANIM_OFF);
+    }
+}
+
+// ═══════════════════════════════════════
+//  KEYPAD — numeric access codes hidden in lore/props/actors
+//  Codes come from missions.json "codes": entering one fires its game
+//  event exactly like an NFC scan would (missions advance, comms trigger,
+//  the GM sees it).
+// ═══════════════════════════════════════
+#define MAX_CODES 12
+struct AccessCode {
+    char code[10];
+    char event[32];
+    char name[24];
+    bool reusable;
+    bool used;
+};
+AccessCode accessCodes[MAX_CODES];
+int accessCodeCount = 0;
+
+char kpdEntry[10] = "";
+lv_obj_t *scrKeypad = NULL;
+lv_obj_t *kpdDisplay = NULL, *kpdStatus = NULL;
+
+static void kpdRefresh() {
+    char disp[24] = "";
+    int n = strlen(kpdEntry);
+    for (int i = 0; i < 8; i++) {
+        strcat(disp, i < n ? "*" : "_");
+        if (i < 7) strcat(disp, " ");
+    }
+    lv_label_set_text(kpdDisplay, disp);
+}
+
+static void ev_kpd_digit(lv_event_t *e) {
+    int d = (int)(intptr_t)lv_event_get_user_data(e);
+    int n = strlen(kpdEntry);
+    if (n >= 8) return;
+    kpdEntry[n] = '0' + d;
+    kpdEntry[n + 1] = 0;
+    buzzerClick();
+    kpdRefresh();
+}
+
+static void ev_kpd_clear(lv_event_t *e) {
+    kpdEntry[0] = 0;
+    lv_label_set_text(kpdStatus, "ENTER ACCESS CODE");
+    lv_obj_set_style_text_color(kpdStatus, C_AMB, 0);
+    kpdRefresh();
+}
+
+static void ev_kpd_enter(lv_event_t *e) {
+    if (!kpdEntry[0]) return;
+    AccessCode *hit = nullptr;
+    for (int i = 0; i < accessCodeCount; i++)
+        if (strcmp(accessCodes[i].code, kpdEntry) == 0) { hit = &accessCodes[i]; break; }
+    if (hit && hit->used && !hit->reusable) {
+        buzzerTone(600, 100);
+        lv_label_set_text(kpdStatus, "CODE ALREADY USED");
+        lv_obj_set_style_text_color(kpdStatus, C_AMB_DIM, 0);
+    } else if (hit) {
+        hit->used = true;
+        buzzerSuccess();
+        char sb[48];
+        snprintf(sb, sizeof(sb), "ACCEPTED -- %s", hit->name[0] ? hit->name : hit->event);
+        lv_label_set_text(kpdStatus, sb);
+        lv_obj_set_style_text_color(kpdStatus, C_AMB_BRT, 0);
+        sfge::gmTriggerEvent(hit->event, hit->name[0] ? hit->name : "Access code entered",
+                             0, callsign);
+        queueGameEvent(hit->event);
+        showObjectiveToast("CODE ACCEPTED", hit->name[0] ? hit->name : hit->event);
+    } else {
+        buzzerScanFail();
+        lv_label_set_text(kpdStatus, "ACCESS DENIED");
+        lv_obj_set_style_text_color(kpdStatus, C_AMB_DIM, 0);
+    }
+    kpdEntry[0] = 0;
+    kpdRefresh();
+}
+
+static void ev_kpd_back(lv_event_t *e) {
+    kpdEntry[0] = 0;
+    lv_scr_load_anim(scrHome, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 180, 0, false);
+}
+
+void buildKeypadScreen() {
+    scrKeypad = lv_obj_create(NULL);
+    lv_obj_add_style(scrKeypad, &s_scr, 0);
+    lv_obj_clear_flag(scrKeypad, LV_OBJ_FLAG_SCROLLABLE);
+
+    makeSubHeader(scrKeypad, "KEYPAD", ev_kpd_back);
+
+    kpdStatus = lv_label_create(scrKeypad);
+    lv_label_set_text(kpdStatus, "ENTER ACCESS CODE");
+    lv_obj_set_style_text_font(kpdStatus, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(kpdStatus, C_AMB, 0);
+    lv_obj_align(kpdStatus, LV_ALIGN_TOP_MID, 0, 66);
+
+    kpdDisplay = lv_label_create(scrKeypad);
+    lv_obj_set_style_text_font(kpdDisplay, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(kpdDisplay, C_AMB_BRT, 0);
+    lv_obj_set_style_text_letter_space(kpdDisplay, 2, 0);
+    lv_obj_align(kpdDisplay, LV_ALIGN_TOP_MID, 0, 96);
+
+    // 3x4 pad: 1-9, CLR, 0, ENT
+    const int bw = 92, bh = 58, gap = 8;
+    const int x0 = (W - (bw * 3 + gap * 2)) / 2, y0 = 148;
+    const char *keys[12] = {"1","2","3","4","5","6","7","8","9","CLR","0","ENT"};
+    for (int i = 0; i < 12; i++) {
+        lv_obj_t *b = lv_btn_create(scrKeypad);
+        lv_obj_set_size(b, bw, bh);
+        lv_obj_set_pos(b, x0 + (i % 3) * (bw + gap), y0 + (i / 3) * (bh + gap));
+        bool special = (i == 9 || i == 11);
+        lv_obj_set_style_bg_color(b, special ? C_AMB_DIM : C_PNL, 0);
+        lv_obj_set_style_bg_color(b, C_PNL2, LV_STATE_PRESSED);
+        lv_obj_set_style_border_color(b, C_AMB_DIM, 0);
+        lv_obj_set_style_border_width(b, 1, 0);
+        lv_obj_set_style_radius(b, 4, 0);
+        lv_obj_set_style_shadow_width(b, 0, 0);
+        if (i == 9)       lv_obj_add_event_cb(b, ev_kpd_clear, LV_EVENT_CLICKED, NULL);
+        else if (i == 11) lv_obj_add_event_cb(b, ev_kpd_enter, LV_EVENT_CLICKED, NULL);
+        else {
+            int digit = (i == 10) ? 0 : i + 1;
+            lv_obj_add_event_cb(b, ev_kpd_digit, LV_EVENT_CLICKED, (void*)(intptr_t)digit);
+        }
+        lv_obj_t *bl = lv_label_create(b);
+        lv_label_set_text(bl, keys[i]);
+        lv_obj_set_style_text_font(bl, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_color(bl, special ? C_BG : C_AMB, 0);
+        lv_obj_center(bl);
+    }
+    kpdRefresh();
+}
+
+// ═══════════════════════════════════════
 //  DUEL — PvP reaction game over the mesh
 //  Trigger: scan another player's operative card. Both datapads run the
 //  same seeded button sequence; fastest total time (wrong presses cost
@@ -3745,8 +4307,8 @@ void buildNameEntryScreen() {
 //  OPERATIVE CARD — written at registration
 //  A blank NFC card gets an NDEF text record PLAYER:<callsign>. It opens
 //  tap-to-use sessions on terminals and triggers Duels when another
-//  player scans it. Skippable (20 s timeout or SKIP) — terminals then
-//  fall back to their RSSI gate only.
+//  player scans it. Waits for a card indefinitely (SKIP to bypass) —
+//  terminals then fall back to their RSSI gate only.
 // ═══════════════════════════════════════
 lv_obj_t *scrCardWrite = NULL;
 lv_obj_t *cardWriteStatus = NULL;
@@ -4246,6 +4808,16 @@ bool handlePropCommon(JsonDocument &doc) {
         showObjectiveToast("ITEM CONSUMED", ci);
     }
 
+    // Guild handed us a contract (accept handshake) — silent on purpose,
+    // the toast is the confirmation
+    const char *ab = doc["accepted_bounty"].as<const char*>();
+    if (ab && ab[0] && acceptedAdd(ab)) {
+        playerDirty = true; playerLastSave = 0;
+        char bname[24] = "";
+        bountyLookup(ab, bname, sizeof(bname), nullptr);
+        showObjectiveToast("CONTRACT ACCEPTED", bname[0] ? bname : ab);
+    }
+
     int cost = doc["cost"] | 0;
     if (cost > 0) {
         score -= cost;
@@ -4271,6 +4843,10 @@ bool handlePropCommon(JsonDocument &doc) {
         } else if (strcmp(g, "purge") == 0) {
             launchPurgeGame(doc["targets"] | PURGE_DEFAULT_TARGETS,
                             doc["time_limit"] | PURGE_DEFAULT_TIME_S);
+        } else if (strcmp(g, "wires") == 0) {
+            launchWiresGame(doc["wires"] | 5, doc["time_limit"] | 25);
+        } else if (strcmp(g, "freq") == 0) {
+            launchFreqGame(doc["time_limit"] | 30, doc["tolerance"] | 6);
         } else {
             int diff = doc["difficulty"] | 2;
             if (kidMode && diff > 1) diff--;
@@ -5135,6 +5711,83 @@ void openBountyDetail(ActiveBounty *b) {
     lv_scr_load_anim(scrBountyDetail, LV_SCR_LOAD_ANIM_MOVE_LEFT, 180, 0, false);
 }
 
+// Set by ev_bounty_accept; the rebuild happens in loop() where deleting the
+// old screen (and the button whose callback requested this) is safe
+ActiveBounty *pendingDetailRefresh = nullptr;
+
+// ACCEPT / COLLECT from the wanted board: find the Guild's AP, connect,
+// and run the action — only succeeds inside the Guild's proximity bubble
+// (~5 ft). The walk to the table IS the gameplay.
+static void guildBountyAction(ActiveBounty *b, bool collect) {
+    if (!b || b->closed) return;
+
+    showObjectiveToast("CONTACTING GUILD", "Searching for the Guild Master...");
+    lv_timer_handler();
+
+    char gssid[33] = "";
+    int n = WiFi.scanNetworks();
+    for (int i = 0; i < n; i++) {
+        String s = WiFi.SSID(i);
+        if (s.startsWith("SFGE_GUILD")) { strlcpy(gssid, s.c_str(), sizeof(gssid)); break; }
+    }
+    WiFi.scanDelete();
+    if (!gssid[0]) {
+        showObjectiveToast("NO GUILD SIGNAL", "Get closer to the Guild Master");
+        buzzerScanFail();
+        return;
+    }
+    if (!connectToProp(gssid)) {
+        WiFi.disconnect();
+        showObjectiveToast("GUILD UNREACHABLE", "Move closer and try again");
+        buzzerScanFail();
+        return;
+    }
+
+    char act[40];
+    snprintf(act, sizeof(act), "%s:%s", collect ? "turn_in" : "accept", b->id);
+    String resp = postInteract(act);
+    WiFi.disconnect();
+
+    if (resp.length() == 0) {
+        showObjectiveToast("GUILD UNREACHABLE", "Move closer and try again");
+        buzzerScanFail();
+        return;
+    }
+    JsonDocument doc;
+    deserializeJson(doc, resp);
+    const char *err = doc["error"].as<const char*>();
+    if (err && strcmp(err, "too_far") == 0) {
+        showObjectiveToast("TOO FAR", "Stand within 5 feet of the\nGuild Master and try again");
+        buzzerScanFail();
+        return;
+    }
+    handlePropCommon(doc);   // accepted_bounty toast / game_event queueing
+
+    if (collect) {
+        // Success carries the bounty_turned_in event; the payout itself
+        // arrives via the Guild's claim broadcast moments later
+        const char *gev = doc["game_event"].as<const char*>();
+        if (gev && strncmp(gev, "bounty_turned_in:", 17) == 0)
+            showObjectiveToast("CONTRACT FULFILLED", "The Guild authorizes payment");
+        else
+            showObjectiveToast("GUILD REFUSED", "Chain code did not verify");
+    }
+
+    // Rebuild is DEFERRED to loop(): this handler lives on a button of the
+    // very screen being rebuilt — deleting it here is a use-after-free crash
+    extern ActiveBounty *pendingDetailRefresh;
+    pendingDetailRefresh = b;
+}
+
+static void ev_bounty_accept(lv_event_t *e) {
+    ActiveBounty *b = (ActiveBounty *)lv_event_get_user_data(e);
+    if (b && !acceptedHas(b->id)) guildBountyAction(b, false);
+}
+static void ev_bounty_collect(lv_event_t *e) {
+    ActiveBounty *b = (ActiveBounty *)lv_event_get_user_data(e);
+    if (b && capturedHas(b->id)) guildBountyAction(b, true);
+}
+
 void buildBountyDetailScreen() {
     if (!currentBounty) return;
     ActiveBounty *b = currentBounty;
@@ -5180,12 +5833,15 @@ void buildBountyDetailScreen() {
     lv_obj_set_style_text_font(rw, &lv_font_montserrat_18, 0);
     lv_obj_align(rw, LV_ALIGN_TOP_MID, 0, 168);
 
-    // Status
+    // Status — walks the contract loop: accept at the Guild, hunt, collect
     const char *statTxt;
     lv_color_t statCol;
-    if (b->closed && b->closedBy[0]) { statTxt = "STATUS: CLAIMED"; statCol = C_DIM; }
-    else if (b->closed)              { statTxt = "STATUS: CLOSED";  statCol = C_DIM; }
-    else                             { statTxt = "STATUS: ACTIVE";  statCol = C_AMB; }
+    if (b->closed && b->closedBy[0])    { statTxt = "STATUS: CLAIMED"; statCol = C_DIM; }
+    else if (b->closed)                 { statTxt = "STATUS: CLOSED";  statCol = C_DIM; }
+    else if (capturedHas(b->id))        { statTxt = "STATUS: CAPTURED — COLLECT AT THE GUILD"; statCol = C_AMB_BRT; }
+    else if (acceptedHas(b->id))        { statTxt = "STATUS: CONTRACT ACCEPTED — HUNT"; statCol = C_AMB_BRT; }
+    else if (b->target_player[0])       { statTxt = "STATUS: ACTIVE — SCAN THEIR CARD"; statCol = C_AMB; }
+    else                                { statTxt = "STATUS: OPEN — ACCEPT AT THE GUILD"; statCol = C_AMB; }
     lv_obj_t *stl = lv_label_create(scrBountyDetail);
     lv_label_set_text(stl, statTxt);
     lv_obj_set_style_text_color(stl, statCol, 0);
@@ -5202,9 +5858,15 @@ void buildBountyDetailScreen() {
     lv_obj_set_style_text_font(ch1, &lv_font_montserrat_14, 0);
     lv_obj_set_pos(ch1, 12, 230);
 
+    // ACCEPT button while the contract is open and untaken; COLLECT button
+    // once the chain code is in custody — the clue area shrinks for either
+    bool showAccept  = !b->closed && !b->target_player[0] &&
+                       !acceptedHas(b->id) && !capturedHas(b->id);
+    bool showCollect = !b->closed && capturedHas(b->id);
+
     // Clue scroll area
     lv_obj_t *cont = lv_obj_create(scrBountyDetail);
-    lv_obj_set_size(cont, W - 12, 196);
+    lv_obj_set_size(cont, W - 12, (showAccept || showCollect) ? 142 : 196);
     lv_obj_set_pos(cont, 6, 252);
     lv_obj_set_style_bg_opa(cont, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(cont, 0, 0);
@@ -5246,6 +5908,27 @@ void buildBountyDetailScreen() {
         lv_obj_set_width(t, lv_pct(100));
         lv_label_set_long_mode(t, LV_LABEL_LONG_WRAP);
         lv_obj_set_pos(t, 0, 16);
+    }
+
+    // ACCEPT / COLLECT — contacts the Guild Master; works only inside its
+    // proximity bubble (~5 ft), so the walk to the table is the gameplay
+    if (showAccept || showCollect) {
+        lv_obj_t *abtn = lv_btn_create(scrBountyDetail);
+        lv_obj_set_size(abtn, W - 20, 50);
+        lv_obj_set_pos(abtn, 10, 400);
+        lv_obj_set_style_bg_color(abtn, showCollect ? C_AMB : C_AMB_DIM, 0);
+        lv_obj_set_style_bg_color(abtn, C_AMB_BRT, LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(abtn, 0, 0);
+        lv_obj_set_style_shadow_width(abtn, 0, 0);
+        lv_obj_set_style_radius(abtn, 3, 0);
+        lv_obj_add_event_cb(abtn, showCollect ? ev_bounty_collect : ev_bounty_accept,
+                            LV_EVENT_CLICKED, b);
+        lv_obj_t *al = lv_label_create(abtn);
+        lv_label_set_text(al, showCollect ? "COLLECT BOUNTY  (at the Guild)"
+                                          : "ACCEPT CONTRACT  (at the Guild)");
+        lv_obj_set_style_text_font(al, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(al, C_BG, 0);
+        lv_obj_center(al);
     }
 
     // Back button
@@ -5454,8 +6137,8 @@ int commInboxCount = 0;
 bool loadMissionsFromSD() {
     NUM_MISSIONS = 0;
     NUM_TRIGGERS = 0;
-    File f = SD.open("/SFGE/missions.json", FILE_READ);
-    if (!f) { S.println("[MSN] /SFGE/missions.json not found"); return false; }
+    File f = SD.open(sfge_scn::path("missions.json"), FILE_READ);
+    if (!f) { S.println("[MSN] missions.json not found"); return false; }
 
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, f);
@@ -5519,7 +6202,21 @@ bool loadMissionsFromSD() {
         NUM_TRIGGERS++;
     }
 
-    S.printf("[MSN] Loaded %d missions, %d triggers\n", NUM_MISSIONS, NUM_TRIGGERS);
+    // Keypad access codes (optional top-level "codes" array)
+    accessCodeCount = 0;
+    for (JsonObject c : doc["codes"].as<JsonArray>()) {
+        if (accessCodeCount >= MAX_CODES) break;
+        AccessCode &a = accessCodes[accessCodeCount];
+        memset(&a, 0, sizeof(a));
+        strlcpy(a.code,  c["code"]  | "", sizeof(a.code));
+        strlcpy(a.event, c["event"] | "", sizeof(a.event));
+        strlcpy(a.name,  c["name"]  | "", sizeof(a.name));
+        a.reusable = c["reusable"] | false;
+        if (a.code[0] && a.event[0]) accessCodeCount++;
+    }
+
+    S.printf("[MSN] Loaded %d missions, %d triggers, %d codes\n",
+             NUM_MISSIONS, NUM_TRIGGERS, accessCodeCount);
     return NUM_MISSIONS > 0;
 }
 
@@ -5634,6 +6331,9 @@ bool savePlayerState() {
     JsonArray cp = doc["captured"].to<JsonArray>();
     for (int i = 0; i < capturedCount; i++) cp.add(capturedBounties[i]);
 
+    JsonArray ac = doc["accepted"].to<JsonArray>();
+    for (int i = 0; i < acceptedCount; i++) ac.add(acceptedBounties[i]);
+
     JsonArray bw = doc["bounties_won"].to<JsonArray>();
     for (int i = 0; i < playerWonBountyCount; i++) bw.add(playerWonBounties[i]);
 
@@ -5731,6 +6431,11 @@ bool loadPlayerState() {
         strlcpy(playerReadComms[playerReadCommCount++], id ? id : "", 20);
     }
 
+    acceptedCount = 0;
+    for (const char *id : doc["accepted"].as<JsonArray>()) {
+        if (id && id[0]) acceptedAdd(id);
+    }
+
     playerWonBountyCount = 0;
     for (const char *id : doc["bounties_won"].as<JsonArray>()) {
         if (playerWonBountyCount >= MAX_WON_BOUNTIES) break;
@@ -5745,7 +6450,7 @@ bool loadPlayerState() {
 void loadCommsFromSD() {
     commPoolCount = 0;
     commInboxCount = 0;
-    File f = SD.open("/SFGE/comms.json", FILE_READ);
+    File f = SD.open(sfge_scn::path("comms.json"), FILE_READ);
     if (!f) {
         S.println("[COMMS] No comms.json on SD");
         return;
@@ -6031,6 +6736,14 @@ void onMeshMsg(const sfge::MeshHeader *hdr, const uint8_t *payload, int len) {
             S.println("[MESH] Reset command — restarting");
             delay(500);
             ESP.restart();
+            break;
+        }
+        case sfge::MSG_SCENARIO: {
+            if (len < (int)sizeof(sfge::MeshScenario)) return;
+            const sfge::MeshScenario *sc = (const sfge::MeshScenario *)payload;
+            extern volatile bool scenarioRebootRequested;
+            if (sdOk && sfge_scn::applyScenario(SD, sc->id))
+                scenarioRebootRequested = true;   // restart from loop context
             break;
         }
         case sfge::MSG_ASSIGN: {
@@ -6543,10 +7256,16 @@ void setup() {
     // Display (must init before SD since they share SPI)
     tft.init(); tft.setRotation(2); tft.setBrightness(255);
 
-    // SD Card — HSPI bus (same pins as panel: CS=15 MO=16 CK=17 MI=18)
+    // SD Card — HSPI bus (same pins as panel: CS=15 MO=16 CK=17 MI=18).
+    // Mount is retried: warm reboots can leave the card mid-state.
     static SPIClass sdSPI(HSPI);
     sdSPI.begin(SD_CLK, SD_MISO, SD_MOSI, SD_CS);
-    if (SD.begin(SD_CS, sdSPI, 4000000)) {
+    bool sdMountOk = false;
+    for (int t = 0; t < 3 && !sdMountOk; t++) {
+        if (t) { SD.end(); delay(250); S.printf("[SD] mount retry %d...\n", t); }
+        sdMountOk = SD.begin(SD_CS, sdSPI, 4000000);
+    }
+    if (sdMountOk) {
         sdOk = true;
         S.printf("[SD] Mounted %lluMB\n", SD.cardSize() / (1024*1024));
 
@@ -6557,8 +7276,12 @@ void setup() {
         // SFGE_WRITE_TEST_CONFIGS is commented out in sfge_test_configs.h)
         sfge_test::writeTestConfigs(SD);
 
+        // Scenario selection: GM-announced id picks a content folder when
+        // the card has one; otherwise defaults (player.json stays global)
+        sfge_scn::begin(SD);
+
         // Load config from SD
-        File cfg = SD.open("/SFGE/config.json", FILE_READ);
+        File cfg = SD.open(sfge_scn::path("config.json"), FILE_READ);
         if (cfg) {
             JsonDocument doc;
             if (!deserializeJson(doc, cfg)) {
@@ -6580,7 +7303,7 @@ void setup() {
 
         // Load game data from SD — order matters: missions before player state
         initMissions();
-        sfge::loadNfcMap(SD);   // tag identities for the datacard reader
+        sfge::loadNfcMap(SD, sfge_scn::path("nfc_map.json"));   // tag identities
         loadMissionsFromSD();
         loadPlayerState();    // restores callsign, score, mission progress, comm-read flags
         loadCommsFromSD();    // loads pool + delivers boot-triggered comms (welcome etc.)
@@ -6639,6 +7362,9 @@ void setup() {
     buildSimonScreen();
     buildPurgeScreen();
     buildDecryptScreen();
+    buildWiresScreen();
+    buildFreqScreen();
+    buildKeypadScreen();
     buildDuelScreen();
     buildInventoryScreen();
     buildRadarScreen();
@@ -6670,6 +7396,23 @@ static unsigned long cgTime = 0;
 void loop() {
     lv_timer_handler();
     sfge::eventRetryService();   // event acks out + re-fire our own unconfirmed events
+
+    // Deferred bounty-detail rebuild (requested from a button on that very
+    // screen). Order matters: build the NEW screen, swap to it, THEN delete
+    // the old one — deleting the active screen first leaves LVGL's active-
+    // screen pointer dangling and crashes the render.
+    if (pendingDetailRefresh) {
+        ActiveBounty *rb = pendingDetailRefresh;
+        pendingDetailRefresh = nullptr;
+        if (scrBountyDetail && lv_scr_act() == scrBountyDetail) {
+            lv_obj_t *old = scrBountyDetail;
+            scrBountyDetail = NULL;
+            currentBounty = rb;
+            buildBountyDetailScreen();     // fresh screen into scrBountyDetail
+            lv_scr_load(scrBountyDetail);  // instant swap, no animation
+            lv_obj_del(old);               // now inactive — safe to delete
+        }
+    }
 
     // Physical button polling — drives the colored LEDs + emits edge events
     pollButtons();
@@ -6775,8 +7518,10 @@ void loop() {
     }
 
     // ── Operative card write (registration) ──
+    // No timeout: the screen waits until a card is written or the operator
+    // taps SKIP. (Rental flow: every player should leave with a card.)
     if (cardWriteActive) {
-        if (!nfcOk || millis() - cardWriteSince > 20000) {
+        if (!nfcOk) {
             cardWriteFinish();
         } else {
             static unsigned long lastCardTry = 0;
@@ -6933,6 +7678,39 @@ void loop() {
         }
     }
 
+    // Hot Wire minigame: countdown each frame, report result 2.5s after end
+    if (act == scrWires) {
+        if (wirActive && minigameSignalLost()) {
+            minigameLostSignal = true;
+            wirEnd(false, "LINK LOST -- SIGNAL DROPPED");
+        }
+        updateWiresGame();
+
+        if (!wirActive && wirEndTime && millis() - wirEndTime > 2500) {
+            wirEndTime = 0;
+            JsonDocument req;
+            req["game"] = "wires";
+            req["faults"] = wirFaults;
+            finishMinigameAndReturn(req, wirWon);
+        }
+    }
+
+    // Frequency Lock minigame: drift + lock check each frame
+    if (act == scrFreq) {
+        if (frqActive && minigameSignalLost()) {
+            minigameLostSignal = true;
+            frqEnd(false, "LINK LOST -- SIGNAL DROPPED");
+        }
+        updateFreqGame();
+
+        if (!frqActive && frqEndTime && millis() - frqEndTime > 2500) {
+            frqEndTime = 0;
+            JsonDocument req;
+            req["game"] = "freq";
+            finishMinigameAndReturn(req, frqWon);
+        }
+    }
+
     // Decrypt minigame end: report to the prop, or unlock the comm locally
     if (act == scrDecrypt) {
         if (dcyActive && dcyMode == DM_PROP && minigameSignalLost()) {
@@ -6991,8 +7769,40 @@ void loop() {
                  digitalRead(BTN_BLUE_PIN), digitalRead(BTN_WHITE_PIN), digitalRead(BTN_RED_PIN),
                  (unsigned)freeHeap, (unsigned)heapMinEver, (unsigned)freePsram);
 
+        // GM ghost view: what is this player doing right now?
+        const char *activity = "BUSY";
+        if      (act == scrHome)        activity = "HOME";
+        else if (act == scrMissions)    activity = "MISSIONS";
+        else if (act == scrComms)       activity = "COMMS";
+        else if (act == scrBounty || act == scrBountyDetail) activity = "BOUNTIES";
+        else if (act == scrCargo)       activity = "CARGO SCAN";
+        else if (act == scrDatacard)    activity = "CARD SCAN";
+        else if (act == scrNearby)      activity = "PROP SCAN";
+        else if (act == scrProp)        activity = "AT A PROP";
+        else if (act == scrSlice)       activity = "SLICING";
+        else if (act == scrSimon)       activity = "PATTERN LOCK";
+        else if (act == scrPurge)       activity = "CORE PURGE";
+        else if (act == scrDecrypt)     activity = "DECRYPTING";
+        else if (act == scrWires)       activity = "HOT WIRE";
+        else if (act == scrFreq)        activity = "FREQ LOCK";
+        else if (act == scrKeypad)      activity = "KEYPAD";
+        else if (act == scrDuel)        activity = "DUELING";
+        else if (act == scrRadar)       activity = "RADAR";
+        else if (act == scrInventory)   activity = "INVENTORY";
+        else if (act == scrDebrief)     activity = "DEBRIEF";
+        else if (act == scrNameEntry || act == scrCardWrite || act == scrFactionPick)
+            activity = "REGISTERING";
+
         // Tell GM we're alive + send full status
-        sfge::sendStatus(up, score, activeMissions, completedMissionCount(), totalScans, slicesWonCount, playerFaction, kidMode, xp);
+        sfge::sendStatus(up, score, activeMissions, completedMissionCount(), totalScans, slicesWonCount, playerFaction, kidMode, xp, activity);
+    }
+
+    // Scenario switch announced by the GM — reboot into the new content
+    if (scenarioRebootRequested) {
+        scenarioRebootRequested = false;
+        showObjectiveToast("SCENARIO CHANGE", "RELOADING CONTENT");
+        delay(600 + (esp_random() % 500));
+        ESP.restart();
     }
 
     delay(5);

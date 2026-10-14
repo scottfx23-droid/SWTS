@@ -1,0 +1,11 @@
+# DROID_C11U17K - C1 astromech dome/body lights
+chip=ws2812
+order=GRB
+pin=21
+# RRGGBB,on_ms,off_ms  (on 0 = solid, on -1 = flicker)
+FF8800,-1,0
+FFC400,500,350
+FF4400,0,0
+FFC400,800,600
+FF8800,300,700
+FFFFFF,0,0

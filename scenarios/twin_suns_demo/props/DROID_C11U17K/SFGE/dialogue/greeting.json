@@ -1,0 +1,12 @@
+{
+  "type": "dialogue",
+  "speaker": {"name": "C1-1U17K", "faction": "rebel"},
+  "lines": [
+    {"text": "WAAAAH-bwop-bwop! (Translation: WHAT. I'm busy.)", "style": "droid"},
+    {"text": "A dented C1-series astromech, paint scorched orange. Its head keeps swiveling like it expects trouble from every direction at once.", "style": "narration"},
+    {"text": "Dock gossip, fuel levels, who parked at berth 7 -- this unit has seen everything and respects none of it.", "style": "info"}
+  ],
+  "choices": [
+    {"label": "[Disconnect]", "next_action": null}
+  ]
+}

@@ -37,12 +37,13 @@
 #include "sfge_lights.h"         // addressable RGB strip (/SFGE/lights.txt)
 #include "sfge_proximity.h"      // RSSI gate for interactions
 #include "sfge_ota.h"            // firmware-from-SD updates
+#include "sfge_scenario.h"       // GM-selected scenario -> content folder
 #include "sfge_test_configs.h"   // boot-time test provisioning (see header to disable)
 
 #define S Serial
 
 // Interaction feedback queued from async HTTP handlers, applied in loop()
-enum PropFx : uint8_t { FX_NONE = 0, FX_ACTIVITY };
+enum PropFx : uint8_t { FX_NONE = 0, FX_ACTIVITY, FX_SUCCESS, FX_FAIL };
 volatile uint8_t pendingFx = FX_NONE;
 
 // ═══════════════════════════════════════
@@ -93,12 +94,46 @@ struct TerminalConfig {
     bool decrypt_required  = false;
     int  decrypt_tries     = 6;
     int  decrypt_glyphs    = 6;
+    bool sabotage_enabled  = false;  // hostile players get a SABOTAGE choice
+    bool startup_song      = true;   // boot jingle on the buzzer (opt-out)
+    // Which job each physical reader does — "cards" (datacards / player
+    // taps / cargo), "cylinder" (CODE_* code cylinders only), or "none".
+    // Primary = SDA14/SCL13, secondary = SDA38/SCL39. Swap them, run two
+    // cylinder slots, whatever the prop needs.
+    char nfc1_role[12] = "cards";
+    char nfc2_role[12] = "cylinder";
 };
 TerminalConfig cfg;
 
+// ── Sabotage state: terminal is OFFLINE until someone wins Hot Wire ──
+bool sabotaged = false;
+bool repairBypass = false;
+volatile bool sabDirty = false;
+
+void setSabotaged(bool on, const char *byCallsign) {
+    if (on == sabotaged) return;
+    sabotaged = on;
+    sabDirty = true;
+    char eventId[40];
+    if (on) {
+        snprintf(eventId, sizeof(eventId), "sabotaged:%s", cfg.id);
+        sfge::gmTriggerEvent(eventId, "Prop sabotaged", 2, byCallsign ? byCallsign : "");
+    } else {
+        snprintf(eventId, sizeof(eventId), "prop_repaired:%s", cfg.id);
+        sfge::gmTriggerEvent(eventId, "Prop repaired", 0, byCallsign ? byCallsign : "");
+    }
+    S.printf("[SAB] %s by %s\n", on ? "SABOTAGED" : "REPAIRED", byCallsign ? byCallsign : "GM");
+}
+
+// -1 friendly / 0 neutral / +1 hostile (terminal has no shared helper)
+static int termFacMod(const char *pfac) {
+    if (!pfac[0] || !cfg.faction[0] || strcasecmp(cfg.faction, "neutral") == 0) return 0;
+    return strcasecmp(pfac, cfg.faction) == 0 ? -1 : 1;
+}
+
 bool loadConfig() {
-    File f = SD.open("/SFGE/config.json", FILE_READ);
-    if (!f) { S.println("[CFG] /SFGE/config.json not found, using defaults"); return false; }
+    File f = SD.open(sfge_scn::path("config.json"), FILE_READ);
+    if (!f) { S.println("[CFG] config.json not found, using defaults"); return false; }
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, f);
     f.close();
@@ -114,6 +149,10 @@ bool loadConfig() {
     cfg.decrypt_required  = doc["behavior"]["decrypt_required"]  | cfg.decrypt_required;
     cfg.decrypt_tries     = doc["behavior"]["decrypt_tries"]     | cfg.decrypt_tries;
     cfg.decrypt_glyphs    = doc["behavior"]["decrypt_glyphs"]    | cfg.decrypt_glyphs;
+    cfg.sabotage_enabled  = doc["behavior"]["sabotage_enabled"]  | cfg.sabotage_enabled;
+    cfg.startup_song      = doc["behavior"]["startup_song"]      | cfg.startup_song;
+    strlcpy(cfg.nfc1_role, doc["hardware"]["nfc_primary_role"]   | cfg.nfc1_role, sizeof(cfg.nfc1_role));
+    strlcpy(cfg.nfc2_role, doc["hardware"]["nfc_secondary_role"] | cfg.nfc2_role, sizeof(cfg.nfc2_role));
     sfge_prox::loadConfig(doc);
     S.printf("[CFG] id=%s ssid=%s faction=%s tap=%d decrypt=%d\n",
              cfg.id, cfg.ssid, cfg.faction, cfg.require_tap, cfg.decrypt_required);
@@ -129,7 +168,7 @@ int shopCount = 0;
 
 void loadShop() {
     shopCount = 0;
-    File f = SD.open("/SFGE/shop.json", FILE_READ);
+    File f = SD.open(sfge_scn::path("shop.json"), FILE_READ);
     if (!f) return;
     JsonDocument doc;
     if (!deserializeJson(doc, f)) {
@@ -341,6 +380,9 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
     bool inSession = (sessionCs[0] && strcmp(sessionCs, callsign) == 0);
     if (inSession) sessionSince = millis();   // activity keeps the session alive
 
+    const char *pfac = reqDoc["player"]["faction"] | "";
+    int facMod = termFacMod(pfac);
+
     JsonDocument resp;
     resp["type"] = "dialogue";
     JsonObject speaker = resp["speaker"].to<JsonObject>();
@@ -349,6 +391,65 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
 
     JsonArray lines   = resp["lines"].to<JsonArray>();
     JsonArray choices = resp["choices"].to<JsonArray>();
+
+    // ── Sabotage gate: everything routes to the repair flow (Hot Wire) ──
+    if (sabotaged && strcmp(action, "repair") != 0 &&
+        !(repairBypass && strcmp(action, "minigame_result") == 0)) {
+        pendingFx = FX_FAIL;
+        JsonObject l1 = lines.add<JsonObject>();
+        l1["text"] = "!! TERMINAL OFFLINE // JUNCTION BOX DAMAGED !!";
+        l1["style"] = "system";
+        JsonObject c1 = choices.add<JsonObject>();
+        c1["label"] = "Repair the wiring";
+        c1["next_action"] = "repair";
+        JsonObject c2 = choices.add<JsonObject>();
+        c2["label"] = "[Disconnect]";
+        c2["next_action"] = nullptr;
+        String out; serializeJson(resp, out);
+        req->send(200, "application/json", out);
+        return;
+    }
+    if (strcmp(action, "repair") == 0) {
+        if (!sabotaged) {
+            JsonObject l1 = lines.add<JsonObject>();
+            l1["text"] = "NO FAULT CONDITION PRESENT";
+            l1["style"] = "system";
+            JsonObject c1 = choices.add<JsonObject>();
+            c1["label"] = "[Disconnect]";
+            c1["next_action"] = nullptr;
+        } else {
+            repairBypass = true;
+            resp["type"] = "minigame_start";
+            resp["game"] = "wires";
+            resp["wires"] = facMod < 0 ? 4 : 5;
+            resp["time_limit"] = 25;
+        }
+        String out; serializeJson(resp, out);
+        req->send(200, "application/json", out);
+        return;
+    }
+    if (strcmp(action, "sabotage") == 0) {
+        if (cfg.sabotage_enabled && facMod > 0) {
+            setSabotaged(true, callsign);
+            pendingFx = FX_FAIL;
+            char eventId[40];
+            snprintf(eventId, sizeof(eventId), "sabotaged:%s", cfg.id);
+            resp["game_event"] = eventId;
+            JsonObject l1 = lines.add<JsonObject>();
+            l1["text"] = "You pull the primary harness. The terminal goes dark.";
+            l1["style"] = "narration";
+        } else {
+            JsonObject l1 = lines.add<JsonObject>();
+            l1["text"] = "ACCESS DENIED";
+            l1["style"] = "system";
+        }
+        JsonObject c1 = choices.add<JsonObject>();
+        c1["label"] = "[Disconnect]";
+        c1["next_action"] = nullptr;
+        String out; serializeJson(resp, out);
+        req->send(200, "application/json", out);
+        return;
+    }
 
     // ── Session gate: only the tapped-in player can go past the greeting ──
     if (cfg.require_tap && !inSession && strcmp(action, "greet") != 0) {
@@ -375,7 +476,25 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
         bool won = reqDoc["won"] | false;
         resp["type"] = "minigame_result";
         resp["accepted"] = true;
-        if (won && pendingCard[0]) {
+        if (repairBypass) {
+            // Hot Wire repair after a sabotage
+            repairBypass = false;
+            if (won) {
+                setSabotaged(false, callsign);
+                pendingFx = FX_SUCCESS;
+                char eventId[40];
+                snprintf(eventId, sizeof(eventId), "prop_repaired:%s", cfg.id);
+                resp["game_event"] = eventId;
+                resp["message"] = "CIRCUIT RESTORED -- TERMINAL ONLINE";
+                JsonObject rewards = resp["rewards"].to<JsonObject>();
+                rewards["xp"] = 30;
+            } else {
+                pendingFx = FX_FAIL;
+                resp["message"] = "STILL SHORTED -- TRY AGAIN";
+                resp["retry"] = true;
+            }
+        }
+        else if (won && pendingCard[0]) {
             // Decryption succeeded — NOW the held card fires its event
             char eventId[40], eventName[40];
             snprintf(eventId, sizeof(eventId), "nfc:%s:%s", cfg.id, pendingCard);
@@ -468,6 +587,11 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
                 cs2["label"] = "Access supply exchange";
                 cs2["next_action"] = "shop";
             }
+            if (cfg.sabotage_enabled && facMod > 0) {
+                JsonObject cs3 = choices.add<JsonObject>();
+                cs3["label"] = "Sabotage junction box";
+                cs3["next_action"] = "sabotage";
+            }
         }
         JsonObject c1 = choices.add<JsonObject>();
         c1["label"]       = "[Disconnect]";
@@ -519,6 +643,22 @@ void onMeshMsg(const sfge::MeshHeader *hdr, const uint8_t *payload, int len) {
         S.println("[MESH] NEW GAME — resetting");
         delay(300 + (esp_random() % 400));
         ESP.restart();
+    }
+    if (hdr->type == sfge::MSG_OVERRIDE && len >= (int)sizeof(sfge::MeshOverride)) {
+        const sfge::MeshOverride *o = (const sfge::MeshOverride *)payload;
+        if (strcmp(o->target_prop, cfg.id) != 0 && strcmp(o->target_prop, "ALL") != 0) return;
+        if (strcmp(o->command, "sabotage") == 0)    setSabotaged(true, "GM");
+        else if (strcmp(o->command, "repair") == 0) setSabotaged(false, "GM");
+        else if (strcmp(o->command, "reset") == 0)  { delay(200); ESP.restart(); }
+        return;
+    }
+    if (hdr->type == sfge::MSG_SCENARIO && len >= (int)sizeof(sfge::MeshScenario)) {
+        const sfge::MeshScenario *sc = (const sfge::MeshScenario *)payload;
+        if (sfge_scn::applyScenario(SD, sc->id)) {
+            delay(400 + (esp_random() % 500));
+            ESP.restart();
+        }
+        return;
     }
     if (hdr->type == sfge::MSG_EVENT && len >= (int)sizeof(sfge::MeshEvent)) {
         // Victory finale: every prop in the room strobes
@@ -636,9 +776,14 @@ void setup() {
 
     pinMode(BUZZER_PIN, OUTPUT);
 
-    // SD
+    // SD — retried: a warm reboot (NEW GAME / scenario switch) can leave the
+    // card mid-state, and a single begin() then fails until a power cycle
+    bool sdOk = false;
     sdSPI.begin(SD_CLK, SD_MISO, SD_MOSI, SD_CS);
-    bool sdOk = SD.begin(SD_CS, sdSPI, 4000000);
+    for (int t = 0; t < 3 && !sdOk; t++) {
+        if (t) { SD.end(); delay(250); S.printf("[SD] mount retry %d...\n", t); }
+        sdOk = SD.begin(SD_CS, sdSPI, 4000000);
+    }
     if (sdOk) {
         S.printf("[SD] Mounted %lluMB\n", SD.cardSize() / (1024 * 1024));
         // Firmware update staged on the card? Flash it before anything else.
@@ -646,11 +791,15 @@ void setup() {
         // TESTING: write embedded gameplay configs to the card (no-op when
         // SFGE_WRITE_TEST_CONFIGS is commented out in sfge_test_configs.h)
         sfge_test::writeTestConfigs(SD);
+        sfge_scn::begin(SD);     // GM-selected scenario -> content folder
         loadConfig();
         loadShop();
-        sfge_lights::load(SD);   // RGB strip pattern (/SFGE/lights.txt)
+        if (!sfge_lights::load(SD, sfge_scn::path("lights.txt")))
+            if (!sfge_lights::load(SD))   // scenario without lights.txt -> default
+                sfge_lights::blank();     // no config at all -> strip OFF
     } else {
         S.println("[SD] Mount failed, using defaults");
+        sfge_lights::blank();   // clear the strip's random power-on state
     }
 
     // NFC — primary reader (datacards / player cards)
@@ -694,6 +843,15 @@ void setup() {
     // Boot tone — two quick beeps so you know the terminal is alive
     buzzerTone(800, 60); delay(80); buzzerTone(1200, 60);
 
+    // Boot sound — terminal signature: modem-style handshake blips
+    if (cfg.startup_song) {
+        static const struct { int f, on, gap; } SONG[] = {
+            { 1800, 70,  60 }, { 1200, 70,  60 }, { 2200, 70,  60 },
+            {  900, 90, 100 }, { 1600, 80,  70 }, { 2400, 200,  0 },
+        };
+        for (auto &n : SONG) { buzzerTone(n.f, n.on); delay(n.on + n.gap); }
+    }
+
     S.println("[TERMINAL] Ready — waiting for cards");
 }
 
@@ -715,11 +873,21 @@ void loop() {
         buzzerTone(1568, 350);
     }
 
+    // Sabotage lights: broken-circuit flicker until repaired
+    if (sabDirty) {
+        sabDirty = false;
+        sfge_lights::setSabotage(sabotaged);
+        if (sabotaged) { buzzerTone(200, 300); }
+        else           { buzzerTone(880, 80); delay(90); buzzerTone(1320, 120); }
+    }
+
     // Lights: idle pattern + any interaction effect queued by HTTP handlers
     if (pendingFx != FX_NONE) {
+        uint8_t fx = pendingFx;
         pendingFx = FX_NONE;
-        sfge_lights::effectActivity();
-        buzzScanIdle();
+        if      (fx == FX_SUCCESS) { sfge_lights::effectSuccess(); buzzGranted(); }
+        else if (fx == FX_FAIL)    { sfge_lights::effectFail();    buzzDenied(); }
+        else                       { sfge_lights::effectActivity(); buzzScanIdle(); }
     }
     sfge_lights::update();
 
@@ -733,23 +901,28 @@ void loop() {
     static unsigned long lastPropStatus = 0;
     if (millis() - lastPropStatus > 10000) {
         lastPropStatus = millis();
-        sfge::sendPropStatus(millis() / 1000, 0, false, sessionCs);
+        sfge::sendPropStatus(millis() / 1000, 0, false, sessionCs, sabotaged);
     }
 
-    if (nfcOk) {
+    // Readers dispatch by their configured ROLE (hardware.nfc_*_role), so
+    // the JSON decides which slot takes cards and which takes cylinders.
+    if (nfcOk && strcasecmp(cfg.nfc1_role, "none") != 0) {
         uint8_t uid[7];
         uint8_t len;
         if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &len, 80)) {
             readNdefText();
-            if (ndefText[0]) onCardScanned(uid, len);
+            if (ndefText[0]) {
+                if (strcasecmp(cfg.nfc1_role, "cylinder") == 0) onCylinderScanned();
+                else onCardScanned(uid, len);
+            }
             // small delay before next read so we don't double-fire on the same card
             delay(80);
         }
     }
 
-    // Secondary reader: code cylinders (polled at a gentler cadence so the
-    // two blocking reads don't stack up every pass)
-    if (nfc2Ok) {
+    // Secondary reader (polled at a gentler cadence so the two blocking
+    // reads don't stack up every pass)
+    if (nfc2Ok && strcasecmp(cfg.nfc2_role, "none") != 0) {
         static unsigned long lastCylPoll = 0;
         if (millis() - lastCylPoll > 250) {
             lastCylPoll = millis();
@@ -757,7 +930,10 @@ void loop() {
             uint8_t len2;
             if (nfc2.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid2, &len2, 50)) {
                 readNdefTextFrom(nfc2);
-                if (ndefText[0]) onCylinderScanned();
+                if (ndefText[0]) {
+                    if (strcasecmp(cfg.nfc2_role, "cards") == 0) onCardScanned(uid2, len2);
+                    else onCylinderScanned();
+                }
             }
         }
     }

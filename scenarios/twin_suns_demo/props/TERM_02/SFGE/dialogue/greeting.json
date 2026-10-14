@@ -1,0 +1,12 @@
+{
+  "type": "dialogue",
+  "speaker": {"name": "Rebel Safehouse Uplink", "faction": "rebel"},
+  "lines": [
+    {"text": "UPLINK LIVE // FRIENDS OF THE ALLIANCE ONLY", "style": "system"},
+    {"text": "A battered field transceiver, wired into a crate of spare parts. Someone has scratched a starbird into the casing.", "style": "narration"},
+    {"text": "Cards read here go straight to Alliance intel -- no decryption delay, no questions.", "style": "info"}
+  ],
+  "choices": [
+    {"label": "[Disconnect]", "next_action": null}
+  ]
+}

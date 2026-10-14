@@ -22,6 +22,7 @@
 #include "sfge_lights.h"         // addressable RGB strip (/SFGE/lights.txt)
 #include "sfge_proximity.h"      // RSSI gate for interactions
 #include "sfge_ota.h"            // firmware-from-SD updates
+#include "sfge_scenario.h"       // GM-selected scenario -> content folder
 #include "sfge_test_configs.h"   // boot-time test provisioning (see header to disable)
 
 #define S Serial
@@ -141,7 +142,12 @@ bool provisionFromSD() {
     pinMode(SD_CS, OUTPUT);
     digitalWrite(SD_CS, HIGH);
 
-    if (!SD.begin(SD_CS, sdSPI, 4000000)) {  // 4MHz, lower speed for reliability
+    bool mounted = false;   // retried: warm reboots can wedge one attempt
+    for (int t = 0; t < 3 && !mounted; t++) {
+        if (t) { SD.end(); delay(250); S.printf("[SD] mount retry %d...\n", t); }
+        mounted = SD.begin(SD_CS, sdSPI, 4000000);   // 4MHz for reliability
+    }
+    if (!mounted) {
         S.println("[SD] No SD card — running from flash");
         sdSPI.end();
         return false;
@@ -200,14 +206,43 @@ struct PanelConfig {
     int  alarm_timeout_s   = 90;
     int  alarm_siren_ms    = 350;
     bool timer_visual      = false;  // strip red-shifts as a GM countdown runs out
+    bool sabotage_enabled  = false;  // hostile players get a SABOTAGE choice
+    // AUX port (the spare second-NFC pins, SDA/A=38 SCL/B=39):
+    //   "none"    — unused (default)
+    //   "buttons" — two momentary buttons to GND; each press fires its event
+    //   "nfc2"    — second PN532: a code-cylinder slot like the terminal's
+    char aux_mode[12] = "none";
+    struct { char event[32]; char name[32]; } aux_btn[2];
+    int  button_cooldown_ms = 1500;
+    bool startup_song      = true;   // boot jingle on the buzzer (opt-out)
 };
 PanelConfig cfg;
+
+// ── Sabotage state: prop is OFFLINE until someone wins the repair game ──
+bool sabotaged = false;
+bool repairBypass = false;           // next minigame_result is the repair game
+volatile bool sabDirty = false;      // lights change applied from loop()
+
+void setSabotaged(bool on, const char *byCallsign) {
+    if (on == sabotaged) return;
+    sabotaged = on;
+    sabDirty = true;
+    char eventId[40];
+    if (on) {
+        snprintf(eventId, sizeof(eventId), "sabotaged:%s", cfg.id);
+        sfge::gmTriggerEvent(eventId, "Prop sabotaged", 2, byCallsign ? byCallsign : "");
+    } else {
+        snprintf(eventId, sizeof(eventId), "prop_repaired:%s", cfg.id);
+        sfge::gmTriggerEvent(eventId, "Prop repaired", 0, byCallsign ? byCallsign : "");
+    }
+    S.printf("[SAB] %s by %s\n", on ? "SABOTAGED" : "REPAIRED", byCallsign ? byCallsign : "GM");
+}
 
 // Per-connection state: has this player sliced yet?
 bool playerSliced = false;
 
 bool loadConfig() {
-    File f = LittleFS.open("/SFGE/config.json", "r");
+    File f = LittleFS.open(sfge_scn::path("config.json"), "r");
     if (!f) {
         S.println("[CFG] No config on flash — using defaults");
         return false;
@@ -244,6 +279,21 @@ bool loadConfig() {
     cfg.alarm_timeout_s   = doc["behavior"]["alarm_timeout_s"]       | cfg.alarm_timeout_s;
     cfg.alarm_siren_ms    = doc["behavior"]["alarm_siren_period_ms"] | cfg.alarm_siren_ms;
     cfg.timer_visual      = doc["behavior"]["timer_visual"]          | cfg.timer_visual;
+    cfg.sabotage_enabled  = doc["behavior"]["sabotage_enabled"]      | cfg.sabotage_enabled;
+
+    // AUX port: "buttons" turns the spare NFC2 pins into two momentary
+    // buttons, "nfc2" into a code-cylinder reader
+    strlcpy(cfg.aux_mode, doc["hardware"]["aux_mode"] | cfg.aux_mode, sizeof(cfg.aux_mode));
+    cfg.button_cooldown_ms = doc["behavior"]["button_cooldown_ms"] | cfg.button_cooldown_ms;
+    cfg.startup_song       = doc["behavior"]["startup_song"]       | cfg.startup_song;
+    JsonArray btns = doc["behavior"]["buttons"].as<JsonArray>();
+    for (int b = 0; b < 2; b++) {
+        cfg.aux_btn[b].event[0] = cfg.aux_btn[b].name[0] = 0;
+        if (!btns.isNull() && b < (int)btns.size()) {
+            strlcpy(cfg.aux_btn[b].event, btns[b]["event"] | "", sizeof(cfg.aux_btn[b].event));
+            strlcpy(cfg.aux_btn[b].name,  btns[b]["name"]  | "", sizeof(cfg.aux_btn[b].name));
+        }
+    }
     sfge_prox::loadConfig(doc);
 
     JsonArray auth = doc["behavior"]["auth_card_ids"].as<JsonArray>();
@@ -261,11 +311,11 @@ bool loadConfig() {
 
 // Load a lore file from flash
 String loadLoreFile(const char* filename) {
-    String path = String("/SFGE/") + filename;
+    String path = String(sfge_scn::root) + "/" + filename;
     File f = LittleFS.open(path, "r");
     if (!f) {
         // Try the lore directory
-        File dir = LittleFS.open("/SFGE/lore");
+        File dir = LittleFS.open(sfge_scn::path("lore"));
         if (dir && dir.isDirectory()) {
             f = dir.openNextFile();
             if (!f) { dir.close(); return "No data available."; }
@@ -289,6 +339,42 @@ char lastNfcUid[24] = "";
 unsigned long lastNfcTime = 0;
 bool cardPresent = false;
 
+// Forward decls — the generic NDEF reader + token handler live with the
+// AUX section below (they share code with the second reader)
+void readNdefFrom(Adafruit_PN532 &rdr, char *out, size_t outSz);
+void onPanelCardScanned();
+char panelNdefText[128] = "";
+
+// Probe the primary reader (wakeup + firmware version). Called at boot and,
+// while no reader has been found, every 10 s from loop() — so plugging in
+// or fixing a reader is picked up live without a reboot. If the normal pin
+// order finds nothing, the SWAPPED order (SDA=13/SCL=14) is tried too: a
+// mirrored harness then still works, with a loud note in the log.
+void panelNfcProbe(bool verbose) {
+    for (int order = 0; order < 2 && !nfcOk; order++) {
+        if (order == 1) { I2C_NFC.end(); I2C_NFC.begin(13, 14, 100000); delay(30); }
+        nfc.begin();
+        for (int tries = 0; tries < 2 && !nfcOk; tries++) {
+            uint32_t fw = nfc.getFirmwareVersion();
+            if (fw) {
+                nfcOk = true;
+                nfc.SAMConfig();
+                S.printf("NFC: READY (fw=0x%08X)%s\n", (unsigned)fw,
+                         order ? "  ** SDA/SCL ARE SWAPPED ON THIS HARNESS — "
+                                 "running swapped; fix when convenient **" : "");
+            } else if (tries == 0) {
+                delay(100);   // one more chance after a wakeup beat
+            }
+        }
+    }
+    if (!nfcOk) {
+        // Back to the standard order for the next probe round
+        I2C_NFC.end();
+        I2C_NFC.begin(14, 13, 100000);
+        if (verbose) S.println("NFC: probe failed (both pin orders)");
+    }
+}
+
 bool pollNfc() {
     uint8_t uid[7]; uint8_t len;
     if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &len, 50)) {
@@ -298,6 +384,9 @@ bool pollNfc() {
             snprintf(lastNfcUid, sizeof(lastNfcUid), "%02X:%02X:%02X:%02X:%02X:%02X:%02X", uid[0], uid[1], uid[2], uid[3], uid[4], uid[5], uid[6]);
         lastNfcTime = millis();
         cardPresent = true;
+        // Read the token and let the game react (DATACARD_##, keys, ...)
+        readNdefFrom(nfc, panelNdefText, sizeof(panelNdefText));
+        if (panelNdefText[0]) onPanelCardScanned();
         return true;
     }
     if (millis() - lastNfcTime > 2000) cardPresent = false;
@@ -305,8 +394,186 @@ bool pollNfc() {
 }
 
 // ═══════════════════════════════════════
-//  PANEL STATE
+//  AUX PORT — the spare second-NFC pins (A/SDA=38, B/SCL=39)
+//  hardware.aux_mode picks what lives there:
+//    "buttons" — two momentary buttons to GND (INPUT_PULLUP). Each press
+//                fires its configured game event over the mesh, with light
+//                + buzzer feedback. Big dramatic physical buttons.
+//    "nfc2"    — a second PN532: a code-cylinder slot exactly like the
+//                terminal's (CODE_* tokens only, fires cyl:<ID>:<TOKEN>).
 // ═══════════════════════════════════════
+#define AUX_PIN_A 38
+#define AUX_PIN_B 39
+
+TwoWire I2C_NFC2 = TwoWire(0);
+Adafruit_PN532 nfc2(-1, -1, &I2C_NFC2);
+bool nfc2Ok = false;
+char auxNdefText[128] = "";
+
+// Read the first NDEF text record off an NTAG2xx (same walk as the terminal)
+// from whichever reader is passed in.
+void readNdefFrom(Adafruit_PN532 &rdr, char *out, size_t outSz) {
+    out[0] = 0;
+    uint8_t buf[128];
+    int pos = 0;
+    for (int page = 4; page < 36 && pos < 120; page++) {
+        uint8_t data[4];
+        if (!rdr.ntag2xx_ReadPage(page, data)) break;
+        for (int i = 0; i < 4 && pos < 127; i++) buf[pos++] = data[i];
+    }
+    int i = 0;
+    while (i < pos) {
+        uint8_t tlvType = buf[i];
+        if (tlvType == 0x00) { i++; continue; }
+        if (tlvType == 0xFE) break;
+        if (i + 1 >= pos) break;
+        uint8_t tlvLen = buf[i + 1];
+        int dataStart = i + 2;
+        if (tlvType == 0x03 && tlvLen > 0) {
+            int r = dataStart;
+            if (r + 3 >= pos) break;
+            uint8_t typeLen = buf[r + 1];
+            uint8_t payLen = buf[r + 2];
+            int typeOff = r + 3;
+            if (typeLen == 1 && typeOff < pos && buf[typeOff] == 0x54) {
+                int payOff = typeOff + typeLen;
+                if (payOff >= pos) break;
+                uint8_t langLen = buf[payOff] & 0x3F;
+                int textOff = payOff + 1 + langLen;
+                int textLen = payLen - 1 - langLen;
+                if (textOff + textLen <= pos && textLen > 0 &&
+                    textLen < (int)outSz - 1) {
+                    memcpy(out, &buf[textOff], textLen);
+                    out[textLen] = 0;
+                    return;
+                }
+            }
+            break;
+        }
+        i = dataStart + tlvLen;
+    }
+}
+
+// ── Primary-reader card scans ──
+// Any non-cargo token is accepted: feedback, GM scan log, and a broadcast
+// nfc:<PANEL_ID>:<TOKEN> event (mission step target / comm trigger) — the
+// same convention as terminal and droid scans. DATACARD_## slots right in.
+void onPanelCardScanned() {
+    static char lastCard[64] = "";
+    static unsigned long lastCardTime2 = 0;
+    if (strcmp(lastCard, panelNdefText) == 0 && millis() - lastCardTime2 < 1500) return;
+    strlcpy(lastCard, panelNdefText, sizeof(lastCard));
+    lastCardTime2 = millis();
+
+    extern bool sabotaged;
+    if (sabotaged) return;   // a broken panel reads nothing
+
+    if (strncasecmp(panelNdefText, "CARGO_", 6) == 0 ||
+        strncasecmp(panelNdefText, "CARGO-", 6) == 0) {
+        S.printf("[NFC] cargo crate %s rejected (wrong reader)\n", panelNdefText);
+        buzzerTone(300, 150);
+        sfge_lights::effectFail();
+        return;
+    }
+
+    S.printf("[NFC] accepted '%s'\n", panelNdefText);
+    buzzerTone(880, 60);
+    sfge_lights::effectSuccess();
+    sfge::sendNfcScan(lastNfcUid, panelNdefText, "datacard");
+
+    char eventId[48], eventName[40];
+    snprintf(eventId, sizeof(eventId), "nfc:%s:%s", cfg.id, panelNdefText);
+    snprintf(eventName, sizeof(eventName), "%s scanned", panelNdefText);
+    sfge::gmTriggerEvent(eventId, eventName, /*severity*/ 0, cfg.name);
+}
+
+// Momentary button state (debounced edges, per-button cooldown)
+struct AuxBtnState { bool down; unsigned long lastChange; unsigned long lastFire; };
+AuxBtnState auxBtnState[2] = {};
+
+void auxInit() {
+    if (strcasecmp(cfg.aux_mode, "buttons") == 0) {
+        pinMode(AUX_PIN_A, INPUT_PULLUP);
+        pinMode(AUX_PIN_B, INPUT_PULLUP);
+        S.printf("[AUX] button panel: A(38)='%s'  B(39)='%s'\n",
+                 cfg.aux_btn[0].event, cfg.aux_btn[1].event);
+    } else if (strcasecmp(cfg.aux_mode, "nfc2") == 0) {
+        I2C_NFC2.begin(AUX_PIN_A, AUX_PIN_B, 100000);
+        nfc2.begin();
+        uint32_t fw2 = nfc2.getFirmwareVersion();
+        if (fw2) {
+            nfc2Ok = true;
+            nfc2.SAMConfig();
+            S.printf("[AUX] cylinder reader ready (fw=0x%08X)\n", (unsigned)fw2);
+        } else {
+            S.println("[AUX] nfc2 configured but no PN532 on 38/39");
+        }
+    }
+}
+
+// Called every loop pass. Sabotage keeps the AUX port dead too — a broken
+// panel shouldn't take button presses or cylinder scans.
+void auxService() {
+    extern bool sabotaged;
+    if (sabotaged) return;
+
+    if (strcasecmp(cfg.aux_mode, "buttons") == 0) {
+        const uint8_t pins[2] = { AUX_PIN_A, AUX_PIN_B };
+        unsigned long now = millis();
+        for (int b = 0; b < 2; b++) {
+            bool raw = (digitalRead(pins[b]) == LOW);   // pressed = LOW (pullup)
+            AuxBtnState &st = auxBtnState[b];
+            if (raw != st.down && now - st.lastChange > 30) {
+                st.lastChange = now;
+                st.down = raw;
+                if (raw && cfg.aux_btn[b].event[0] &&
+                    now - st.lastFire > (unsigned long)cfg.button_cooldown_ms) {
+                    st.lastFire = now;
+                    S.printf("[AUX] button %c -> %s\n", 'A' + b, cfg.aux_btn[b].event);
+                    sfge_lights::effectActivity();
+                    buzzerTone(880, 60);
+                    sfge::gmTriggerEvent(cfg.aux_btn[b].event,
+                                         cfg.aux_btn[b].name[0] ? cfg.aux_btn[b].name
+                                                                : "Panel button pressed",
+                                         0, cfg.id);
+                }
+            }
+        }
+        return;
+    }
+
+    if (nfc2Ok) {
+        static unsigned long lastCylPoll = 0;
+        static char lastCylText[64] = "";
+        static unsigned long lastCylTime = 0;
+        if (millis() - lastCylPoll > 250) {
+            lastCylPoll = millis();
+            uint8_t uid2[7]; uint8_t len2;
+            if (nfc2.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid2, &len2, 50)) {
+                readNdefFrom(nfc2, auxNdefText, sizeof(auxNdefText));
+                if (!auxNdefText[0]) return;
+                if (strcmp(lastCylText, auxNdefText) == 0 && millis() - lastCylTime < 1500) return;
+                strlcpy(lastCylText, auxNdefText, sizeof(lastCylText));
+                lastCylTime = millis();
+                if (strncasecmp(auxNdefText, "CODE_", 5) != 0) {
+                    S.printf("[AUX] rejected '%s' (not a CODE_ cylinder)\n", auxNdefText);
+                    buzzerTone(300, 150);
+                    sfge_lights::effectFail();
+                    return;
+                }
+                S.printf("[AUX] code cylinder '%s'\n", auxNdefText);
+                buzzerTone(880, 60);
+                sfge_lights::effectSignal();
+                sfge::sendNfcScan(auxNdefText, auxNdefText, "cylinder");
+                char eventId[40], eventName[40];
+                snprintf(eventId, sizeof(eventId), "cyl:%s:%s", cfg.id, auxNdefText);
+                snprintf(eventName, sizeof(eventName), "Code cylinder %s", auxNdefText);
+                sfge::gmTriggerEvent(eventId, eventName, 0, cfg.name);
+            }
+        }
+    }
+}
+
 enum PanelState { STATE_IDLE, STATE_CONNECTED, STATE_ACTIVE, STATE_MINIGAME, STATE_HACKED };
 PanelState panelState = STATE_IDLE;
 int connectCount = 0;
@@ -432,6 +699,33 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
         return;
     }
 
+    // ── Sabotage gate: the system is physically OFFLINE. Everything routes
+    //    to the repair flow (Hot Wire) until someone fixes the wiring. ──
+    if (sabotaged && strcmp(action, "repair") != 0 &&
+        !(repairBypass && strcmp(action, "minigame_result") == 0)) {
+        pendingFx = FX_FAIL;
+        resp["type"] = "dialogue";
+        JsonObject sp = resp["speaker"].to<JsonObject>();
+        sp["name"] = cfg.name;
+        JsonArray lines = resp["lines"].to<JsonArray>();
+        JsonObject l1 = lines.add<JsonObject>();
+        l1["text"] = "!! SYSTEM OFFLINE // JUNCTION BOX DAMAGED !!";
+        l1["style"] = "system";
+        JsonObject l2 = lines.add<JsonObject>();
+        l2["text"] = "Scorched wiring hangs from an open service hatch.";
+        l2["style"] = "narration";
+        JsonArray choices = resp["choices"].to<JsonArray>();
+        JsonObject c1 = choices.add<JsonObject>();
+        c1["label"] = "Repair the wiring";
+        c1["next_action"] = "repair";
+        JsonObject c2 = choices.add<JsonObject>();
+        c2["label"] = "[Disconnect]";
+        c2["next_action"] = nullptr;
+        String out; serializeJson(resp, out);
+        req->send(200, "application/json", out);
+        return;
+    }
+
     // ── Keycard auth (no NFC on panels — the datapad sends the card tokens
     //    it has scanned as player.inventory) ──
     if (cfg.requires_auth && cfg.num_auth_cards > 0 && strcmp(action, "greet") == 0) {
@@ -528,9 +822,66 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
                 cx["next_action"] = "send_signal";
             }
 
+            if (cfg.sabotage_enabled && facMod > 0) {
+                // Hostile players can take the system offline entirely
+                JsonObject cs = choices.add<JsonObject>();
+                cs["label"] = "Sabotage junction box";
+                cs["next_action"] = "sabotage";
+            }
+
             JsonObject c3 = choices.add<JsonObject>();
             c3["label"] = "[Disconnect]";
             c3["next_action"] = nullptr;
+        }
+    }
+    else if (strcmp(action, "sabotage") == 0) {
+        resp["type"] = "dialogue";
+        JsonObject sp = resp["speaker"].to<JsonObject>();
+        sp["name"] = cfg.name;
+        JsonArray lines = resp["lines"].to<JsonArray>();
+        JsonArray choices = resp["choices"].to<JsonArray>();
+        if (!cfg.sabotage_enabled || facMod <= 0) {
+            JsonObject l1 = lines.add<JsonObject>();
+            l1["text"] = "ACCESS DENIED";
+            l1["style"] = "system";
+        } else {
+            setSabotaged(true, callsign);
+            pendingFx = FX_FAIL;
+            char eventId[40];
+            snprintf(eventId, sizeof(eventId), "sabotaged:%s", cfg.id);
+            resp["game_event"] = eventId;
+            JsonObject l1 = lines.add<JsonObject>();
+            l1["text"] = "You rip the primary harness loose. Sparks shower the floor.";
+            l1["style"] = "narration";
+            JsonObject l2 = lines.add<JsonObject>();
+            l2["text"] = "!! SYSTEM OFFLINE !!";
+            l2["style"] = "system";
+        }
+        JsonObject c1 = choices.add<JsonObject>();
+        c1["label"] = "[Disconnect]";
+        c1["next_action"] = nullptr;
+    }
+    else if (strcmp(action, "repair") == 0) {
+        if (!sabotaged) {
+            resp["type"] = "dialogue";
+            JsonObject sp = resp["speaker"].to<JsonObject>();
+            sp["name"] = cfg.name;
+            JsonArray lines = resp["lines"].to<JsonArray>();
+            JsonObject l1 = lines.add<JsonObject>();
+            l1["text"] = "NO FAULT CONDITION PRESENT";
+            l1["style"] = "system";
+            JsonArray choices = resp["choices"].to<JsonArray>();
+            JsonObject c1 = choices.add<JsonObject>();
+            c1["label"] = "[Disconnect]";
+            c1["next_action"] = nullptr;
+        } else {
+            repairBypass = true;
+            panelState = STATE_MINIGAME;
+            pendingFx = FX_ACTIVITY;
+            resp["type"] = "minigame_start";
+            resp["game"] = "wires";
+            resp["wires"] = facMod < 0 ? 4 : 5;   // friendly techs get a simpler box
+            resp["time_limit"] = 25;
         }
     }
     else if (strcmp(action, "start_minigame") == 0) {
@@ -574,7 +925,25 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
         resp["type"] = "minigame_result";
         resp["accepted"] = true;
 
-        if (alarmBypass) {
+        if (repairBypass) {
+            // Hot Wire repair after a sabotage — restores the system, no slice
+            repairBypass = false;
+            if (won) {
+                setSabotaged(false, callsign);
+                pendingFx = FX_SUCCESS;
+                char eventId[40];
+                snprintf(eventId, sizeof(eventId), "prop_repaired:%s", cfg.id);
+                resp["game_event"] = eventId;
+                resp["message"] = "CIRCUIT RESTORED -- SYSTEM ONLINE";
+                JsonObject rewards = resp["rewards"].to<JsonObject>();
+                rewards["xp"] = 30;
+            } else {
+                pendingFx = FX_FAIL;
+                resp["message"] = "STILL SHORTED -- TRY AGAIN";
+                resp["retry"] = true;
+            }
+        }
+        else if (alarmBypass) {
             // Hostile "bypass the klaxon" Simon — clears the alarm, no slice
             alarmBypass = false;
             if (won) {
@@ -775,6 +1144,8 @@ void onMeshMsg(const sfge::MeshHeader *hdr, const uint8_t *payload, int len) {
             if (strcmp(o->command, "offline") == 0) panelDisabled = true;
             else if (strcmp(o->command, "online") == 0) panelDisabled = false;
             else if (strcmp(o->command, "difficulty") == 0) diffOverride = atoi(o->value);
+            else if (strcmp(o->command, "sabotage") == 0) setSabotaged(true, "GM");
+            else if (strcmp(o->command, "repair") == 0)   setSabotaged(false, "GM");
             else if (strcmp(o->command, "reset") == 0) { delay(200); ESP.restart(); }
             break;
         }
@@ -789,6 +1160,15 @@ void onMeshMsg(const sfge::MeshHeader *hdr, const uint8_t *payload, int len) {
             S.println("[MESH] NEW GAME — resetting");
             delay(300 + (esp_random() % 400));   // stagger fleet reboots
             ESP.restart();
+            break;
+        }
+        case sfge::MSG_SCENARIO: {
+            if (len < (int)sizeof(sfge::MeshScenario)) return;
+            const sfge::MeshScenario *sc = (const sfge::MeshScenario *)payload;
+            if (sfge_scn::applyScenario(LittleFS, sc->id)) {
+                delay(400 + (esp_random() % 500));
+                ESP.restart();
+            }
             break;
         }
         case sfge::MSG_EVENT: {
@@ -877,29 +1257,57 @@ void setup() {
     // SFGE_WRITE_TEST_CONFIGS is commented out in sfge_test_configs.h)
     sfge_test::writeTestConfigs(LittleFS);
 
+    // Scenario: marker lives OUTSIDE /SFGE because provisioning wipes it
+    sfge_scn::markerPath = "/scn.txt";
+    sfge_scn::begin(LittleFS);
+
     // Load config from flash
     loadConfig();
 
     // Buzzer + RGB strip
     pinMode(BUZZER_PIN, OUTPUT);
-    sfge_lights::load(LittleFS);
+    if (!sfge_lights::load(LittleFS, sfge_scn::path("lights.txt")))
+        if (!sfge_lights::load(LittleFS))   // scenario without lights.txt -> default
+            sfge_lights::blank();           // no config at all -> strip OFF
 
     S.printf("Panel: %s (%s)\n", cfg.name, cfg.id);
 
     // NFC — same pins as the terminal's primary reader (SDA=14, SCL=13)
-    // so one wiring harness fits every prop
-    I2C_NFC.begin(14, 13, 100000);
-    delay(50);
-    for (uint8_t a = 1; a < 127; a++) {
-        I2C_NFC.beginTransmission(a);
-        if (I2C_NFC.endTransmission() == 0) {
-            nfc.begin();
-            uint32_t fw = nfc.getFirmwareVersion();
-            if (fw) { nfcOk = true; nfc.SAMConfig(); }
-            break;
-        }
+    // so one wiring harness fits every prop. Gated on hardware.has_nfc_reader:
+    // a panel configured scan-free skips the probe (and its log noise)
+    // entirely. No address pre-scan: a sleeping PN532 won't ACK a bare probe —
+    // begin()/getFirmwareVersion() performs the wakeup. If nothing answers,
+    // the panel keeps re-probing every 10 s from loop(), so fixing wiring or
+    // mode switches is detected live — no reboot needed.
+    if (cfg.has_nfc) {
+        I2C_NFC.begin(14, 13, 100000);
+        delay(50);
+        panelNfcProbe(true);
+    } else {
+        S.println("NFC: disabled by config (scan-free panel)");
     }
-    S.printf("NFC: %s\n", nfcOk ? "READY" : "NOT FOUND");
+    if (cfg.has_nfc && !nfcOk) {
+        // Diagnostic: who (if anyone) is on the bus? A PN532 in I2C mode
+        // ACKs at 0x24. NOTE: a PN532 with its mode switches on HSU/SPI
+        // ignores I2C entirely and ALSO looks like an empty bus — so
+        // "EMPTY" means either wiring/power OR the switches.
+        S.println("NFC: NOT FOUND (SDA=14, SCL=13) — scanning bus:");
+        int found = 0;
+        for (uint8_t a = 1; a < 127; a++) {
+            I2C_NFC.beginTransmission(a);
+            if (I2C_NFC.endTransmission() == 0) {
+                S.printf("NFC:   device ACK at 0x%02X%s\n", a,
+                         a == 0x24 ? " (PN532!)" : "");
+                found++;
+            }
+        }
+        if (!found) S.println("NFC:   bus EMPTY — check power/GND/SDA14/SCL13 AND the"
+                              " mode switches (I2C = SW1 ON, SW2 OFF); re-probing every 10 s");
+        else        S.println("NFC:   device present but PN532 not responding — re-probing every 10 s");
+    }
+
+    // AUX port (buttons or second NFC on 38/39, per hardware.aux_mode)
+    auxInit();
 
     // WiFi AP + STA (STA needed for ESPNOW). Both use MESH_CHANNEL.
     WiFi.onEvent(onWiFiEvent);
@@ -912,6 +1320,17 @@ void setup() {
 
     // ── ESPNOW Mesh ──
     sfge::meshInit(cfg.id, sfge::ROLE_PANEL, onMeshMsg);
+
+    // Boot jingle (behavior.startup_song) — a cheery little power-up ditty
+    // so the prop announces it's alive before anyone taps it
+    if (cfg.startup_song) {
+        static const struct { int f, on, gap; } SONG[] = {
+            { 523, 90, 110 }, { 659, 90, 110 }, { 784, 90, 110 },
+            { 659, 70,  90 }, { 784, 90, 110 }, {1047, 160, 200 },
+            { 784, 70,  90 }, {1047, 220,   0 },
+        };
+        for (auto &n : SONG) { buzzerTone(n.f, n.on); delay(n.on + n.gap); }
+    }
 
     S.println("Ready.");
 }
@@ -928,6 +1347,9 @@ void loop() {
     // Lights: idle pattern + any interaction effect queued by HTTP handlers
     applyPendingFx();
 
+    // AUX port: momentary buttons or the code-cylinder reader
+    auxService();
+
     // Victory celebration (game_complete / faction victory heard on the mesh)
     if (pendingCelebrate) {
         pendingCelebrate = false;
@@ -943,6 +1365,14 @@ void loop() {
     if (alarmDirty) {
         alarmDirty = false;
         sfge_lights::setAlarm(alarmActive, cfg.alarm_siren_ms);
+    }
+
+    // ── Sabotage: broken-circuit lights until repaired ──
+    if (sabDirty) {
+        sabDirty = false;
+        sfge_lights::setSabotage(sabotaged);
+        if (sabotaged) { buzzerTone(200, 300); }
+        else           { buzzerTone(880, 80); delay(90); buzzerTone(1320, 120); }
     }
     if (alarmActive) {
         static unsigned long lastSiren = 0;
@@ -981,6 +1411,14 @@ void loop() {
         pollNfc();
     }
 
+    // No reader found yet (but config expects one)? Keep looking —
+    // a hot-plugged or just-fixed PN532 comes up without a reboot.
+    static unsigned long lastNfcProbe = 0;
+    if (cfg.has_nfc && !nfcOk && millis() - lastNfcProbe > 10000) {
+        lastNfcProbe = millis();
+        panelNfcProbe(false);
+    }
+
     // Auto-reset after 60s idle
     if (panelState != STATE_IDLE && millis() - lastActivity > 60000) {
         panelState = STATE_IDLE;
@@ -997,7 +1435,7 @@ void loop() {
                  cfg.id, st[panelState], playerSliced, alarmActive,
                  nfcOk ? "ok" : "--", cardPresent ? lastNfcUid : "--");
         sfge::sendPing(millis() / 1000);
-        sfge::sendPropStatus(millis() / 1000, 0, alarmActive, "");
+        sfge::sendPropStatus(millis() / 1000, 0, alarmActive, "", sabotaged);
     }
 
     delay(10);

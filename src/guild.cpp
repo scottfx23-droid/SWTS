@@ -36,6 +36,7 @@
 #include "sfge_mesh.h"
 #include "sfge_proximity.h"
 #include "sfge_ota.h"            // firmware-from-TF updates
+#include "sfge_scenario.h"       // GM-selected scenario -> content folder
 #include "sfge_test_configs.h"   // boot-time test provisioning (see header to disable)
 
 #define S Serial
@@ -106,9 +107,24 @@ unsigned long eyeMoodUntil = 0;   // revert to IDLE after this (0 = sticky)
 float pupilX = 0, pupilY = 0;          // current offset from center
 float pupilTX = 0, pupilTY = 0;        // saccade target
 unsigned long nextSaccade = 0;
-unsigned long nextBlink = 3000;
-int blinkPhase = 0;                    // 0 = open, 1..4 closing, 5..8 opening
 unsigned long lastEyeFrame = 0;
+
+// ── Blink engine — "Data-style" natural blinking ──
+// Star Trek's Data used a chaotic function for his blink timing because a
+// fixed rhythm instantly reads as mechanical. Same tricks here:
+//   * intervals drawn from a bell-ish distribution (sum of 3 uniforms),
+//     never a uniform spread, with occasional long unnerving stares
+//   * ~1 in 5 blinks is a quick double, ~1 in 7 only half-closes
+//   * the motion is asymmetric: fast close, a beat of hold, slow settle open
+//   * mood scales the rate — ALERT blinks quicker, ANGRY slow and deliberate
+unsigned long nextBlink   = 3000;
+unsigned long blinkStart  = 0;         // 0 = eye fully open
+int  blinkDepth    = 240;              // how far the membrane sweeps (px)
+int  blinkSweep    = 0;                // current sweep this frame (px)
+bool blinkIsDouble = false;            // a second flick follows this one
+#define BLINK_CLOSE_MS 90
+#define BLINK_HOLD_MS  50
+#define BLINK_OPEN_MS  190
 
 void setEyeMood(EyeMood m, uint32_t forMs) {
     eyeMood = m;
@@ -179,16 +195,14 @@ void drawEye(lgfx::LGFX_Device &dev, bool mirror) {
     eyeFrame.fillCircle(px + (mirror ? -16 : 16), py + 38, 5,
                         eyeFrame.color888(200, 255, 220));
 
-    // Blink: the nictitating membrane sweeps down the eye.
+    // Blink: the nictitating membrane sweeps down the eye by blinkSweep px.
     // (Panels run at rotation 1 for the sideways mount, so the physical
     // "top-to-bottom" blink is a sweep along draw-Y.)
-    if (blinkPhase > 0) {
-        static const int memSeq[9] = { 0, 80, 170, 240, 240, 240, 170, 80, 0 };
-        int sweep = memSeq[blinkPhase];
+    if (blinkSweep > 0) {
         uint32_t mem = eyeFrame.color888(34, 44, 26);   // translucent-looking lid tone
-        eyeFrame.fillRect(0, 0, 240, sweep, mem);
-        if (sweep > 0 && sweep < 240)
-            eyeFrame.fillRect(0, sweep - 4, 240, 4, eyeFrame.color888(60, 80, 45));
+        eyeFrame.fillRect(0, 0, 240, blinkSweep, mem);
+        if (blinkSweep < 240)
+            eyeFrame.fillRect(0, blinkSweep - 4, 240, 4, eyeFrame.color888(60, 80, 45));
     }
 
     // Mood lids (on top of everything; same axis as the blink)
@@ -215,20 +229,53 @@ void updateEyes() {
     pupilX = 0;
     pupilY = 0;
 
-    // Blinks
-    if (blinkPhase > 0) {
-        blinkPhase = (blinkPhase + 1) % 9;
-    } else if (now > nextBlink) {
-        nextBlink = now + 2500 + esp_random() % 5500;
-        blinkPhase = 1;
+    // ── Natural blink engine (see the notes at the state block) ──
+    int sweep = 0;
+    if (blinkStart) {
+        unsigned long t = now - blinkStart;
+        if (t < BLINK_CLOSE_MS) {
+            // Fast snap shut
+            sweep = (int)(blinkDepth * (float)t / BLINK_CLOSE_MS);
+        } else if (t < BLINK_CLOSE_MS + BLINK_HOLD_MS) {
+            sweep = blinkDepth;                      // a beat fully closed
+        } else if (t < BLINK_CLOSE_MS + BLINK_HOLD_MS + BLINK_OPEN_MS) {
+            // Slow settle open: fast at first, decelerating at the end
+            float u = (float)(t - BLINK_CLOSE_MS - BLINK_HOLD_MS) / BLINK_OPEN_MS;
+            float v = 1.0f - u;
+            sweep = (int)(blinkDepth * v * v);
+        } else {
+            blinkStart = 0;
+            if (blinkIsDouble) {
+                // Quick second flick lands right after the first
+                blinkIsDouble = false;
+                nextBlink = now + 220 + esp_random() % 240;
+            }
+        }
+    }
+    if (!blinkStart && now > nextBlink) {
+        blinkStart = now;
+        // Mostly full blinks; sometimes a lazy half-close
+        blinkDepth = (esp_random() % 100 < 14) ? 130 + (int)(esp_random() % 70) : 240;
+        blinkIsDouble = (esp_random() % 100 < 22);
+        // Interval: sum of three uniforms ~ bell curve centered ~4.5 s
+        uint32_t iv = 1200 + esp_random() % 2200 + esp_random() % 2200
+                           + esp_random() % 2200;
+        if (eyeMood == EYE_ALERT) iv = iv * 3 / 5;   // keyed-up: quicker
+        if (eyeMood == EYE_ANGRY) iv = iv * 8 / 5;   // slow and deliberate
+        if (esp_random() % 100 < 12)                 // the long alien stare
+            iv += 4000 + esp_random() % 5000;
+        nextBlink = now + iv;
     }
 
-    // Static stare between blinks — only redraw when something changed
-    static int prevBlink = -1;
+    // Static stare between blinks — only redraw when the lid moved a
+    // visible amount (8 px quantum) or the mood changed
+    int q = (sweep + 4) / 8;
+    static int prevQ = -1;
     static EyeMood prevMood = EYE_IDLE;
-    if (blinkPhase == prevBlink && eyeMood == prevMood) return;
-    prevBlink = blinkPhase;
+    if (q == prevQ && eyeMood == prevMood) return;
+    prevQ = q;
     prevMood = eyeMood;
+    blinkSweep = sweep;
 
     drawEye(eyeL, false);
     drawEye(eyeR, true);
@@ -242,6 +289,26 @@ bool codecOk = false;
 int  audioVolume = 18;        // 0-21, config behavior.volume
 char speechQueue[32] = "";    // one pending clip (base name, latest wins)
 bool wasSpeaking = false;
+
+// ── Remote audio (DFPlayer node) ──
+// behavior.audio_node names a mesh audio node (e.g. "AUDIO_01"); speech then
+// plays THERE: behavior.speech_tracks maps clip names to the numbered MP3s
+// on the DFPlayer's own card (/mp3/0001.mp3 = track 1). Empty = onboard
+// ES8311 as before.
+char audioNode[16] = "";
+struct SpeechTrack { char name[24]; int track; };
+SpeechTrack speechTracks[16];
+int speechTrackCount = 0;
+
+// Idle grumble cadence (behavior.idle_min_s / idle_max_s)
+int idleMinS = 120;
+int idleMaxS = 300;
+
+int trackFor(const char *base) {
+    for (int i = 0; i < speechTrackCount; i++)
+        if (strcasecmp(speechTracks[i].name, base) == 0) return speechTracks[i].track;
+    return -1;
+}
 
 void es8311Write(uint8_t reg, uint8_t val) {
     Wire.beginTransmission(ES8311_ADDR);
@@ -259,10 +326,14 @@ bool es8311Init() {
     es8311Write(0x00, 0x1F);   // reset
     delay(20);
     es8311Write(0x00, 0x00);
-    es8311Write(0x00, 0x80);   // power on, slave mode
-    es8311Write(0x01, 0xBF);   // clocks on, MCLK from pin
+    // Clock tree FIRST, then power-on (esp-bsp order). REG01 bit7 selects the
+    // codec's clock source: 0 = the MCLK pin (which the audio lib drives at
+    // 256*fs on GPIO12), 1 = derive from BCLK. We previously set bit7 (0xBF),
+    // so the dividers below were computed against the wrong clock -> silence.
+    es8311Write(0x01, 0x3F);   // all clocks on, clock from the MCLK pin
     es8311Write(0x02, 0x00);   // pre-div 1, pre-mult 1 (MCLK = 256*fs)
     es8311Write(0x03, 0x10);   // ADC OSR
+    es8311Write(0x16, 0x24);   // ADC config (reference sequence)
     es8311Write(0x04, 0x10);   // DAC OSR
     es8311Write(0x05, 0x00);   // adc/dac div 1
     es8311Write(0x06, 0x03);   // bclk div (master-mode only; benign as slave)
@@ -270,12 +341,17 @@ bool es8311Init() {
     es8311Write(0x08, 0xFF);
     es8311Write(0x09, 0x0C);   // SDP in: I2S, 16-bit
     es8311Write(0x0A, 0x0C);   // SDP out: I2S, 16-bit
+    es8311Write(0x00, 0x80);   // CSM power on, slave mode
+    delay(10);
     es8311Write(0x0D, 0x01);   // power up analog
     es8311Write(0x0E, 0x02);   // PGA/modulator
     es8311Write(0x12, 0x00);   // DAC power up
-    es8311Write(0x13, 0x10);   // HP drive
+    es8311Write(0x13, 0x10);   // HP drive (output stage on)
+    es8311Write(0x1C, 0x6A);   // ADC EQ bypass (reference sequence)
     es8311Write(0x37, 0x08);   // DAC EQ bypass
+    es8311Write(0x31, 0x00);   // DAC UNMUTE (never set before — muted = silent)
     es8311Write(0x32, 0xBF);   // DAC volume (~75%)
+    es8311Write(0x45, 0x00);   // GP control defaults
     S.println("[AUDIO] ES8311 ready");
     return true;
 }
@@ -292,12 +368,38 @@ void speechQueueFile(const char *name) {
     snprintf(speechQueue, sizeof(speechQueue), "%s", name);
 }
 
+// Teach the audio node the name->track table (its DFPlayer only knows
+// numbers and hides its card, so the node learns the map from OUR config).
+// Called after mesh init and every ~30 s so a rebooted node re-learns it.
+void speechMapBroadcast() {
+    if (!audioNode[0]) return;
+    for (int i = 0; i < speechTrackCount; i++) {
+        char kv[32];
+        snprintf(kv, sizeof(kv), "%s=%d", speechTracks[i].name, speechTracks[i].track);
+        sfge::gmOverride(audioNode, "map", kv);
+        delay(25);
+    }
+}
+
 bool speechPlay(const char *base) {
+    // Remote mode: tell the DFPlayer audio node the clip NAME over the
+    // mesh — the node resolves it against the map we taught it
+    if (audioNode[0]) {
+        if (trackFor(base) <= 0) {
+            S.printf("[AUDIO] no track mapped for '%s' (behavior.speech_tracks)\n", base);
+            return false;
+        }
+        sfge::gmOverride(audioNode, "play", base);
+        setEyeMood(EYE_TALK, 3500);   // mouth-less talking eyes, ~clip length
+        S.printf("[AUDIO] -> %s play '%s'\n", audioNode, base);
+        return true;
+    }
+
     if (!codecOk) return false;
-    char path[72];
-    snprintf(path, sizeof(path), "/SFGE/speech/%s.wav", base);
+    char path[96];
+    snprintf(path, sizeof(path), "%s/speech/%s.wav", sfge_scn::root, base);
     if (!SD_MMC.exists(path)) {
-        snprintf(path, sizeof(path), "/SFGE/speech/%s.mp3", base);
+        snprintf(path, sizeof(path), "%s/speech/%s.mp3", sfge_scn::root, base);
         if (!SD_MMC.exists(path)) {
             S.printf("[AUDIO] missing %s(.wav/.mp3)\n", base);
             return false;
@@ -313,7 +415,7 @@ bool speechPlay(const char *base) {
 }
 
 void speechService() {
-    audio.loop();   // feed the decoder every pass
+    if (codecOk) audio.loop();   // feed the decoder every pass (onboard mode)
 
     bool speaking = audio.isRunning();
     if (wasSpeaking && !speaking && eyeMood == EYE_TALK)
@@ -342,8 +444,8 @@ GuildConfig cfg;
 bool sdOk = false;
 
 bool loadConfig() {
-    File f = SD_MMC.open("/SFGE/config.json", FILE_READ);
-    if (!f) { S.println("[CFG] no /SFGE/config.json — defaults"); return false; }
+    File f = SD_MMC.open(sfge_scn::path("config.json"), FILE_READ);
+    if (!f) { S.println("[CFG] no config.json — defaults"); return false; }
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, f);
     f.close();
@@ -355,8 +457,25 @@ bool loadConfig() {
     audioVolume = doc["behavior"]["volume"] | audioVolume;   // 0-21
     if (audioVolume < 0) audioVolume = 0;
     if (audioVolume > 21) audioVolume = 21;
+
+    idleMinS = doc["behavior"]["idle_min_s"] | idleMinS;
+    idleMaxS = doc["behavior"]["idle_max_s"] | idleMaxS;
+    if (idleMaxS <= idleMinS) idleMaxS = idleMinS + 60;
+
+    // Remote DFPlayer audio node + the clip-name -> track-number map
+    strlcpy(audioNode, doc["behavior"]["audio_node"] | "", sizeof(audioNode));
+    speechTrackCount = 0;
+    JsonObject st = doc["behavior"]["speech_tracks"].as<JsonObject>();
+    for (JsonPair kv : st) {
+        if (speechTrackCount >= 16) break;
+        SpeechTrack &t = speechTracks[speechTrackCount++];
+        strlcpy(t.name, kv.key().c_str(), sizeof(t.name));
+        t.track = kv.value().as<int>();
+    }
+
     sfge_prox::loadConfig(doc);
-    S.printf("[CFG] %s (%s) vol=%d\n", cfg.name, cfg.id, audioVolume);
+    S.printf("[CFG] %s (%s) vol=%d audio=%s tracks=%d\n", cfg.name, cfg.id,
+             audioVolume, audioNode[0] ? audioNode : "onboard", speechTrackCount);
     return true;
 }
 
@@ -410,11 +529,14 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
 
     int stationRssi = 0;
     if (!sfge_prox::check(&stationRssi)) {
+        S.printf("[PROX] rejected %s (rssi %d — gate needs >= start threshold)\n",
+                 callsign, stationRssi);
         char body[64];
         snprintf(body, sizeof(body), "{\"error\":\"too_far\",\"rssi\":%d}", stationRssi);
         req->send(403, "application/json", body);
         return;
     }
+    S.printf("[PROX] %s in range (rssi %d)\n", callsign, stationRssi);
 
     JsonDocument resp;
     resp["type"] = "dialogue";
@@ -423,7 +545,52 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
     JsonArray lines = resp["lines"].to<JsonArray>();
     JsonArray choices = resp["choices"].to<JsonArray>();
 
-    if (strncmp(action, "turn_in:", 8) == 0) {
+    if (strncmp(action, "accept:", 7) == 0) {
+        // ── Take a contract (the 3-foot handshake at the Guild table) ──
+        const char *bid = action + 7;
+        GuildBounty *b = ledgerFind(bid);
+        if (!b || !b->open) {
+            pendingEye = 3;
+            JsonObject l1 = lines.add<JsonObject>();
+            l1["text"] = !b ? "THE GUILD HAS NO SUCH CONTRACT."
+                            : "THAT CONTRACT IS ALREADY SETTLED.";
+            l1["style"] = "system";
+        } else {
+            pendingEye = 2;   // pleased — new blood on the books
+            resp["accepted_bounty"] = b->id;   // datapad records + persists it
+
+            // Vex delivers the contract briefing: <id>_posted voice line
+            // (generic "posted" as fallback)
+            char base[32];
+            snprintf(base, sizeof(base), "%s_posted", b->id);
+            bool haveClip;
+            if (audioNode[0]) haveClip = (trackFor(base) > 0);
+            else {
+                char p1[96], p2[96];
+                snprintf(p1, sizeof(p1), "%s/speech/%s.wav", sfge_scn::root, base);
+                snprintf(p2, sizeof(p2), "%s/speech/%s.mp3", sfge_scn::root, base);
+                haveClip = SD_MMC.exists(p1) || SD_MMC.exists(p2);
+            }
+            if (haveClip) speechQueueFile(base);
+            else if (audioNode[0] ? (trackFor("posted") > 0) : true) speechQueueFile("posted");
+
+            char eventId[48];
+            snprintf(eventId, sizeof(eventId), "bounty_accepted:%s", b->id);
+            sfge::gmTriggerEvent(eventId, "Contract accepted", 0, callsign);
+            char msg[120];
+            snprintf(msg, sizeof(msg),
+                     "CONTRACT REGISTERED TO %s.\nTarget: %s. Reward: %d credits on delivery.\nScan the target's chain code and return to collect.",
+                     callsign, b->target_name, b->reward);
+            JsonObject l1 = lines.add<JsonObject>();
+            l1["text"] = msg;
+            l1["style"] = "system";
+            S.printf("[GUILD] %s accepted %s\n", callsign, b->id);
+        }
+        JsonObject c1 = choices.add<JsonObject>();
+        c1["label"] = "[Disconnect]";
+        c1["next_action"] = nullptr;
+    }
+    else if (strncmp(action, "turn_in:", 8) == 0) {
         const char *bid = action + 8;
         GuildBounty *b = ledgerFind(bid);
         // The hunter must actually hold the chain code (datapad sends its
@@ -443,11 +610,19 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
         } else {
             b->open = false;
             pendingEye = 2;   // happy
-            // Per-bounty voice line (<id>.wav or .mp3), else the stock one
-            char p1[72], p2[72];
-            snprintf(p1, sizeof(p1), "/SFGE/speech/%s.wav", b->id);
-            snprintf(p2, sizeof(p2), "/SFGE/speech/%s.mp3", b->id);
-            speechQueueFile((SD_MMC.exists(p1) || SD_MMC.exists(p2)) ? b->id : "turnin");
+            // Per-bounty voice line (<id> clip), else the stock turn-in.
+            // Remote mode consults the track MAP — the clips live on the
+            // DFPlayer's card, not this prop's TF card.
+            bool haveClip;
+            if (audioNode[0]) {
+                haveClip = (trackFor(b->id) > 0);
+            } else {
+                char p1[96], p2[96];
+                snprintf(p1, sizeof(p1), "%s/speech/%s.wav", sfge_scn::root, b->id);
+                snprintf(p2, sizeof(p2), "%s/speech/%s.mp3", sfge_scn::root, b->id);
+                haveClip = SD_MMC.exists(p1) || SD_MMC.exists(p2);
+            }
+            speechQueueFile(haveClip ? b->id : "turnin");
 
             // The claim broadcast pays the hunter and closes the bounty on
             // every datapad + the GM console
@@ -479,26 +654,47 @@ void handleInteract(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
         l1["text"] = "THE BOUNTY HUNTERS' GUILD RECOGNIZES YOU.";
         l1["style"] = "system";
 
-        int offered = 0;
+        // COLLECT — contracts whose chain code the hunter holds
+        int collectable = 0;
         for (const char *c : reqDoc["player"]["captured"].as<JsonArray>()) {
             if (!c || !c[0]) continue;
             GuildBounty *b = ledgerFind(c);
             if (!b || !b->open) continue;
             char lbl[40];
-            snprintf(lbl, sizeof(lbl), "Turn in: %s", b->target_name);
+            snprintf(lbl, sizeof(lbl), "Collect bounty: %s", b->target_name);
             char act[36];
             snprintf(act, sizeof(act), "turn_in:%s", b->id);
             JsonObject ch = choices.add<JsonObject>();
             ch["label"] = lbl;
             ch["next_action"] = act;
-            offered++;
+            collectable++;
         }
+
+        // ACCEPT — open contracts this hunter hasn't taken or captured yet
+        int acceptable = 0;
+        for (int i = 0; i < ledgerCount; i++) {
+            GuildBounty *b = &ledger[i];
+            if (!b->open) continue;
+            bool mine = false;
+            for (const char *a : reqDoc["player"]["accepted"].as<JsonArray>())
+                if (a && strcmp(a, b->id) == 0) { mine = true; break; }
+            for (const char *c : reqDoc["player"]["captured"].as<JsonArray>())
+                if (c && strcmp(c, b->id) == 0) { mine = true; break; }
+            if (mine) continue;
+            char lbl[44];
+            snprintf(lbl, sizeof(lbl), "Accept contract: %s (%d)", b->target_name, b->reward);
+            char act[36];
+            snprintf(act, sizeof(act), "accept:%s", b->id);
+            JsonObject ch = choices.add<JsonObject>();
+            ch["label"] = lbl;
+            ch["next_action"] = act;
+            acceptable++;
+        }
+
         JsonObject l2 = lines.add<JsonObject>();
-        if (offered == 0) {
-            l2["text"] = "No completed contracts on file. Acquire a target, scan its chain code, and return to me.";
-        } else {
-            l2["text"] = "Your chain codes verify. The Guild pays on delivery.";
-        }
+        if (collectable > 0)      l2["text"] = "Your chain codes verify. The Guild pays on delivery.";
+        else if (acceptable > 0)  l2["text"] = "Contracts are open on the board. Take one, hunt, and bring me the chain code.";
+        else                      l2["text"] = "No open contracts, no pending deliveries. The board is quiet... for now.";
         l2["style"] = "speech";
 
         JsonObject cd = choices.add<JsonObject>();
@@ -520,6 +716,7 @@ void onMeshMsg(const sfge::MeshHeader *hdr, const uint8_t *payload, int len) {
             if (len < (int)sizeof(sfge::MeshBounty)) return;
             const sfge::MeshBounty *b = (const sfge::MeshBounty *)payload;
             GuildBounty *g = ledgerFind(b->bounty_id);
+            bool wasOpen = (g && g->open);
             if (!g && ledgerCount < 8) {
                 g = &ledger[ledgerCount++];
                 memset(g, 0, sizeof(*g));
@@ -530,6 +727,10 @@ void onMeshMsg(const sfge::MeshHeader *hdr, const uint8_t *payload, int len) {
                 g->reward = b->reward;
                 g->open = true;
                 S.printf("[LEDGER] contract open: %s (%d)\n", g->id, g->reward);
+                // A newly opened contract perks the eyes up but stays SILENT —
+                // the <id>_posted voice line plays when a hunter ACCEPTS the
+                // contract at the table (3-foot handshake), not at GM posting.
+                if (!wasOpen) pendingEye = 1;
             }
             break;
         }
@@ -565,6 +766,15 @@ void onMeshMsg(const sfge::MeshHeader *hdr, const uint8_t *payload, int len) {
             if (len < (int)sizeof(sfge::MeshEvent)) break;
             const sfge::MeshEvent *e = (const sfge::MeshEvent *)payload;
             if (sfge::isCelebrationEvent(e->event_id)) pendingEye = 4;
+            break;
+        }
+        case sfge::MSG_SCENARIO: {
+            if (len < (int)sizeof(sfge::MeshScenario)) break;
+            const sfge::MeshScenario *sc = (const sfge::MeshScenario *)payload;
+            if (sdOk && sfge_scn::applyScenario(SD_MMC, sc->id)) {
+                delay(400 + (esp_random() % 500));
+                ESP.restart();
+            }
             break;
         }
         default: break;
@@ -605,15 +815,38 @@ void setup() {
         S.printf("[SD] Mounted %lluMB\n", SD_MMC.cardSize() / (1024 * 1024));
         sfge_ota::checkAndFlash(SD_MMC);
         sfge_test::writeTestConfigs(SD_MMC);
+        sfge_scn::begin(SD_MMC);   // GM-selected scenario -> content folder
         loadConfig();
     } else {
         S.println("[SD] Mount failed — insert configured card");
     }
 
-    // Audio (ES8311 codec + WAV/MP3 player)
+    // What voice lines does this card actually have? (boot diagnostic)
+    if (sdOk) {
+        File sdir = SD_MMC.open(sfge_scn::path("speech"));
+        if (sdir && sdir.isDirectory()) {
+            S.println("[SPEECH] files on card:");
+            File sf;
+            int n = 0;
+            while ((sf = sdir.openNextFile())) {
+                if (!sf.isDirectory()) { S.printf("[SPEECH]   %s\n", sf.name()); n++; }
+                sf.close();
+            }
+            if (!n) S.println("[SPEECH]   (none — put boot/greet/idle1../turnin/denied .mp3|.wav here)");
+            sdir.close();
+        } else {
+            S.printf("[SPEECH] no %s folder on the card\n", sfge_scn::path("speech"));
+        }
+    }
+
+    // Audio (ES8311 codec + WAV/MP3 player, or the remote DFPlayer node)
     codecOk = es8311Init();
     if (codecOk) audioStart();
-    else S.println("[AUDIO] disabled");
+    else S.println("[AUDIO] onboard codec disabled");
+    if (audioNode[0]) S.printf("[AUDIO] remote mode -> %s\n", audioNode);
+    // Boot sound — plays once the loop services the speech queue (onboard
+    // file or the node's mapped "boot" track; missing = logs and skips)
+    if (codecOk || audioNode[0]) speechQueueFile("boot");
 
     // WiFi AP + mesh
     WiFi.mode(WIFI_AP_STA);
@@ -626,6 +859,8 @@ void setup() {
     server.begin();
 
     sfge::meshInit(cfg.id, sfge::ROLE_PANEL, onMeshMsg);
+    delay(200);
+    speechMapBroadcast();   // teach the audio node our clip names
     S.println("[GUILD] Ready — the Guild is open for business");
 }
 
@@ -645,11 +880,42 @@ void loop() {
     updateEyes();
     speechService();
 
-    // Occasional idle grumbling
-    static unsigned long nextIdle = 60000;
-    if (sdOk && codecOk && !audio.isRunning() && millis() > nextIdle) {
-        nextIdle = millis() + 45000 + esp_random() % 60000;
-        speechQueueFile("idle");
+    // Occasional idle grumbling — picks randomly from the idle pool.
+    // Onboard mode: speech/idle1..idle9.(wav|mp3) files, plain idle fallback.
+    // Remote mode: any speech_tracks entries whose name starts with "idle".
+    // Cadence: behavior.idle_min_s .. idle_max_s (default 2-5 minutes).
+    static unsigned long nextIdle = 0;
+    if (!nextIdle) nextIdle = millis() + (unsigned long)idleMinS * 1000UL;
+    if ((codecOk || audioNode[0]) && !audio.isRunning() && millis() > nextIdle) {
+        nextIdle = millis() + (unsigned long)idleMinS * 1000UL +
+                   esp_random() % ((unsigned long)(idleMaxS - idleMinS) * 1000UL + 1);
+        if (audioNode[0]) {
+            const char *pool[16];
+            int poolN = 0;
+            for (int i = 0; i < speechTrackCount; i++)
+                if (strncasecmp(speechTracks[i].name, "idle", 4) == 0)
+                    pool[poolN++] = speechTracks[i].name;
+            if (poolN > 0) speechQueueFile(pool[esp_random() % poolN]);
+        } else if (sdOk) {
+            int pool[9], poolN = 0;
+            for (int i = 1; i <= 9; i++) {
+                char p1[64], p2[64];
+                snprintf(p1, sizeof(p1), "%s/speech/idle%d.wav", sfge_scn::root, i);
+                snprintf(p2, sizeof(p2), "%s/speech/idle%d.mp3", sfge_scn::root, i);
+                if (SD_MMC.exists(p1) || SD_MMC.exists(p2)) pool[poolN++] = i;
+            }
+            if (poolN > 0) {
+                char base[16];
+                snprintf(base, sizeof(base), "idle%d", pool[esp_random() % poolN]);
+                speechQueueFile(base);
+            } else {
+                // Plain idle.* fallback — skip quietly when the card has none
+                char pi1[64], pi2[64];
+                snprintf(pi1, sizeof(pi1), "%s/speech/idle.wav", sfge_scn::root);
+                snprintf(pi2, sizeof(pi2), "%s/speech/idle.mp3", sfge_scn::root);
+                if (SD_MMC.exists(pi1) || SD_MMC.exists(pi2)) speechQueueFile("idle");
+            }
+        }
     }
 
     // Heartbeat
@@ -658,6 +924,13 @@ void loop() {
         lastBeat = millis();
         sfge::sendPing(millis() / 1000);
         sfge::sendPropStatus(millis() / 1000, 0, false, "");
+    }
+
+    // Re-teach the audio node its track map every 30 s (covers node reboots)
+    static unsigned long lastMapBcast = 0;
+    if (audioNode[0] && millis() - lastMapBcast > 30000) {
+        lastMapBcast = millis();
+        speechMapBroadcast();
     }
 
     delay(2);

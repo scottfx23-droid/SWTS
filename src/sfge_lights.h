@@ -63,6 +63,12 @@ inline bool          alarmLit     = false;
 // Countdown tint: idle colors blend toward red by tintPct (0 = off)
 inline uint8_t       tintPct = 0;
 
+// Sabotage: slow alternating red/amber halves — "physically broken" look,
+// distinct from the alarm's hard red strobe. Cleared by a repair.
+inline bool          sabOn   = false;
+inline unsigned long sabNext = 0;
+inline bool          sabPhase = false;
+
 // Celebration: rainbow sweep + white sparkles for a while (victory finale).
 // A nonzero theme color swaps the rainbow for a single-color brightness wave
 // (faction victory strobes in the winner's color). Alarm still wins.
@@ -160,6 +166,18 @@ inline bool loadBuiltin(const char *txt) {
     return parseAndBegin(String(txt));
 }
 
+// No lights config? Still drive zeros once: WS2812 pixels power up in RANDOM
+// states, so an undriven strip shows stuck colors. This turns them all off
+// without configuring any content (safe to call when no strip is attached).
+inline void blank(int count = 64, int pin = 21) {
+    if (strip) return;   // a real config owns the strip
+    Adafruit_NeoPixel off((uint16_t)count, pin, NEO_GRB | NEO_KHZ800);
+    off.begin();
+    off.clear();
+    off.show();
+    Serial.println("[LIGHTS] no config — strip blanked (all off)");
+}
+
 // Blink the whole strip `times` times in `rgb`, then resume the idle pattern.
 inline void flash(uint32_t rgb, uint8_t times = 3, uint16_t periodMs = 120) {
     if (!strip) return;
@@ -180,6 +198,13 @@ inline void setAlarm(bool on, uint16_t periodMs = 350) {
     alarmOn = on;
     alarmPeriod = periodMs;
     alarmNext = 0;
+    if (!on) for (int i = 0; i < ledCount; i++) leds[i].nextChange = 0;  // redraw idle
+}
+
+// SABOTAGE: broken-circuit flicker until repaired (alarm still outranks it)
+inline void setSabotage(bool on) {
+    sabOn = on;
+    sabNext = 0;
     if (!on) for (int i = 0; i < ledCount; i++) leds[i].nextChange = 0;  // redraw idle
 }
 
@@ -236,6 +261,23 @@ inline void update() {
             alarmLit = !alarmLit;
             for (int i = 0; i < ledCount; i++) setPixel(i, alarmLit ? 0xFF2000 : 0);
             alarmNext = now + alarmPeriod;
+            dirty = true;
+        }
+        if (dirty && now - lastShow >= 15) { strip->show(); lastShow = now; }
+        return;
+    }
+
+    if (sabOn) {
+        // Broken circuit: halves alternate red/amber with random dropouts
+        if (now >= sabNext) {
+            sabPhase = !sabPhase;
+            for (int i = 0; i < ledCount; i++) {
+                bool firstHalf = i < ledCount / 2;
+                uint32_t c = (firstHalf == sabPhase) ? 0xFF2000 : 0xFF8800;
+                if ((esp_random() % 100) < 25) c = 0;   // dead cells
+                setPixel(i, scale(c, 60));
+            }
+            sabNext = now + 500;
             dirty = true;
         }
         if (dirty && now - lastShow >= 15) { strip->show(); lastShow = now; }

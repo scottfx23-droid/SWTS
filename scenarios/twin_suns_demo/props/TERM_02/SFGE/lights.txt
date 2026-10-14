@@ -1,0 +1,11 @@
+# TERM_02 - Rebel Safehouse Uplink strip
+chip=ws2812
+order=GRB
+pin=21
+# RRGGBB,on_ms,off_ms  (on 0 = solid, on -1 = flicker)
+FF4400,0,0
+FFFFFF,900,700
+FF4400,-1,0
+FF8844,0,0
+FF4400,600,400
+FFFFFF,0,0

@@ -435,7 +435,10 @@ void setup() {
     // SD → OTA → test provisioning → config
     SPIClass *sdSPI = new SPIClass(HSPI);
     sdSPI->begin(SD_CLK, SD_MISO, SD_MOSI, SD_CS);
-    sdOk = SD.begin(SD_CS, *sdSPI, 20000000);
+    for (int t = 0; t < 3 && !sdOk; t++) {   // warm reboots can wedge one try
+        if (t) { SD.end(); delay(250); }
+        sdOk = SD.begin(SD_CS, *sdSPI, 20000000);
+    }
     if (sdOk) {
         sfge_ota::checkAndFlash(SD);
         sfge_test::writeTestConfigs(SD);

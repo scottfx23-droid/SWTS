@@ -134,9 +134,9 @@
   ],
   "bounties": [
     {
-      "id": "bounty_greedo",
-      "target_name": "Greedo",
-      "description": "Rodian bounty hunter casing the Twin Suns Cantina. Armed, opportunistic, working freelance for the Empire.",
+      "id": "bounty_shilak",
+      "target_name": "Shilak",
+      "description": "Rodian bounty hunter casing the Outpost 77 Cantina. Armed, opportunistic, working freelance for the Empire.",
       "reward": 300,
       "clues": [
         "Last seen at the cantina bar. Green skin, big black eyes, holstered DT-12 blaster.",

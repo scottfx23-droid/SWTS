@@ -16,7 +16,16 @@
     "has_eyes": true
   },
   "behavior": {
-    "proximity_enabled": false,
-    "volume": 18
+    "proximity_enabled": true,
+    "proximity_rssi_start": -62,
+    "proximity_rssi_drop": -72,
+    "proximity_grace_ms": 1500,
+    "volume": 18,
+    "audio_node": "AUDIO_01",
+    "speech_tracks": {
+      "boot": 1, "greet": 2, "turnin": 3, "denied": 4,
+      "bounty_shilak": 5, "idle_01": 6, "idle_02": 7,
+      "bounty_shilak_posted": 8
+    }
   }
 }

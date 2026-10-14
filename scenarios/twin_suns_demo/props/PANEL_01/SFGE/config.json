@@ -8,15 +8,21 @@
     "wifi_channel": 1,
     "name": "Cantina Comm Board",
     "faction": "neutral",
-    "location_hint": "Twin Suns Cantina dome"
+    "location_hint": "Outpost 77 Cantina dome"
   },
   "hardware": {
     "has_nfc_reader": false,
     "has_leds": false,
     "has_buzzer": true,
-    "buzzer_pin": 4
+    "buzzer_pin": 4,
+    "aux_mode": "buttons"
   },
   "behavior": {
+    "buttons": [
+      { "event": "btn_door_cycle",  "name": "DOOR CONTROL" },
+      { "event": "btn_power_relay", "name": "POWER RELAY" }
+    ],
+    "button_cooldown_ms": 1500,
     "idle_animation": "cantina_pulse",
     "requires_auth_card": false,
     "slice_first": true,
@@ -30,6 +36,7 @@
     "alarm_timeout_s": 90,
     "alarm_siren_period_ms": 350,
     "timer_visual": true,
+    "sabotage_enabled": true,
     "dialogue_greeting": "dialogue/greeting.json"
   }
 }

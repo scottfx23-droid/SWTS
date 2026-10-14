@@ -11,7 +11,7 @@
     "location_hint": "Storage facility (the generic building)"
   },
   "hardware": {
-    "has_nfc_reader": false,
+    "has_nfc_reader": true,
     "has_leds": true,
     "has_buzzer": true,
     "buzzer_pin": 4

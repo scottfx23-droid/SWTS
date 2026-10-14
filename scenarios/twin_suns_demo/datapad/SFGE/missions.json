@@ -6,7 +6,7 @@
       "title": "INTEL RUN",
       "subtitle": "Recover encrypted intel from the outpost and deliver it to R5-D8",
       "faction": "REBEL",
-      "briefing": "Operative, a rebel sympathizer at the Twin Suns Cantina has dead-dropped an intel package for us.\n\nFind the datacard at the outpost, take it to the Repair Shop Decoder to decrypt, and hand the coordinates to R5-D8 who is hiding in the storage facility.\n\nImperial patrols are sweeping the area. Stay low.",
+      "briefing": "Operative, a rebel sympathizer at the Outpost 77 Cantina has dead-dropped an intel package for us.\n\nFind the datacard at the outpost, take it to the Repair Shop Decoder to decrypt, and hand the coordinates to R5-D8 who is hiding in the storage facility.\n\nImperial patrols are sweeping the area. Stay low.",
       "difficulty": 1,
       "reward_credits": 250,
       "reward_xp": 100,
@@ -102,5 +102,10 @@
     { "token": "INTEL_01",   "action": "step", "mission": "intel_run",     "step": 0 },
     { "token": "INTEL_01",   "action": "step", "mission": "counter_slice", "step": 1 },
     { "token": "EXTRACT_01", "action": "step", "mission": "extraction",    "step": 1 }
+  ],
+  "codes": [
+    { "code": "7731", "event": "dock_access_granted", "name": "DOCK ACCESS" },
+    { "code": "2187", "event": "supply_cache_opened", "name": "SUPPLY CACHE",
+      "reusable": true }
   ]
 }

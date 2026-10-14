@@ -49,7 +49,7 @@
 #define LV_USE_LABEL       1
 #define LV_USE_LINE        1
 #define LV_USE_ROLLER      0
-#define LV_USE_SLIDER      0
+#define LV_USE_SLIDER      1   /* Frequency Lock minigame tuners */
 #define LV_USE_SWITCH      0
 #define LV_USE_TEXTAREA    1
 #define LV_USE_TABLE       0

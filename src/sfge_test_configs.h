@@ -2,7 +2,7 @@
  * SFGE TEST PROVISIONING — embedded gameplay configs written on boot
  *
  * While SFGE_WRITE_TEST_CONFIGS is defined, every device writes its
- * Twin Suns demo gameplay files to its own storage at boot, before the
+ * Outpost 77 demo gameplay files to its own storage at boot, before the
  * normal config load:
  *
  *   datapad  → SD        (config, missions, comms, nfc_map, player)
@@ -65,7 +65,7 @@ static const char T_MISSIONS[] = R"json({
       "title": "INTEL RUN",
       "subtitle": "Recover encrypted intel from the outpost and deliver it to R5-D8",
       "faction": "REBEL",
-      "briefing": "Operative, a rebel sympathizer at the Twin Suns Cantina has dead-dropped an intel package for us.\n\nFind the datacard at the outpost, take it to the Repair Shop Decoder to decrypt, and hand the coordinates to R5-D8 who is hiding in the storage facility.\n\nImperial patrols are sweeping the area. Stay low.",
+      "briefing": "Operative, a rebel sympathizer at the Outpost 77 Cantina has dead-dropped an intel package for us.\n\nFind the datacard at the outpost, take it to the Repair Shop Decoder to decrypt, and hand the coordinates to R5-D8 who is hiding in the storage facility.\n\nImperial patrols are sweeping the area. Stay low.",
       "difficulty": 1,
       "reward_credits": 250,
       "reward_xp": 100,
@@ -161,6 +161,11 @@ static const char T_MISSIONS[] = R"json({
     { "token": "INTEL_01",   "action": "step", "mission": "intel_run",     "step": 0 },
     { "token": "INTEL_01",   "action": "step", "mission": "counter_slice", "step": 1 },
     { "token": "EXTRACT_01", "action": "step", "mission": "extraction",    "step": 1 }
+  ],
+  "codes": [
+    { "code": "7731", "event": "dock_access_granted", "name": "DOCK ACCESS" },
+    { "code": "2187", "event": "supply_cache_opened", "name": "SUPPLY CACHE",
+      "reusable": true }
   ]
 }
 )json";
@@ -172,7 +177,7 @@ static const char T_COMMS[] = R"json({
       "id": "welcome",
       "from": "ALLIANCE COMMAND",
       "subject": "WELCOME TO OUTPOST 77",
-      "body": "Operative, you've been deployed to the Twin Suns Outpost. A rebel contact has left intel for us at the cantina. Find it, decrypt it at the Repair Shop Terminal, and get the coordinates to R5-D8 in the storage facility. Watch for Imperial patrols.",
+      "body": "Operative, you've been deployed to the Outpost 77. A rebel contact has left intel for us at the cantina. Find it, decrypt it at the Repair Shop Terminal, and get the coordinates to R5-D8 in the storage facility. Watch for Imperial patrols.",
       "trigger": "boot",
       "faction": "REBEL"
     },
@@ -180,7 +185,7 @@ static const char T_COMMS[] = R"json({
       "id": "welcome_imp",
       "from": "ISB COMMAND",
       "subject": "WELCOME TO OUTPOST 77",
-      "body": "Agent, rebel activity is confirmed at the Twin Suns Outpost. They are moving intelligence through the cantina. Trace their slicer network, recover whatever they are hiding, and log it as evidence. The Empire is watching your performance.",
+      "body": "Agent, rebel activity is confirmed at the Outpost 77. They are moving intelligence through the cantina. Trace their slicer network, recover whatever they are hiding, and log it as evidence. The Empire is watching your performance.",
       "trigger": "boot",
       "faction": "IMPERIAL"
     },
@@ -258,7 +263,7 @@ static const char T_COMMS[] = R"json({
     },
     {
       "id": "shuttle_inbound",
-      "from": "TWIN SUNS FLIGHT",
+      "from": "OUTPOST 77 FLIGHT",
       "subject": "SHUTTLE INBOUND",
       "body": "Signal received, operative. Lambda shuttle on approach -- ETA ten minutes. Proceed to the landing zone and scan the extraction beacon EXTRACT_01 to confirm pickup. Clear skies.",
       "trigger": "event:extraction:PANEL_01",
@@ -278,6 +283,41 @@ static const char T_COMMS[] = R"json({
       "body": "Backup extraction frequency is 121.9 -- memorize it and burn this message. If the comm board is compromised, broadcast from the repair shop decoder instead. Trust no one wearing white armor.",
       "trigger": "boot",
       "encrypted": true
+    },
+    {
+      "id": "guild_contract",
+      "from": "BOUNTY HUNTERS' GUILD",
+      "subject": "CONTRACT POSTED",
+      "body": "The Guild is open for business at the cantina back table. First contract of the season: SHILAK, Rodian gun-for-hire, armed and freelancing for the Empire -- 300 credits, no questions asked. Find him, scan his chain code, and bring it to Guild Master Vex. First hunter to deliver gets paid. The Guild does not split fees.",
+      "trigger": "boot"
+    },
+    {
+      "id": "grid_breached",
+      "from": "OUTPOST WATCH",
+      "subject": "POWER GRID BREACH",
+      "body": "Someone just retuned the docking bay power junction. The duty log mentions berth 7 going dark off the books -- and a backup spin-up code the techs were told not to share. Try it on your keypad.",
+      "trigger": "event:panel_sliced:PANEL_02"
+    },
+    {
+      "id": "clamps_released",
+      "from": "DOCKING CONTROL",
+      "subject": "CLAMP ALERT",
+      "body": "Berth 7 docking clamps just released without authorization. Whatever was parked there is free to fly. If that was you -- move now, before control re-engages them.",
+      "trigger": "event:btn_clamp_release"
+    },
+    {
+      "id": "bolt_removed_c1",
+      "from": "ALLIANCE INTEL",
+      "subject": "C1 UNIT UNSHACKLED",
+      "body": "Someone pulled the restraining bolt off the C1 unit in the docking bay. That droid has been carrying a locked uplink since before the occupation -- feed it the battle plans datacard while it's free.",
+      "trigger": "event:bolt_removed:DROID_C11U17K"
+    },
+    {
+      "id": "battle_plans_up",
+      "from": "ALLIANCE COMMAND",
+      "subject": "BATTLE PLANS RECEIVED",
+      "body": "The C1 unit just burst-transmitted the battle plans to the fleet. Outstanding work, operative. Keep that droid out of Imperial hands.",
+      "trigger": "event:nfc:DROID_C11U17K:DATACARD_02"
     }
   ]
 }
@@ -498,9 +538,9 @@ static const char T_GM_CONFIG[] = R"json({
   ],
   "bounties": [
     {
-      "id": "bounty_greedo",
-      "target_name": "Greedo",
-      "description": "Rodian bounty hunter casing the Twin Suns Cantina. Armed, opportunistic, working freelance for the Empire.",
+      "id": "bounty_shilak",
+      "target_name": "Shilak",
+      "description": "Rodian bounty hunter casing the Outpost 77 Cantina. Armed, opportunistic, working freelance for the Empire.",
       "reward": 300,
       "clues": [
         "Last seen at the cantina bar. Green skin, big black eyes, holstered DT-12 blaster.",
@@ -517,9 +557,112 @@ static const TestFile FILES[] = {
 };
 
 // ═══════════════════════════════════════
-//  PANEL — Cantina Comm Board (PANEL_01)
+//  PANEL — Cantina Comm Board (PANEL_01), or with the SFGE_PANEL2 build
+//  flag, Docking Bay Power Junction (PANEL_02, env:panel2)
 // ═══════════════════════════════════════
 #elif defined(SFGE_DEVICE_PANEL)
+
+#if defined(SFGE_PANEL2)
+
+static const char T_CONFIG[] = R"json({
+  "$schema": "sfge-config-v1",
+  "scenario": {"name": "Tatooine Run", "version": "0.1-demo"},
+  "prop": {
+    "type": "panel",
+    "id": "PANEL_02",
+    "ssid": "SFGE_PANEL_02",
+    "wifi_channel": 1,
+    "name": "Docking Bay Power Junction",
+    "faction": "imperial",
+    "location_hint": "Docking bay service wall"
+  },
+  "hardware": {
+    "has_nfc_reader": false,
+    "has_leds": false,
+    "has_buzzer": true,
+    "buzzer_pin": 4,
+    "aux_mode": "buttons"
+  },
+  "behavior": {
+    "buttons": [
+      { "event": "btn_clamp_release", "name": "DOCKING CLAMPS" },
+      { "event": "btn_floodlights",   "name": "FLOODLIGHTS" }
+    ],
+    "button_cooldown_ms": 1500,
+    "idle_animation": "grid_hum",
+    "requires_auth_card": false,
+    "slice_first": true,
+    "minigame_default": "freq",
+    "startup_song": true,
+    "proximity_enabled": true,
+    "proximity_rssi_start": -60,
+    "proximity_rssi_drop": -72,
+    "proximity_grace_ms": 2000,
+    "alarm_after_fails": 2,
+    "alarm_timeout_s": 90,
+    "alarm_siren_period_ms": 350,
+    "timer_visual": true,
+    "sabotage_enabled": true,
+    "dialogue_greeting": "dialogue/greeting.json"
+  }
+}
+)json";
+
+static const char T_GREETING[] = R"json({
+  "type": "dialogue",
+  "speaker": {"name": "Docking Bay Power Junction", "faction": "imperial"},
+  "lines": [
+    {"text": "IMPERIAL GRID NODE 77-B // AUTHORIZED PERSONNEL ONLY", "style": "system"},
+    {"text": "Heavy conduits hum behind the service wall. A maintenance readout cycles through power figures for the docking bay clamps and floodlights.", "style": "narration"},
+    {"text": "Carrier channels drift across the monitor band -- the grid is poorly tuned.", "style": "info"}
+  ],
+  "choices": [
+    {"label": "[Disconnect]", "next_action": null}
+  ]
+}
+)json";
+
+// Sliceable data — served by the "Access data logs" choice after a breach
+static const char T_LORE1[] = R"lore(TITLE: Docking Bay Power Allocation
+CLASS: IMPERIAL MAINTENANCE // NODE 77-B
+DATE: 3 ABY
+---
+Sliced from the junction's duty log:
+
+CYCLE 112: Clamp power rerouted twice this
+week on verbal orders only. No requisition
+forms filed. Someone is keeping a berth
+energized off the books.
+
+CYCLE 115: Floodlight ring 3 disabled for
+"maintenance" during the night shift. The
+bay cameras lost coverage of berth 7 for
+two full hours.
+
+CYCLE 118: Note from the duty tech: if the
+grid drops again, the backup spin-up code
+is 2187. Do not share with contractors.
+---
+END OF LOG
+)lore";
+
+// RGB strip pattern — cold Imperial grid tones
+static const char T_LIGHTS[] = R"txt(# PANEL_02 - Docking Bay Power Junction strip
+chip=ws2812
+order=GRB
+pin=21
+# RRGGBB,on_ms,off_ms  (on 0 = solid, on -1 = flicker)
+3388FF,0,0
+AAC8FF,0,0
+3388FF,800,500
+FFFFFF,-1,0
+3388FF,0,0
+AAC8FF,600,900
+3388FF,0,0
+FFFFFF,0,0
+)txt";
+
+#else   // PANEL_01 (default panel build)
 
 static const char T_CONFIG[] = R"json({
   "$schema": "sfge-config-v1",
@@ -531,15 +674,21 @@ static const char T_CONFIG[] = R"json({
     "wifi_channel": 1,
     "name": "Cantina Comm Board",
     "faction": "neutral",
-    "location_hint": "Twin Suns Cantina dome"
+    "location_hint": "Outpost 77 Cantina dome"
   },
   "hardware": {
     "has_nfc_reader": false,
     "has_leds": false,
     "has_buzzer": true,
-    "buzzer_pin": 4
+    "buzzer_pin": 4,
+    "aux_mode": "buttons"
   },
   "behavior": {
+    "buttons": [
+      { "event": "btn_door_cycle",  "name": "DOOR CONTROL" },
+      { "event": "btn_power_relay", "name": "POWER RELAY" }
+    ],
+    "button_cooldown_ms": 1500,
     "idle_animation": "cantina_pulse",
     "requires_auth_card": false,
     "slice_first": true,
@@ -553,6 +702,7 @@ static const char T_CONFIG[] = R"json({
     "alarm_timeout_s": 90,
     "alarm_siren_period_ms": 350,
     "timer_visual": true,
+    "sabotage_enabled": true,
     "dialogue_greeting": "dialogue/greeting.json"
   }
 }
@@ -615,6 +765,8 @@ FFAA00,700,500
 CC8800,0,0
 )txt";
 
+#endif  // SFGE_PANEL2
+
 static const TestFile FILES[] = {
     { "/SFGE/config.json",            T_CONFIG,   true },
     { "/SFGE/dialogue/greeting.json", T_GREETING, true },
@@ -623,9 +775,83 @@ static const TestFile FILES[] = {
 };
 
 // ═══════════════════════════════════════
-//  TERMINAL — Repair Shop Decoder (TERM_01)
+//  TERMINAL — Repair Shop Decoder (TERM_01), or with the SFGE_TERM2 build
+//  flag, Rebel Safehouse Uplink (TERM_02, env:terminal2)
 // ═══════════════════════════════════════
 #elif defined(SFGE_DEVICE_TERMINAL)
+
+#if defined(SFGE_TERM2)
+
+static const char T_CONFIG[] = R"json({
+  "$schema": "sfge-config-v1",
+  "scenario": {"name": "Tatooine Run", "version": "0.1-demo"},
+  "prop": {
+    "type": "terminal",
+    "id": "TERM_02",
+    "ssid": "SFGE_TERM_02",
+    "wifi_channel": 1,
+    "name": "Rebel Safehouse Uplink",
+    "faction": "rebel",
+    "location_hint": "Behind the storage facility, under the awning"
+  },
+  "hardware": {
+    "has_nfc_reader": true,
+    "has_buzzer": true,
+    "buzzer_pin": 4,
+    "nfc_primary_role": "cards",
+    "nfc_secondary_role": "cylinder"
+  },
+  "behavior": {
+    "scan_cooldown_ms": 1500,
+    "require_tap_to_use": true,
+    "session_timeout_s": 60,
+    "decrypt_required": false,
+    "sabotage_enabled": true,
+    "dialogue_greeting": "dialogue/greeting.json"
+  }
+}
+)json";
+
+static const char T_GREETING[] = R"json({
+  "type": "dialogue",
+  "speaker": {"name": "Rebel Safehouse Uplink", "faction": "rebel"},
+  "lines": [
+    {"text": "UPLINK LIVE // FRIENDS OF THE ALLIANCE ONLY", "style": "system"},
+    {"text": "A battered field transceiver, wired into a crate of spare parts. Someone has scratched a starbird into the casing.", "style": "narration"},
+    {"text": "Cards read here go straight to Alliance intel -- no decryption delay, no questions.", "style": "info"}
+  ],
+  "choices": [
+    {"label": "[Disconnect]", "next_action": null}
+  ]
+}
+)json";
+
+static const char T_SHOP[] = R"json({
+  "$schema": "sfge-shop-v1",
+  "items": [
+    { "id": "JAMMER", "name": "SIGNAL JAMMER (ALLIANCE RATE)",
+      "cost": 250, "effect": "next_hostile_as_neutral" },
+    { "id": "INFORMANT_TIP", "name": "INFORMANT TIP",
+      "cost": 100, "effect": "reveal_bounty_clue" }
+  ]
+}
+)json";
+
+// RGB strip pattern — rebel ember-and-white
+static const char T_LIGHTS[] = R"txt(# TERM_02 - Rebel Safehouse Uplink strip
+chip=ws2812
+order=GRB
+pin=21
+# RRGGBB,on_ms,off_ms  (on 0 = solid, on -1 = flicker)
+FF4400,0,0
+FFFFFF,900,700
+FF4400,-1,0
+FF8844,0,0
+FF4400,600,400
+FFFFFF,0,0
+)txt";
+
+#else   // TERM_01 (default terminal build)
 
 static const char T_CONFIG[] = R"json({
   "$schema": "sfge-config-v1",
@@ -642,7 +868,9 @@ static const char T_CONFIG[] = R"json({
   "hardware": {
     "has_nfc_reader": true,
     "has_buzzer": true,
-    "buzzer_pin": 4
+    "buzzer_pin": 4,
+    "nfc_primary_role": "cards",
+    "nfc_secondary_role": "cylinder"
   },
   "behavior": {
     "scan_cooldown_ms": 1500,
@@ -654,6 +882,7 @@ static const char T_CONFIG[] = R"json({
     "decrypt_required": true,
     "decrypt_tries": 6,
     "decrypt_glyphs": 6,
+    "sabotage_enabled": true,
     "dialogue_greeting": "dialogue/greeting.json"
   }
 }
@@ -697,6 +926,8 @@ FFAA00,500,900
 CC8800,1200,300
 )txt";
 
+#endif  // SFGE_TERM2
+
 static const TestFile FILES[] = {
     { "/SFGE/config.json",            T_CONFIG,   true },
     { "/SFGE/dialogue/greeting.json", T_GREETING, true },
@@ -705,9 +936,90 @@ static const TestFile FILES[] = {
 };
 
 // ═══════════════════════════════════════
-//  DROID — R5-D8 (DROID_R5D8)
+//  DROID — R5-D8 (DROID_R5D8), or with the SFGE_DROID2 build flag,
+//  C1-1U17K (env:droid2) — a scrappy C1-series with a restless head
 // ═══════════════════════════════════════
 #elif defined(SFGE_DEVICE_DROID)
+
+#if defined(SFGE_DROID2)
+
+static const char T_CONFIG[] = R"json({
+  "$schema": "sfge-config-v1",
+  "scenario": {"name": "Tatooine Run", "version": "0.1-demo"},
+  "prop": {
+    "type": "droid",
+    "id": "DROID_C11U17K",
+    "ssid": "SFGE_DROID_C1",
+    "wifi_channel": 1,
+    "name": "C1-1U17K",
+    "faction": "rebel",
+    "location_hint": "Docking bay, parked by the fuel drums"
+  },
+  "hardware": {
+    "has_nfc_reader": true,
+    "has_leds": true,
+    "has_buzzer": true,
+    "buzzer_pin": 4
+  },
+  "behavior": {
+    "restraining_bolt": { "enabled": false, "grace_ms": 3000 },
+    "startup_tune": true,
+    "startup_head_shakes": 3,
+    "idle_animation": "astromech_idle",
+    "minigame_default": "purge",
+    "purge_targets": 10,
+    "purge_time_s": 40,
+    "proximity_enabled": true,
+    "proximity_rssi_start": -60,
+    "proximity_rssi_drop": -72,
+    "proximity_grace_ms": 2000,
+    "mood_enabled": true,
+    "mood_decay_s": 90,
+    "mood_colors": { "hostile": "FF2000", "neutral": "FF8800", "friendly": "FFC400" },
+    "eye_pixel": 0,
+    "servo": {
+      "enabled": true,
+      "pin": 38,
+      "min_us": 600,
+      "max_us": 2400,
+      "min_deg": 20,
+      "max_deg": 160,
+      "idle_s": 5
+    },
+    "dialogue_greeting": "dialogue/greeting.json"
+  }
+}
+)json";
+
+static const char T_GREETING[] = R"json({
+  "type": "dialogue",
+  "speaker": {"name": "C1-1U17K", "faction": "rebel"},
+  "lines": [
+    {"text": "WAAAAH-bwop-bwop! (Translation: WHAT. I'm busy.)", "style": "droid"},
+    {"text": "A dented C1-series astromech, paint scorched orange. Its head keeps swiveling like it expects trouble from every direction at once.", "style": "narration"},
+    {"text": "Dock gossip, fuel levels, who parked at berth 7 -- this unit has seen everything and respects none of it.", "style": "info"}
+  ],
+  "choices": [
+    {"label": "[Disconnect]", "next_action": null}
+  ]
+}
+)json";
+
+// RGB strip pattern — C1 orange/yellow, eye = pixel 0 (mood overrides it)
+static const char T_LIGHTS[] = R"txt(# DROID_C11U17K - C1 astromech dome/body lights
+chip=ws2812
+order=GRB
+pin=21
+# RRGGBB,on_ms,off_ms  (on 0 = solid, on -1 = flicker)
+FF8800,-1,0
+FFC400,500,350
+FF4400,0,0
+FFC400,800,600
+FF8800,300,700
+FFFFFF,0,0
+)txt";
+
+#else   // DROID_R5D8 (default droid build)
 
 static const char T_CONFIG[] = R"json({
   "$schema": "sfge-config-v1",
@@ -722,7 +1034,7 @@ static const char T_CONFIG[] = R"json({
     "location_hint": "Storage facility (the generic building)"
   },
   "hardware": {
-    "has_nfc_reader": false,
+    "has_nfc_reader": true,
     "has_leds": true,
     "has_buzzer": true,
     "buzzer_pin": 4
@@ -784,6 +1096,8 @@ FF2000,300,900
 0055FF,0,0
 )txt";
 
+#endif  // SFGE_DROID2
+
 static const TestFile FILES[] = {
     { "/SFGE/config.json",            T_CONFIG,   true },
     { "/SFGE/dialogue/greeting.json", T_GREETING, true },
@@ -813,8 +1127,17 @@ static const char T_CONFIG[] = R"json({
     "has_eyes": true
   },
   "behavior": {
-    "proximity_enabled": false,
-    "volume": 18
+    "proximity_enabled": true,
+    "proximity_rssi_start": -62,
+    "proximity_rssi_drop": -72,
+    "proximity_grace_ms": 1500,
+    "volume": 18,
+    "audio_node": "AUDIO_01",
+    "speech_tracks": {
+      "boot": 1, "greet": 2, "turnin": 3, "denied": 4,
+      "bounty_shilak": 5, "idle_01": 6, "idle_02": 7,
+      "bounty_shilak_posted": 8
+    }
   }
 }
 )json";
@@ -885,9 +1208,19 @@ inline void writeTestConfigs(fs::FS &fs) {
     }
 }
 
+// Direct access to this device's embedded files — lets a prop with a dead
+// or missing SD slot FORCE the demo config from flash (testing only; the
+// go-live build below removes this, restoring the strict cards-only rule).
+inline const char* embeddedFile(const char *path) {
+    for (const TestFile &tf : FILES)
+        if (strcmp(tf.path, path) == 0) return tf.content;
+    return nullptr;
+}
+
 #else   // SFGE_WRITE_TEST_CONFIGS not defined — go-live: no-op
 
 inline void writeTestConfigs(fs::FS &) {}
+inline const char* embeddedFile(const char *) { return nullptr; }
 
 #endif  // SFGE_WRITE_TEST_CONFIGS
 

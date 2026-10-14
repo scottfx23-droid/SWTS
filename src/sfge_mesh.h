@@ -61,6 +61,9 @@ enum MeshMsgType : uint8_t {
                              // and reboot to registration; props reset + reboot
     MSG_EVENT_ACK   = 0x24,  // receipt confirmation for a coded MSG_EVENT
     MSG_AWARD       = 0x25,  // actor/GM gives a player credits and/or an item
+    MSG_SCENARIO    = 0x26,  // GM broadcasts the active scenario id; devices
+                             // with that content folder reboot into it, the
+                             // rest keep defaults (generic side-game props)
 };
 
 // Device roles
@@ -103,6 +106,9 @@ struct __attribute__((packed)) MeshStatus {
     int8_t   mood;          // droid mood -5..+5
     uint8_t  alarm;         // 1 = prop is in ALARM state
     char     session[16];   // terminal: callsign of the open session
+    uint8_t  sab;           // 1 = prop is SABOTAGED (offline until repaired)
+    char     activity[20];  // datapad: what the player is doing right now
+                            // (GM ghost view: "SLICE", "KEYPAD", "HOME", ...)
 };
 
 struct __attribute__((packed)) MeshTimer {
@@ -508,7 +514,8 @@ inline bool sendPing(uint32_t uptime) {
 }
 
 inline bool sendStatus(uint32_t uptime, int score, int activeMsn, int completeMsn, int scans, int slicesWon,
-                       const char *faction = "", bool kid = false, int xp = 0) {
+                       const char *faction = "", bool kid = false, int xp = 0,
+                       const char *activity = "") {
     MeshStatus s = {};
     s.uptime_sec = uptime;
     s.score = score;
@@ -519,6 +526,7 @@ inline bool sendStatus(uint32_t uptime, int score, int activeMsn, int completeMs
     if (faction) strlcpy(s.faction, faction, sizeof(s.faction));
     s.kid = kid ? 1 : 0;
     s.xp = (uint16_t)(xp < 0 ? 0 : xp);
+    if (activity) strlcpy(s.activity, activity, sizeof(s.activity));
     return meshSend(MSG_STATUS, &s, sizeof(s));
 }
 
@@ -691,13 +699,26 @@ inline bool gmAssignCallsign(const char *target, const char *newCallsign) {
 
 // Prop status report (panel/terminal/droid): mood, alarm, open session.
 // Reuses MeshStatus with the player fields zeroed.
-inline bool sendPropStatus(uint32_t uptime, int mood, bool alarm, const char *session) {
+inline bool sendPropStatus(uint32_t uptime, int mood, bool alarm, const char *session,
+                           bool sabotaged = false) {
     MeshStatus s = {};
     s.uptime_sec = uptime;
     s.mood = (int8_t)mood;
     s.alarm = alarm ? 1 : 0;
     if (session) strlcpy(s.session, session, sizeof(s.session));
+    s.sab = sabotaged ? 1 : 0;
     return meshSend(MSG_STATUS, &s, sizeof(s));
+}
+
+// ── Scenario selection ──
+struct __attribute__((packed)) MeshScenario {
+    char id[24];   // folder name under /SFGE/scenarios/ ("" = defaults)
+};
+
+inline bool gmSetScenario(const char *id) {
+    MeshScenario s = {};
+    if (id) strlcpy(s.id, id, sizeof(s.id));
+    return meshSend(MSG_SCENARIO, &s, sizeof(s));
 }
 
 // GM countdown broadcast (send every ~5s while running; active=0 to cancel)

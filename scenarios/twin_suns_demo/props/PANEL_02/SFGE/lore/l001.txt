@@ -1,0 +1,21 @@
+TITLE: Docking Bay Power Allocation
+CLASS: IMPERIAL MAINTENANCE // NODE 77-B
+DATE: 3 ABY
+---
+Sliced from the junction's duty log:
+
+CYCLE 112: Clamp power rerouted twice this
+week on verbal orders only. No requisition
+forms filed. Someone is keeping a berth
+energized off the books.
+
+CYCLE 115: Floodlight ring 3 disabled for
+"maintenance" during the night shift. The
+bay cameras lost coverage of berth 7 for
+two full hours.
+
+CYCLE 118: Note from the duty tech: if the
+grid drops again, the backup spin-up code
+is 2187. Do not share with contractors.
+---
+END OF LOG

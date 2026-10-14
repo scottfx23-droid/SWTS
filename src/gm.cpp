@@ -27,6 +27,7 @@
 #include <ArduinoJson.h>
 #include "sfge_mesh.h"
 #include "sfge_ota.h"            // firmware-from-SD updates
+#include "sfge_scenario.h"       // scenario folders + boot picker
 #include "sfge_test_configs.h"   // boot-time test provisioning (see header to disable)
 
 #define S Serial
@@ -172,14 +173,19 @@ struct TrackedDevice {
     // Prop extensions
     int  mood;          // droid mood -5..+5
     bool alarm;         // prop alarm state
+    bool sab;           // prop sabotaged (offline until repaired)
     char sessionCs[16]; // terminal: open session's callsign
     uint32_t uptimeS;   // device uptime (drives the battery estimate)
     bool lowPowerFlagged;
+    char activity[20];  // datapad ghost view: what the player is doing now
 };
 
 #define MAX_DEVICES 32
 TrackedDevice trackedDevs[MAX_DEVICES];
 int deviceCount = 0;
+
+TrackedDevice* findDeviceById(const char *id);   // defined with the player modal
+void sendDebriefTo(TrackedDevice *d);            // defined with the GM menu
 
 // ═══════════════════════════════════════════════
 //  PER-PLAYER INTERACTION LOG (gameplay analytics)
@@ -330,7 +336,9 @@ unsigned long timerLastBcast = 0;
 lv_obj_t *timerBtnLbl[MAX_TIMERS] = {};
 
 bool loadGmConfig() {
-    File f = SD_MMC.open("/SFGE/gm_config.json", FILE_READ);
+    // Scenario folder first, default gm_config as the fallback
+    File f = SD_MMC.open(sfge_scn::path("gm_config.json"), FILE_READ);
+    if (!f) f = SD_MMC.open("/SFGE/gm_config.json", FILE_READ);
     if (!f) {
         S.println("[GM] gm_config.json not found on SD");
         return false;
@@ -743,6 +751,14 @@ void onMeshMsg(const sfge::MeshHeader *hdr, const uint8_t *payload, int len) {
             snprintf(log, sizeof(log), "ALARM on %s", hdr->from_id);
             logActivity(log, 4);
         }
+        bool wasSab = d->sab;
+        d->sab = (s->sab != 0);
+        if (d->sab != wasSab) {
+            snprintf(log, sizeof(log), "%s %s", hdr->from_id,
+                     d->sab ? "SABOTAGED — needs repair" : "repaired, back online");
+            logActivity(log, d->sab ? 4 : 1);
+        }
+        strlcpy(d->activity, s->activity, sizeof(d->activity));   // ghost view
         gmDirty = true;
     }
     else if (hdr->type == sfge::MSG_SCORE && len >= (int)sizeof(sfge::MeshScore)) {
@@ -818,6 +834,11 @@ void onMeshMsg(const sfge::MeshHeader *hdr, const uint8_t *payload, int len) {
                           e->payload, hdr->from_id);
         snprintf(log, sizeof(log), "%s: %s", hdr->from_id, e->event_id);
         logActivity(log, 0);
+        // A finished player gets their personal session debrief right away
+        if (strcmp(e->event_id, "game_complete") == 0 && e->payload[0]) {
+            TrackedDevice *fin = findDeviceById(e->payload);
+            if (fin) sendDebriefTo(fin);
+        }
         for (int i = 0; i < deviceCount; i++) {
             if (trackedDevs[i].role != sfge::ROLE_DATAPAD) continue;
             if (strcmp(trackedDevs[i].id, e->payload) != 0) continue;
@@ -2479,11 +2500,13 @@ void refreshPlayerDetail() {
     if (d->lastHeard) fmtAgo(d->lastHeard, ago, sizeof(ago));
     else strlcpy(ago, "never", sizeof(ago));
 
-    char line1[128], line2[128];
-    snprintf(line1, sizeof(line1), "%s   /   %s   /   %s   /   last seen %s ago",
+    char line1[160], line2[128];
+    snprintf(line1, sizeof(line1), "%s   /   %s   /   %s   /   last seen %s ago%s%s",
              d->faction[0] ? d->faction : "NO FACTION",
              d->kid ? "KID" : "ADULT",
-             online ? "ONLINE" : "OFFLINE", ago);
+             online ? "ONLINE" : "OFFLINE", ago,
+             (online && d->activity[0]) ? "   /   NOW: " : "",
+             online ? d->activity : "");
     lv_obj_t *l1 = lv_label_create(playerModalStats);
     lv_label_set_text(l1, line1);
     lv_obj_set_style_text_color(l1, online ? C_GRN : C_RED, 0);
@@ -2776,14 +2799,15 @@ void refreshLiveLists() {
         lv_obj_set_style_text_font(n, &lv_font_montserrat_18, 0);
         lv_obj_set_pos(n, 10, 4);
 
-        // Status line: ALARM beats online/offline; sessions and mood shown too
+        // Status line: ALARM/SABOTAGE beat online/offline; sessions and mood too
         char stx[40];
         if (d.alarm)                 strlcpy(stx, "!! ALARM !!", sizeof(stx));
+        else if (d.sab)              strlcpy(stx, "!! SABOTAGED !!", sizeof(stx));
         else if (d.sessionCs[0])     snprintf(stx, sizeof(stx), "IN USE: %s", d.sessionCs);
         else                         strlcpy(stx, stale ? "OFFLINE" : "ONLINE", sizeof(stx));
         lv_obj_t *st = lv_label_create(card);
         lv_label_set_text(st, stx);
-        lv_obj_set_style_text_color(st, d.alarm ? C_RED : stale ? C_RED : C_GRN, 0);
+        lv_obj_set_style_text_color(st, (d.alarm || d.sab) ? C_RED : stale ? C_RED : C_GRN, 0);
         lv_obj_set_style_text_font(st, &lv_font_montserrat_14, 0);
         lv_obj_set_pos(st, 10, 28);
 
@@ -2816,6 +2840,30 @@ void refreshLiveLists() {
             lv_obj_set_style_text_color(cl, C_WHITE, 0);
             lv_obj_set_style_text_font(cl, &lv_font_montserrat_14, 0);
             lv_obj_center(cl);
+        } else if (!stale) {
+            // Sabotage control: take the prop offline (players must run the
+            // Hot Wire repair) or restore it instantly
+            lv_obj_t *sb2 = lv_btn_create(card);
+            lv_obj_set_size(sb2, 150, 34);
+            lv_obj_align(sb2, LV_ALIGN_BOTTOM_MID, 0, -6);
+            lv_obj_set_style_bg_color(sb2, d.sab ? C_GRN : C_PNL2, 0);
+            lv_obj_set_style_border_color(sb2, d.sab ? C_GRN : C_RED, 0);
+            lv_obj_set_style_border_width(sb2, 1, 0);
+            lv_obj_add_event_cb(sb2, [](lv_event_t *e) {
+                TrackedDevice *td = (TrackedDevice *)lv_event_get_user_data(e);
+                if (!td) return;
+                bool makeSab = !td->sab;
+                sfge::gmOverride(td->id, makeSab ? "sabotage" : "repair", "");
+                td->sab = makeSab;   // optimistic; next status confirms
+                char log[64];
+                snprintf(log, sizeof(log), "GM %s %s", makeSab ? "sabotaged" : "repaired", td->id);
+                logActivity(log, makeSab ? 4 : 5);
+            }, LV_EVENT_CLICKED, &trackedDevs[pidx[i]]);
+            lv_obj_t *sl = lv_label_create(sb2);
+            lv_label_set_text(sl, d.sab ? "RESTORE" : "SABOTAGE");
+            lv_obj_set_style_text_color(sl, d.sab ? C_BG : C_RED, 0);
+            lv_obj_set_style_text_font(sl, &lv_font_montserrat_14, 0);
+            lv_obj_center(sl);
         }
     }
 
@@ -2949,6 +2997,51 @@ static void ev_menu_resync(lv_event_t *e) {
     closeGmMenus();
 }
 
+// ── Session debriefs: each player gets a personal report comm with their
+//    rank and stats. Sent per-player on game_complete, or to everyone from
+//    the GM MENU (do this BEFORE a NEW GAME wipe). ──
+int playerRank(TrackedDevice *who) {
+    int rank = 1;
+    for (int i = 0; i < deviceCount; i++) {
+        TrackedDevice &d = trackedDevs[i];
+        if (d.role != sfge::ROLE_DATAPAD || d.lastHeard == 0 || &d == who) continue;
+        if (d.score > who->score) rank++;
+    }
+    return rank;
+}
+
+void sendDebriefTo(TrackedDevice *d) {
+    if (!d || d->role != sfge::ROLE_DATAPAD) return;
+    int totalPlayers = 0;
+    for (int i = 0; i < deviceCount; i++)
+        if (trackedDevs[i].role == sfge::ROLE_DATAPAD && trackedDevs[i].lastHeard != 0)
+            totalPlayers++;
+    char body[120];
+    snprintf(body, sizeof(body),
+             "Operative %s: RANK %d of %d. Score %d, XP %d, %d scans, "
+             "%d systems sliced, %d missions complete. Well fought.",
+             d->id, playerRank(d), totalPlayers, d->score, d->xp,
+             d->scans, d->slicesWon, d->missionsDone);
+    char commId[28];
+    snprintf(commId, sizeof(commId), "debrief_%s", d->id);
+    sfge::gmPushComm(commId, d->id, "COMMAND", "SESSION DEBRIEF", body);
+}
+
+static void ev_menu_debriefs(lv_event_t *e) {
+    int sent = 0;
+    for (int i = 0; i < deviceCount; i++) {
+        TrackedDevice &d = trackedDevs[i];
+        if (d.role != sfge::ROLE_DATAPAD || d.lastHeard == 0) continue;
+        sendDebriefTo(&d);
+        sent++;
+        delay(60);
+    }
+    char log[64];
+    snprintf(log, sizeof(log), "Session debriefs sent to %d players", sent);
+    logActivity(log, 5);
+    closeGmMenus();
+}
+
 // ── RE-FIRE EVENT picker — manually unstick a player whose datapad missed
 //    an event even after the automatic ack/retry window ──
 static void ev_refire_pick(lv_event_t *e) {
@@ -3037,7 +3130,7 @@ static void ev_menu_refire(lv_event_t *e) {
 static void ev_gm_menu_open(lv_event_t *e) {
     if (gmMenuModal) return;
     gmMenuModal = lv_obj_create(lv_layer_top());
-    lv_obj_set_size(gmMenuModal, 360, 310);
+    lv_obj_set_size(gmMenuModal, 360, 370);
     lv_obj_center(gmMenuModal);
     lv_obj_set_style_bg_color(gmMenuModal, C_PNL, 0);
     lv_obj_set_style_border_color(gmMenuModal, C_AMB, 0);
@@ -3052,12 +3145,13 @@ static void ev_gm_menu_open(lv_event_t *e) {
 
     struct MenuDef { const char *label; lv_event_cb_t cb; lv_color_t col; };
     MenuDef items[] = {
-        { "NEW GAME (wipe session)", ev_menu_newgame, C_RED },
-        { "RE-FIRE EVENT",           ev_menu_refire,  C_AMB },
-        { "RESYNC DEVICES",          ev_menu_resync,  C_CYN },
+        { "NEW GAME (wipe session)", ev_menu_newgame,  C_RED },
+        { "RE-FIRE EVENT",           ev_menu_refire,   C_AMB },
+        { "SEND DEBRIEFS",           ev_menu_debriefs, C_GRN },
+        { "RESYNC DEVICES",          ev_menu_resync,   C_CYN },
         { "CLOSE",                   ev_gm_menu_close, C_DIM },
     };
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 5; i++) {
         lv_obj_t *btn = lv_btn_create(gmMenuModal);
         lv_obj_set_size(btn, 320, 50);
         lv_obj_align(btn, LV_ALIGN_TOP_MID, 0, 38 + i * 60);
@@ -3171,6 +3265,97 @@ void initIoExpander() {
     delay(100);  // let LCD/touch come out of reset
 }
 
+// ═══════════════════════════════════════════════
+//  SCENARIO PICKER — one card, many games
+//  Shown at boot when /SFGE/scenarios/ holds content folders. The choice
+//  is broadcast to every device; devices lacking that folder keep their
+//  default content as generic side-game props.
+// ═══════════════════════════════════════════════
+#define MAX_SCN 6
+char scnList[MAX_SCN][24];
+int  scnListCount = 0;
+volatile int scnPicked = -2;   // -2 waiting, -1 default, >=0 index into scnList
+
+void scanScenarios() {
+    scnListCount = 0;
+    File dir = SD_MMC.open("/SFGE/scenarios");
+    if (!dir || !dir.isDirectory()) { if (dir) dir.close(); return; }
+    File f;
+    while ((f = dir.openNextFile()) && scnListCount < MAX_SCN) {
+        if (f.isDirectory()) {
+            const char *nm = strrchr(f.name(), '/');
+            strlcpy(scnList[scnListCount], nm ? nm + 1 : f.name(), sizeof(scnList[0]));
+            if (scnList[scnListCount][0]) scnListCount++;
+        }
+        f.close();
+    }
+    dir.close();
+    S.printf("[SCN] %d scenario folder(s) on the GM card\n", scnListCount);
+}
+
+static void ev_scn_pick(lv_event_t *e) {
+    scnPicked = (int)(intptr_t)lv_event_get_user_data(e);
+}
+
+// Blocking boot modal (before buildUI). Returns once the GM has chosen.
+void runScenarioPicker() {
+    if (!sdOk || scnListCount == 0) return;
+
+    lv_obj_t *modal = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(modal, 560, 150 + (scnListCount + 1) * 62);
+    lv_obj_center(modal);
+    lv_obj_set_style_bg_color(modal, C_PNL, 0);
+    lv_obj_set_style_border_color(modal, C_AMB, 0);
+    lv_obj_set_style_border_width(modal, 2, 0);
+    lv_obj_clear_flag(modal, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *t = lv_label_create(modal);
+    lv_label_set_text(t, "SELECT SCENARIO");
+    lv_obj_set_style_text_color(t, C_AMB_BRT, 0);
+    lv_obj_set_style_text_font(t, &lv_font_montserrat_24, 0);
+    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 6);
+
+    lv_obj_t *sub = lv_label_create(modal);
+    lv_label_set_text(sub, "Devices with this content load it; the rest run\n"
+                           "their default content as side-game props.");
+    lv_obj_set_style_text_color(sub, C_DIM, 0);
+    lv_obj_set_style_text_font(sub, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_align(sub, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(sub, LV_ALIGN_TOP_MID, 0, 42);
+
+    for (int i = -1; i < scnListCount; i++) {
+        bool current = (i < 0) ? (sfge_scn::activeId[0] == 0)
+                               : (strcmp(sfge_scn::activeId, scnList[i]) == 0);
+        lv_obj_t *btn = lv_btn_create(modal);
+        lv_obj_set_size(btn, 500, 52);
+        lv_obj_align(btn, LV_ALIGN_TOP_MID, 0, 96 + (i + 1) * 62);
+        lv_obj_set_style_bg_color(btn, C_PNL2, 0);
+        lv_obj_set_style_border_color(btn, current ? C_AMB_BRT : C_AMB_DIM, 0);
+        lv_obj_set_style_border_width(btn, current ? 3 : 1, 0);
+        lv_obj_add_event_cb(btn, ev_scn_pick, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+        lv_obj_t *bl = lv_label_create(btn);
+        char lb[48];
+        snprintf(lb, sizeof(lb), "%s%s", i < 0 ? "DEFAULT (card contents)" : scnList[i],
+                 current ? "   <- current" : "");
+        lv_label_set_text(bl, lb);
+        lv_obj_set_style_text_color(bl, C_AMB, 0);
+        lv_obj_set_style_text_font(bl, &lv_font_montserrat_16, 0);
+        lv_obj_center(bl);
+    }
+
+    scnPicked = -2;
+    while (scnPicked == -2) { lv_timer_handler(); delay(5); }
+
+    const char *chosen = scnPicked < 0 ? "" : scnList[scnPicked];
+    if (strcmp(chosen, sfge_scn::activeId) != 0) {
+        sfge_scn::applyScenario(SD_MMC, chosen);
+        sfge_scn::begin(SD_MMC);   // recompute content root, no reboot needed
+    }
+    lv_obj_del(modal);
+    S.printf("[SCN] GM running scenario '%s'\n",
+             sfge_scn::activeId[0] ? sfge_scn::activeId : "(default)");
+}
+
 void setup() {
     S.begin(115200);
     delay(2000);
@@ -3195,8 +3380,9 @@ void setup() {
         // TESTING: write embedded gameplay configs to the card (no-op when
         // SFGE_WRITE_TEST_CONFIGS is commented out in sfge_test_configs.h)
         sfge_test::writeTestConfigs(SD_MMC);
-        loadGmConfig();
-        loadGmState();   // restore bounty/device state from previous session
+        sfge_scn::begin(SD_MMC);   // last-chosen scenario -> content root
+        scanScenarios();           // folders for the boot picker
+        // gm_config/state load AFTER the scenario picker (below, post-LVGL)
     } else {
         S.println("[SD] Mount failed — check card / format (FAT32)");
     }
@@ -3221,6 +3407,14 @@ void setup() {
     id.read_cb = lvgl_touch;
     lv_indev_drv_register(&id);
 
+    // Scenario pick (blocking modal, only when the card holds scenarios),
+    // THEN the config load — tabs/timers/events come from the chosen one
+    runScenarioPicker();
+    if (sdOk) {
+        loadGmConfig();
+        loadGmState();   // restore bounty/device state from previous session
+    }
+
     buildUI();
 
     // Mesh
@@ -3233,7 +3427,8 @@ void setup() {
     delay(300);                  // give the mesh a moment to settle
     sfge::gmSyncRequest();
     sfge::gmSendFactions(gmConfig.factions, gmConfig.factionCount);
-    S.println("[GM] Sync request + faction roster broadcast");
+    for (int i = 0; i < 3; i++) { sfge::gmSetScenario(sfge_scn::activeId); delay(80); }
+    S.println("[GM] Sync request + faction roster + scenario broadcast");
 
     S.println("[GM] Ready");
 }
@@ -3253,11 +3448,25 @@ void loop() {
         if (playerModal) refreshPlayerDetail();
     }
 
-    // Faction roster broadcast — datapads use it for the allegiance screen
+    // Faction roster + active scenario broadcast — late joiners converge
     static unsigned long lastFacBcast = 0;
     if (millis() - lastFacBcast > 10000) {
         lastFacBcast = millis();
         sfge::gmSendFactions(gmConfig.factions, gmConfig.factionCount);
+        sfge::gmSetScenario(sfge_scn::activeId);
+    }
+
+    // Open bounties re-broadcast — heals a rebooted Guild Master (its
+    // ledger is RAM-only) and late-joining datapads. Receivers dedupe by
+    // bounty id, so repeats are silent everywhere.
+    static unsigned long lastBountyBcast = 0;
+    if (millis() - lastBountyBcast > 15000) {
+        lastBountyBcast = millis();
+        for (int i = 0; i < bountyCount; i++) {
+            BountyTemplate &t = bountyTemplates[i];
+            if (t.posted && !t.closed)
+                sfge::gmPushBounty(t.id, "", t.target_name, t.description, t.reward);
+        }
     }
 
     // Countdown: rebroadcast + expiry, and keep the button labels ticking

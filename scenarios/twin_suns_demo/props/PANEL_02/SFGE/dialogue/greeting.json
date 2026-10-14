@@ -1,0 +1,12 @@
+{
+  "type": "dialogue",
+  "speaker": {"name": "Docking Bay Power Junction", "faction": "imperial"},
+  "lines": [
+    {"text": "IMPERIAL GRID NODE 77-B // AUTHORIZED PERSONNEL ONLY", "style": "system"},
+    {"text": "Heavy conduits hum behind the service wall. A maintenance readout cycles through power figures for the docking bay clamps and floodlights.", "style": "narration"},
+    {"text": "Carrier channels drift across the monitor band -- the grid is poorly tuned.", "style": "info"}
+  ],
+  "choices": [
+    {"label": "[Disconnect]", "next_action": null}
+  ]
+}
