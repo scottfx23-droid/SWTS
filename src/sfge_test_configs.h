@@ -962,7 +962,7 @@ static const char T_CONFIG[] = R"json({
     "buzzer_pin": 4
   },
   "behavior": {
-    "restraining_bolt": { "enabled": false, "grace_ms": 3000 },
+    "restraining_bolt": { "enabled": true, "grace_ms": 3000 },
     "startup_tune": true,
     "startup_head_shakes": 3,
     "idle_animation": "astromech_idle",
@@ -979,7 +979,7 @@ static const char T_CONFIG[] = R"json({
     "eye_pixel": 0,
     "servo": {
       "enabled": true,
-      "pin": 38,
+      "pin": 5,
       "min_us": 600,
       "max_us": 2400,
       "min_deg": 20,

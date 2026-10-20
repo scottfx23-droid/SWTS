@@ -24,6 +24,7 @@
 #include <ArduinoJson.h>
 #include <ESPAsyncWebServer.h>
 #include <Adafruit_PN532.h>
+#include <ESP32Servo.h>
 #include "sfge_mesh.h"
 #include "sfge_lights.h"         // addressable RGB strip (/SFGE/lights.txt)
 #include "sfge_proximity.h"      // RSSI gate for interactions
@@ -140,10 +141,11 @@ void setSabotaged(bool on, const char *byCallsign) {
 }
 
 // ═══════════════════════════════════════
-//  HEAD SERVO — LEDC PWM, 50 Hz. Idle wander plus reaction moves:
-//  a look-at-you on greet, a happy wiggle on wins, a slow shake on fails.
+//  HEAD SERVO — ESP32Servo library (proven on this hardware; the raw LEDC
+//  approach never moved a horn). Idle wander plus reaction moves: a
+//  look-at-you on greet, a happy wiggle on wins, a slow shake on fails.
 // ═══════════════════════════════════════
-#define SERVO_LEDC_CH 2
+Servo headServo;
 float headDeg = 90, headTarget = 90;
 unsigned long nextHeadMove = 0;
 int   headWiggles = 0;         // remaining wiggle half-cycles
@@ -153,18 +155,18 @@ bool  headShake = false;       // wiggle style: fast happy vs slow shake
 void servoWriteDeg(float deg) {
     if (deg < cfg.servo_min_deg) deg = cfg.servo_min_deg;
     if (deg > cfg.servo_max_deg) deg = cfg.servo_max_deg;
-    uint32_t us = cfg.servo_min_us +
-                  (uint32_t)((deg / 180.0f) * (cfg.servo_max_us - cfg.servo_min_us));
-    ledcWrite(SERVO_LEDC_CH, (uint32_t)((uint64_t)us * 65536 / 20000));   // 20 ms frame
+    headServo.write((int)deg);
 }
 
 void servoInit() {
     if (!cfg.servo_enabled) return;
-    ledcSetup(SERVO_LEDC_CH, 50, 16);
-    ledcAttachPin(cfg.servo_pin, SERVO_LEDC_CH);
+    ESP32PWM::allocateTimer(2);
+    ESP32PWM::allocateTimer(3);
+    headServo.setPeriodHertz(50);
+    headServo.attach(cfg.servo_pin, cfg.servo_min_us, cfg.servo_max_us);
     headDeg = headTarget = 90;
     servoWriteDeg(headDeg);
-    S.printf("[SERVO] head on GPIO %d (%d-%d deg)\n",
+    S.printf("[SERVO] head on GPIO %d (%d-%d deg, ESP32Servo)\n",
              cfg.servo_pin, cfg.servo_min_deg, cfg.servo_max_deg);
 }
 

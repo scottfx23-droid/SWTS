@@ -15,6 +15,7 @@
 
 #include <Arduino.h>
 #define LGFX_USE_V1
+#include <Adafruit_PN532.h>
 #include <LovyanGFX.hpp>
 #include <lgfx/v1/platforms/esp32s3/Bus_RGB.hpp>
 #include <lgfx/v1/platforms/esp32s3/Panel_RGB.hpp>
@@ -2882,6 +2883,194 @@ void refreshLiveLists() {
 }
 
 // ═══════════════════════════════════════════════
+//  NFC TOOL — PN532 in HSU (UART) mode on the UART header (TXD=43, RXD=44)
+//  The I2C header is NOT usable for it: this board's CH422G expander decodes
+//  the whole 0x20-0x27 / 0x30-0x3F address ranges, squatting the PN532's
+//  fixed I2C address 0x24 (an I2C scan "sees" 25 devices). So the reader
+//  runs HSU on UART0's pins, which are free since Serial lives on USB-CDC.
+//  Module switches: HSU mode; module SDA/TXD -> header RXD, SCL/RXD -> TXD.
+//  READ (default): present any tag -> shows its UID + NDEF text, so the
+//  GM can identify mystery tags. WRITE: type text on screen, hold a tag
+//  to the reader, and it becomes that token (CHAIN:..., PLAYER:..., etc.)
+//  — the GM doubles as the fleet's tag-provisioning station.
+// ═══════════════════════════════════════════════
+Adafruit_PN532 gmNfc(-1, &Serial0);
+bool gmNfcOk = false;
+char gmNfcDiag[240] = "";   // human-readable probe result for the modal
+
+lv_obj_t *nfcToolModal = nullptr;
+lv_obj_t *nfcTitleLbl = nullptr;
+lv_obj_t *nfcReadPanel = nullptr, *nfcWritePanel = nullptr;
+lv_obj_t *nfcStatusLbl = nullptr, *nfcUidLbl = nullptr, *nfcTextLbl = nullptr;
+lv_obj_t *nfcWriteTa = nullptr, *nfcWriteStatus = nullptr;
+bool nfcWriteMode = false;
+bool nfcWriteArmed = false;   // WRITE TAG pressed, waiting for a tag
+bool nfcDetectArmed = false;  // InListPassiveTarget pending on the PN532
+
+void gmNfcProbe() {
+    gmNfcOk = false;
+
+    // UART0 pins (TX=43/RX=44) feed the board's UART header; Serial itself
+    // is on USB-CDC, so the port is ours. The lib's begin() re-begins the
+    // port at 115200 on these same default pins and sends the HSU wakeup.
+    Serial0.end();
+    Serial0.begin(115200, SERIAL_8N1, 44, 43);
+    Serial0.setTimeout(150);   // bound the lib's readBytes() stalls
+    nfcDetectArmed = false;    // any pending detection died with the port
+    delay(100);                // PN532 wake time after power-on
+
+    // Abort whatever command a previous run left pending (an ACK frame from
+    // the host cancels it), then drop any bytes it managed to send.
+    static const uint8_t hostAck[] = {0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00};
+    Serial0.write(hostAck, sizeof(hostAck));
+    delay(20);
+    while (Serial0.available()) Serial0.read();
+
+    gmNfc.begin();
+    for (int tries = 0; tries < 3 && !gmNfcOk; tries++) {
+        uint32_t fw = gmNfc.getFirmwareVersion();
+        if (fw) {
+            gmNfcOk = true;
+            gmNfc.SAMConfig();
+            Serial.printf("[NFC] PN532 on the UART header, HSU mode (fw=0x%08X)\n",
+                          (unsigned)fw);
+        } else {
+            delay(150);
+        }
+    }
+    if (!gmNfcOk) {
+        strlcpy(gmNfcDiag,
+                "No PN532 on the UART header. (The I2C header can't host it —\n"
+                "the board's CH422G chip owns address 0x24.) Set it up as:\n"
+                "1. Module switches -> HSU mode (both OFF)\n"
+                "2. Module SDA/TXD -> header RXD,  SCL/RXD -> header TXD\n"
+                "3. 5V and GND, then press RETRY PROBE",
+                sizeof(gmNfcDiag));
+        Serial.printf("[NFC] probe failed: %s\n", gmNfcDiag);
+    }
+}
+
+// Arm the PN532's card detection by hand over HSU. The library's
+// startPassiveTargetIDDetection() blocks a full second waiting for the
+// RESPONSE (not just the ACK) and reports failure when no card shows up,
+// which tricks the caller into re-arming a command that is still pending —
+// after that the byte stream never recovers. Here: send the frame, confirm
+// only the 6-byte ACK, and leave the response to arrive whenever a tag does.
+bool gmNfcArmDetect() {
+    // InListPassiveTarget, 1 target, 106 kbps type A: D4 4A 01 00
+    static const uint8_t frame[] = {0x00, 0x00, 0xFF, 0x04, 0xFC,
+                                    0xD4, 0x4A, 0x01, 0x00, 0xE1, 0x00};
+    while (Serial0.available()) Serial0.read();
+    Serial0.write(frame, sizeof(frame));
+    uint8_t a[6] = {0};
+    bool ok = Serial0.readBytes(a, 6) == 6 &&
+              a[0] == 0x00 && a[1] == 0x00 && a[2] == 0xFF &&
+              a[3] == 0x00 && a[4] == 0xFF && a[5] == 0x00;
+    if (!ok) {
+        // Something was mid-flight — abort it (host ACK cancels a pending
+        // command) so the next arm starts from a clean stream.
+        static const uint8_t hostAck[] = {0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00};
+        Serial0.write(hostAck, sizeof(hostAck));
+        delay(20);
+        while (Serial0.available()) Serial0.read();
+    }
+    return ok;
+}
+
+// Read the first NDEF text record off an NTAG2xx (standard fleet walk).
+// gmNfcWalkDiag records what the walk saw, for the modal AND the serial log,
+// so a failed parse shows its raw evidence right on the GM screen.
+char gmNfcWalkDiag[120] = "";
+bool gmReadNdefText(char *out, size_t outSz) {
+    out[0] = 0;
+    uint8_t buf[192];
+    int pos = 0;
+    int failPage = -1;
+    for (int page = 4; page < 48 && pos < 180; page++) {
+        uint8_t data[4];
+        if (!gmNfc.ntag2xx_ReadPage(page, data)) { failPage = page; break; }
+        for (int i = 0; i < 4 && pos < 191; i++) buf[pos++] = data[i];
+    }
+    {
+        char hex[76] = "";
+        for (int i = 0; i < pos && i < 20; i++) {
+            char h[4];
+            snprintf(h, sizeof(h), "%02X ", buf[i]);
+            strlcat(hex, h, sizeof(hex));
+        }
+        if (failPage >= 0)
+            snprintf(gmNfcWalkDiag, sizeof(gmNfcWalkDiag),
+                     "page %d read FAILED after %d bytes\n%s",
+                     failPage, pos, hex);
+        else
+            snprintf(gmNfcWalkDiag, sizeof(gmNfcWalkDiag),
+                     "%d bytes, no text record found\n%s", pos, hex);
+        Serial.printf("[NFC] walk: %s\n", gmNfcWalkDiag);
+    }
+    int i = 0;
+    while (i < pos) {
+        uint8_t tlvType = buf[i];
+        if (tlvType == 0x00) { i++; continue; }
+        if (tlvType == 0xFE) break;
+        if (i + 1 >= pos) break;
+        uint8_t tlvLen = buf[i + 1];
+        int dataStart = i + 2;
+        if (tlvType == 0x03 && tlvLen > 0) {
+            int r = dataStart;
+            if (r + 3 >= pos) break;
+            uint8_t typeLen = buf[r + 1];
+            uint8_t payLen = buf[r + 2];
+            int typeOff = r + 3;
+            if (typeLen == 1 && typeOff < pos && buf[typeOff] == 0x54) {
+                int payOff = typeOff + typeLen;
+                if (payOff >= pos) break;
+                uint8_t langLen = buf[payOff] & 0x3F;
+                int textOff = payOff + 1 + langLen;
+                int textLen = payLen - 1 - langLen;
+                if (textOff + textLen <= pos && textLen > 0 &&
+                    textLen < (int)outSz - 1) {
+                    memcpy(out, &buf[textOff], textLen);
+                    out[textLen] = 0;
+                    return true;
+                }
+            }
+            break;
+        }
+        i = dataStart + tlvLen;
+    }
+    return false;
+}
+
+// Write `text` as the tag's ONE NDEF text record (same format the datapad
+// writes on operative cards). Up to 100 chars; fits an NTAG213 and up.
+bool gmWriteNdefText(const char *text) {
+    int tlen = strlen(text);
+    if (tlen < 1 || tlen > 100) return false;
+
+    uint8_t rec[112];
+    int r = 0;
+    rec[r++] = 0xD1;                  // MB|ME|SR, TNF=well-known
+    rec[r++] = 0x01;                  // type length
+    rec[r++] = (uint8_t)(tlen + 3);   // payload: status + "en" + text
+    rec[r++] = 0x54;                  // 'T'
+    rec[r++] = 0x02;                  // UTF-8, 2-char language code
+    rec[r++] = 'e'; rec[r++] = 'n';
+    memcpy(rec + r, text, tlen); r += tlen;
+
+    uint8_t buf[128];
+    int b = 0;
+    buf[b++] = 0x03;                  // NDEF TLV
+    buf[b++] = (uint8_t)r;
+    memcpy(buf + b, rec, r); b += r;
+    buf[b++] = 0xFE;                  // terminator
+    while (b % 4) buf[b++] = 0x00;
+
+    for (int page = 0; page < b / 4; page++)
+        if (!gmNfc.ntag2xx_WritePage(4 + page, buf + page * 4)) return false;
+    return true;
+}
+
+// ═══════════════════════════════════════════════
 //  GM MENU — session controls (NEW GAME needs two confirmations)
 // ═══════════════════════════════════════════════
 lv_obj_t *gmMenuModal = nullptr;
@@ -3127,10 +3316,291 @@ static void ev_menu_refire(lv_event_t *e) {
     lv_obj_center(ccl);
 }
 
+// ── NFC TOOL modal ──
+// Big green/red confirmation banner laid over the whole tool — the small
+// status line under the textarea is too easy to miss when writing a tag.
+lv_obj_t *nfcBanner = nullptr;
+unsigned long nfcBannerUntil = 0;
+static void nfcShowBanner(const char *msg, bool good) {
+    if (!nfcToolModal) return;
+    if (!nfcBanner) {
+        nfcBanner = lv_obj_create(nfcToolModal);
+        lv_obj_set_size(nfcBanner, 640, 150);
+        lv_obj_align(nfcBanner, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_set_style_border_width(nfcBanner, 3, 0);
+        lv_obj_clear_flag(nfcBanner, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_t *l = lv_label_create(nfcBanner);
+        lv_obj_set_style_text_font(l, &lv_font_montserrat_28, 0);
+        lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(l, 600);
+        lv_obj_center(l);
+    }
+    lv_obj_t *l = lv_obj_get_child(nfcBanner, 0);
+    lv_obj_set_style_bg_color(nfcBanner, good ? lv_color_hex(0x0A3A0A)
+                                              : lv_color_hex(0x3A0A0A), 0);
+    lv_obj_set_style_border_color(nfcBanner, good ? lv_color_hex(0x30D030)
+                                                  : lv_color_hex(0xE03030), 0);
+    lv_obj_set_style_text_color(l, good ? lv_color_hex(0x60FF60)
+                                        : lv_color_hex(0xFF6060), 0);
+    lv_label_set_text(l, msg);
+    lv_obj_clear_flag(nfcBanner, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(nfcBanner);
+    nfcBannerUntil = millis() + 3500;
+}
+
+static void closeNfcTool(lv_event_t *e) {
+    if (nfcToolModal) {
+        lv_obj_del(nfcToolModal);
+        nfcToolModal = nullptr;
+        nfcReadPanel = nfcWritePanel = nullptr;
+        nfcStatusLbl = nfcUidLbl = nfcTextLbl = nullptr;
+        nfcWriteTa = nfcWriteStatus = nullptr;
+        nfcBanner = nullptr;
+        nfcWriteArmed = false;
+    }
+}
+
+static void nfcShowMode() {
+    if (!nfcToolModal) return;
+    if (nfcWriteMode) {
+        lv_obj_add_flag(nfcReadPanel, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(nfcWritePanel, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_clear_flag(nfcReadPanel, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(nfcWritePanel, LV_OBJ_FLAG_HIDDEN);
+        nfcWriteArmed = false;
+    }
+}
+static void ev_nfc_mode_read(lv_event_t *e)  { nfcWriteMode = false; nfcShowMode(); }
+static void ev_nfc_mode_write(lv_event_t *e) { nfcWriteMode = true;  nfcShowMode(); }
+
+static void ev_nfc_write_arm(lv_event_t *e) {
+    const char *txt = lv_textarea_get_text(nfcWriteTa);
+    if (!txt || !txt[0]) {
+        lv_label_set_text(nfcWriteStatus, "TYPE THE TAG TEXT FIRST");
+        return;
+    }
+    nfcWriteArmed = true;
+    lv_label_set_text(nfcWriteStatus, "HOLD A TAG TO THE READER...");
+}
+
+static void ev_menu_nfctool(lv_event_t *e) {
+    closeGmMenus();
+    if (nfcToolModal) return;
+
+    nfcToolModal = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(nfcToolModal, 760, 440);
+    lv_obj_center(nfcToolModal);
+    lv_obj_set_style_bg_color(nfcToolModal, C_PNL, 0);
+    lv_obj_set_style_border_color(nfcToolModal, C_CYN, 0);
+    lv_obj_set_style_border_width(nfcToolModal, 2, 0);
+    lv_obj_clear_flag(nfcToolModal, LV_OBJ_FLAG_SCROLLABLE);
+
+    nfcTitleLbl = lv_label_create(nfcToolModal);
+    lv_label_set_text(nfcTitleLbl, gmNfcOk ? "NFC TOOL" : "NFC TOOL — READER NOT FOUND");
+    lv_obj_set_style_text_color(nfcTitleLbl, gmNfcOk ? C_CYN_BRT : C_RED, 0);
+    lv_obj_set_style_text_font(nfcTitleLbl, &lv_font_montserrat_20, 0);
+    lv_obj_align(nfcTitleLbl, LV_ALIGN_TOP_LEFT, 4, 0);
+
+    // READ / WRITE mode buttons + CLOSE (top-right)
+    struct { const char *lbl; lv_event_cb_t cb; int x; } tops[] = {
+        { "READ",  ev_nfc_mode_read,  -230 },
+        { "WRITE", ev_nfc_mode_write, -120 },
+        { "CLOSE", closeNfcTool,      -4   },
+    };
+    for (auto &tb : tops) {
+        lv_obj_t *btn = lv_btn_create(nfcToolModal);
+        lv_obj_set_size(btn, 100, 36);
+        lv_obj_align(btn, LV_ALIGN_TOP_RIGHT, tb.x, 0);
+        lv_obj_set_style_bg_color(btn, C_PNL2, 0);
+        lv_obj_set_style_border_color(btn, C_CYN, 0);
+        lv_obj_set_style_border_width(btn, 1, 0);
+        lv_obj_add_event_cb(btn, tb.cb, LV_EVENT_CLICKED, nullptr);
+        lv_obj_t *bl = lv_label_create(btn);
+        lv_label_set_text(bl, tb.lbl);
+        lv_obj_set_style_text_color(bl, C_CYN, 0);
+        lv_obj_set_style_text_font(bl, &lv_font_montserrat_14, 0);
+        lv_obj_center(bl);
+    }
+
+    // ── READ panel (default): present a tag, see what it is ──
+    nfcReadPanel = lv_obj_create(nfcToolModal);
+    lv_obj_set_size(nfcReadPanel, 720, 350);
+    lv_obj_align(nfcReadPanel, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_set_style_bg_color(nfcReadPanel, C_PNL2, 0);
+    lv_obj_set_style_border_color(nfcReadPanel, C_FRM, 0);
+    lv_obj_set_style_border_width(nfcReadPanel, 1, 0);
+    lv_obj_clear_flag(nfcReadPanel, LV_OBJ_FLAG_SCROLLABLE);
+
+    nfcStatusLbl = lv_label_create(nfcReadPanel);
+    lv_label_set_text(nfcStatusLbl, gmNfcOk ? "PRESENT A TAG TO THE READER" : gmNfcDiag);
+    lv_obj_set_style_text_color(nfcStatusLbl, gmNfcOk ? C_CYN : C_RED, 0);
+    lv_obj_set_style_text_font(nfcStatusLbl, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_align(nfcStatusLbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(nfcStatusLbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(nfcStatusLbl, 680);
+    lv_obj_align(nfcStatusLbl, LV_ALIGN_TOP_MID, 0, 8);
+
+    // RETRY PROBE — fix wiring/switches live, no reboot needed
+    if (!gmNfcOk) {
+        lv_obj_t *rb = lv_btn_create(nfcReadPanel);
+        lv_obj_set_size(rb, 220, 48);
+        lv_obj_align(rb, LV_ALIGN_CENTER, 0, 60);
+        lv_obj_set_style_bg_color(rb, C_CYN, 0);
+        lv_obj_add_event_cb(rb, [](lv_event_t *e) {
+            gmNfcProbe();
+            if (nfcTitleLbl) {
+                lv_label_set_text(nfcTitleLbl, gmNfcOk ? "NFC TOOL" : "NFC TOOL — READER NOT FOUND");
+                lv_obj_set_style_text_color(nfcTitleLbl, gmNfcOk ? C_CYN_BRT : C_RED, 0);
+            }
+            if (nfcStatusLbl) {
+                lv_label_set_text(nfcStatusLbl, gmNfcOk ? "PRESENT A TAG TO THE READER" : gmNfcDiag);
+                lv_obj_set_style_text_color(nfcStatusLbl, gmNfcOk ? C_CYN : C_RED, 0);
+            }
+            if (gmNfcOk) lv_obj_add_flag(lv_event_get_target(e), LV_OBJ_FLAG_HIDDEN);
+        }, LV_EVENT_CLICKED, nullptr);
+        lv_obj_t *rl = lv_label_create(rb);
+        lv_label_set_text(rl, "RETRY PROBE");
+        lv_obj_set_style_text_color(rl, lv_color_hex(0x000000), 0);
+        lv_obj_set_style_text_font(rl, &lv_font_montserrat_16, 0);
+        lv_obj_center(rl);
+    }
+
+    nfcUidLbl = lv_label_create(nfcReadPanel);
+    lv_label_set_text(nfcUidLbl, "");
+    lv_obj_set_style_text_color(nfcUidLbl, C_DIM, 0);
+    lv_obj_set_style_text_font(nfcUidLbl, &lv_font_montserrat_14, 0);
+    lv_obj_align(nfcUidLbl, LV_ALIGN_TOP_MID, 0, 48);
+
+    nfcTextLbl = lv_label_create(nfcReadPanel);
+    lv_label_set_text(nfcTextLbl, "");
+    lv_obj_set_style_text_color(nfcTextLbl, C_AMB_BRT, 0);
+    lv_obj_set_style_text_font(nfcTextLbl, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_align(nfcTextLbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(nfcTextLbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(nfcTextLbl, 680);
+    lv_obj_align(nfcTextLbl, LV_ALIGN_CENTER, 0, 10);
+
+    // ── WRITE panel: type the token, press WRITE TAG, hold a tag ──
+    nfcWritePanel = lv_obj_create(nfcToolModal);
+    lv_obj_set_size(nfcWritePanel, 720, 350);
+    lv_obj_align(nfcWritePanel, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_set_style_bg_color(nfcWritePanel, C_PNL2, 0);
+    lv_obj_set_style_border_color(nfcWritePanel, C_FRM, 0);
+    lv_obj_set_style_border_width(nfcWritePanel, 1, 0);
+    lv_obj_clear_flag(nfcWritePanel, LV_OBJ_FLAG_SCROLLABLE);
+
+    nfcWriteTa = lv_textarea_create(nfcWritePanel);
+    lv_obj_set_size(nfcWriteTa, 520, 44);
+    lv_obj_set_pos(nfcWriteTa, 8, 6);
+    lv_textarea_set_one_line(nfcWriteTa, true);
+    lv_textarea_set_max_length(nfcWriteTa, 100);
+    lv_textarea_set_placeholder_text(nfcWriteTa, "CHAIN:bounty_shilak, PLAYER:KESTIS, DATACARD_02 ...");
+
+    lv_obj_t *wbtn = lv_btn_create(nfcWritePanel);
+    lv_obj_set_size(wbtn, 160, 44);
+    lv_obj_set_pos(wbtn, 540, 6);
+    lv_obj_set_style_bg_color(wbtn, C_CYN, 0);
+    lv_obj_add_event_cb(wbtn, ev_nfc_write_arm, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *wl = lv_label_create(wbtn);
+    lv_label_set_text(wl, "WRITE TAG");
+    lv_obj_set_style_text_color(wl, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_text_font(wl, &lv_font_montserrat_16, 0);
+    lv_obj_center(wl);
+
+    nfcWriteStatus = lv_label_create(nfcWritePanel);
+    lv_label_set_text(nfcWriteStatus, "Type the tag text, then WRITE TAG");
+    lv_obj_set_style_text_color(nfcWriteStatus, C_CYN, 0);
+    lv_obj_set_style_text_font(nfcWriteStatus, &lv_font_montserrat_14, 0);
+    lv_obj_set_pos(nfcWriteStatus, 8, 58);
+
+    lv_obj_t *kb = lv_keyboard_create(nfcWritePanel);
+    lv_obj_set_size(kb, 704, 250);
+    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -4);
+    lv_keyboard_set_textarea(kb, nfcWriteTa);
+
+    nfcWriteMode = false;
+    nfcShowMode();
+}
+
+// Called from loop() while the NFC TOOL is open: reads tags (READ mode) or
+// performs an armed write (WRITE mode)
+void nfcToolService() {
+    if (!nfcToolModal) return;
+    if (nfcBanner && nfcBannerUntil && millis() > nfcBannerUntil) {
+        lv_obj_add_flag(nfcBanner, LV_OBJ_FLAG_HIDDEN);
+        nfcBannerUntil = 0;
+    }
+    if (!gmNfcOk) return;
+    static unsigned long lastPoll = 0;
+    if (millis() - lastPoll < 350) return;
+    lastPoll = millis();
+
+    // HSU flow: readPassiveTargetID() would sit in readBytes() for the whole
+    // serial timeout whenever no card is present (stalling LVGL) and desync
+    // the stream. Instead arm detection once, then watch the UART for the
+    // response frame — it only arrives when a tag enters the field.
+    if (!nfcDetectArmed) {
+        nfcDetectArmed = gmNfcArmDetect();
+        return;
+    }
+    if (Serial0.available() < 19) return;   // smallest complete detect frame
+
+    uint8_t uid[7]; uint8_t uidLen = 0;
+    bool hit = gmNfc.readDetectedPassiveTargetID(uid, &uidLen);
+    nfcDetectArmed = false;                 // one-shot — re-arm next tick
+    // The lib reads only 20 bytes of the detect frame; a 7-byte-UID tag's
+    // frame is 22, and the leftover checksum bytes would poison the ACK
+    // check of the very next command (= every NDEF page read). Flush them.
+    delay(3);
+    while (Serial0.available()) Serial0.read();
+    if (!hit || uidLen < 4) return;
+
+    char uidStr[24] = "";
+    for (int i = 0; i < uidLen && i < 7; i++) {
+        char hx[4];
+        snprintf(hx, sizeof(hx), i ? ":%02X" : "%02X", uid[i]);
+        strlcat(uidStr, hx, sizeof(uidStr));
+    }
+
+    if (nfcWriteMode) {
+        if (!nfcWriteArmed) return;
+        nfcWriteArmed = false;
+        const char *txt = lv_textarea_get_text(nfcWriteTa);
+        bool ok = gmWriteNdefText(txt);
+        char sb[160];
+        if (ok) snprintf(sb, sizeof(sb), "TAG WRITTEN\n\"%s\"\nUID %s", txt, uidStr);
+        else    snprintf(sb, sizeof(sb), "WRITE FAILED on %s\n(locked tag? not NTAG2xx?)", uidStr);
+        nfcShowBanner(sb, ok);
+        lv_label_set_text(nfcWriteStatus,
+                          ok ? "Written. Type new text or WRITE TAG again."
+                             : "Write failed - press WRITE TAG to retry.");
+        Serial.printf("[NFC] write %s: '%s'\n", ok ? "OK" : "FAILED", txt);
+        return;
+    }
+
+    // READ mode — same-tag cooldown so a resting tag doesn't flicker
+    static char lastUid[24] = "";
+    static unsigned long lastSeen = 0;
+    if (strcmp(lastUid, uidStr) == 0 && millis() - lastSeen < 1500) { lastSeen = millis(); return; }
+    strlcpy(lastUid, uidStr, sizeof(lastUid));
+    lastSeen = millis();
+
+    char text[160];
+    bool got = gmReadNdefText(text, sizeof(text));
+    lv_label_set_text(nfcStatusLbl, "TAG READ");
+    char ub[40];
+    snprintf(ub, sizeof(ub), "UID %s", uidStr);
+    lv_label_set_text(nfcUidLbl, ub);
+    lv_label_set_text(nfcTextLbl, got ? text : gmNfcWalkDiag);
+    Serial.printf("[NFC] read %s: '%s'\n", uidStr, got ? text : "(none)");
+}
+
 static void ev_gm_menu_open(lv_event_t *e) {
     if (gmMenuModal) return;
     gmMenuModal = lv_obj_create(lv_layer_top());
-    lv_obj_set_size(gmMenuModal, 360, 370);
+    lv_obj_set_size(gmMenuModal, 360, 430);
     lv_obj_center(gmMenuModal);
     lv_obj_set_style_bg_color(gmMenuModal, C_PNL, 0);
     lv_obj_set_style_border_color(gmMenuModal, C_AMB, 0);
@@ -3148,10 +3618,11 @@ static void ev_gm_menu_open(lv_event_t *e) {
         { "NEW GAME (wipe session)", ev_menu_newgame,  C_RED },
         { "RE-FIRE EVENT",           ev_menu_refire,   C_AMB },
         { "SEND DEBRIEFS",           ev_menu_debriefs, C_GRN },
+        { "NFC TOOL (read/write tags)", ev_menu_nfctool, C_CYN },
         { "RESYNC DEVICES",          ev_menu_resync,   C_CYN },
         { "CLOSE",                   ev_gm_menu_close, C_DIM },
     };
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 6; i++) {
         lv_obj_t *btn = lv_btn_create(gmMenuModal);
         lv_obj_set_size(btn, 320, 50);
         lv_obj_align(btn, LV_ALIGN_TOP_MID, 0, 38 + i * 60);
@@ -3364,6 +3835,9 @@ void setup() {
     // Init IO expander FIRST — turns on backlight, releases LCD/touch reset
     initIoExpander();
 
+    // PN532 on the same I2C header — powers the MENU's NFC TOOL
+    gmNfcProbe();
+
     // Display + touch
     tft.init();
     tft.setRotation(0);
@@ -3436,6 +3910,7 @@ void setup() {
 void loop() {
     lv_timer_handler();
     sfge::eventRetryService();   // event acks out + re-fire unconfirmed events
+    nfcToolService();            // tag read/write while the NFC TOOL is open
 
     static unsigned long lastRefresh = 0;
     if (millis() - lastRefresh > 2000) {
